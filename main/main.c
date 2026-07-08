@@ -3,7 +3,7 @@
  *
  * Board resources from README.md:
  *   ST7735-compatible SPI TFT, MicroSD on shared SPI2, 6 active-low keys,
- *   GPIO14 passive buzzer, GPIO36/GPIO39 ADC sensors, I2C0 GD32/MPU6050,
+ *   GPIO14 passive buzzer, GPIO36/GPIO39 ADC sensors, I2C0 (MPU6050),
  *   and GPIO25/26/32/33 extension IO.
  */
 
@@ -149,15 +149,8 @@
 #define THERM_HISTORY_MAX_PCT       65
 #define I2C_TIMEOUT_MS              30
 #define I2C_FREQ_HZ                 100000
-#define GD32_REPROBE_PERIOD_MS      1500
 #define MPU_REPROBE_PERIOD_MS       1500
 #define SD_SPI_MAX_FREQ_KHZ         10000
-
-#define GD32_ADDR                   0x40
-#define GD32_LED1_REG               0xA0
-#define GD32_LED2_REG               0xA1
-#define GD32_MOTOR1_REG             0x0E
-#define GD32_MOTOR2_REG             0x06
 
 #define MPU6050_ADDR                0x68
 #define MPU6050_REG_ACCEL_XOUT_H    0x3B
@@ -218,19 +211,8 @@ typedef struct {
 } board_button_t;
 
 typedef enum {
-    UI_PAGE_LIGHT = 0,
-    UI_PAGE_THERM,
-    UI_PAGE_MOTION,
-    UI_PAGE_LED1,
-    UI_PAGE_LED2,
-    UI_PAGE_BUZZER,
-    UI_PAGE_MOTOR1,
-    UI_PAGE_MOTOR2,
+    UI_PAGE_BUZZER = 0,
     UI_PAGE_SD,
-    UI_PAGE_GPIO25,
-    UI_PAGE_GPIO26,
-    UI_PAGE_ADC32,
-    UI_PAGE_ADC33,
     UI_PAGE_SYSTEM,
     UI_PAGE_ABOUT,
     UI_PAGE_COUNT,
@@ -238,18 +220,12 @@ typedef enum {
 
 typedef struct {
     bool i2c_ready;
-    bool gd32_present;
     bool mpu_present;
     bool sd_mounted;
     bool buzzer_ready;
     bool adc_ready;
     bool ext_pwm_ready;
-    bool led1_on;
-    bool led2_on;
-    bool motor_running[2];
-    bool motor_dir[2];
     bool ext_out[2];
-    uint8_t motor_speed[2];
     uint8_t ext_pwm[2];
     uint8_t mpu_whoami;
     uint32_t samples;
@@ -264,7 +240,6 @@ typedef struct {
     char sd_name[24];
     uint32_t sd_mb;
     esp_err_t last_adc_err;
-    esp_err_t last_gd32_err;
     esp_err_t last_mpu_err;
     esp_err_t last_sd_err;
     char action[32];
@@ -304,7 +279,6 @@ static ui_state_t s_ui;
 static board_state_t s_board = {
     .gesture = "ABSENT",
     .sd_name = "NO CARD",
-    .motor_speed = {120, 120},
     .ext_pwm = {128, 128},
     .last_sd_err = ESP_ERR_NOT_FOUND,
     .action = "Ready",
@@ -313,15 +287,12 @@ static board_state_t s_board = {
 static adc_oneshot_unit_handle_t s_adc_handle;
 static esp_lcd_panel_io_handle_t s_lcd_io_handle;
 static i2c_master_bus_handle_t s_i2c_bus;
-static i2c_master_dev_handle_t s_gd32_dev;
 static i2c_master_dev_handle_t s_mpu_dev;
 static sdmmc_card_t *s_sd_card;
 static uint32_t s_buzzer_stop_at;
 static uint32_t s_buzzer_freq_hz = 988;
 static uint32_t s_action_until_ms;
-static uint32_t s_last_gd32_probe_ms;
 static uint32_t s_last_mpu_probe_ms;
-static bool s_gd32_probe_seen;
 static bool s_mpu_probe_seen;
 static bool s_lcd_display_on;
 static volatile bool s_lcd_first_flush_done;
@@ -409,73 +380,6 @@ static esp_err_t i2c_read_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t 
         return ESP_ERR_INVALID_STATE;
     }
     return i2c_master_transmit_receive(dev, &reg, 1, data, len, I2C_TIMEOUT_MS);
-}
-
-static void gd32_mark_absent(void)
-{
-    s_board.gd32_present = false;
-    s_board.led1_on = false;
-    s_board.led2_on = false;
-    s_board.motor_running[0] = false;
-    s_board.motor_running[1] = false;
-}
-
-static esp_err_t gd32_write_reg(uint8_t reg, uint8_t value)
-{
-    esp_err_t err = i2c_write_reg(s_gd32_dev, reg, value);
-    s_board.last_gd32_err = err;
-    if (err == ESP_OK) {
-        s_board.gd32_present = true;
-    }
-    else {
-        gd32_mark_absent();
-    }
-    return err;
-}
-
-static esp_err_t gd32_motor_stop_all(void)
-{
-    const uint8_t data[] = {0x00, 0x00, 0x00, 0x00, 0x00};
-    esp_err_t err = i2c_write(s_gd32_dev, data, sizeof(data));
-    s_board.last_gd32_err = err;
-    if (err == ESP_OK) {
-        s_board.gd32_present = true;
-        s_board.motor_running[0] = false;
-        s_board.motor_running[1] = false;
-    }
-    else {
-        gd32_mark_absent();
-    }
-    return err;
-}
-
-static esp_err_t gd32_motor_set(uint8_t motor, bool dir, uint8_t speed)
-{
-    const uint8_t reg = (motor == 0) ? GD32_MOTOR1_REG : GD32_MOTOR2_REG;
-    const uint16_t pwm = ((uint16_t)speed) << 4;
-    const uint8_t pwm_l = pwm & 0xFF;
-    const uint8_t pwm_h = pwm >> 8;
-    uint8_t data[9] = {reg, 0, 0, 0, 0, 0, 0, 0, 0};
-
-    if (dir) {
-        data[3] = pwm_l;
-        data[4] = pwm_h;
-    }
-    else {
-        data[7] = pwm_l;
-        data[8] = pwm_h;
-    }
-
-    esp_err_t err = i2c_write(s_gd32_dev, data, sizeof(data));
-    s_board.last_gd32_err = err;
-    if (err == ESP_OK) {
-        s_board.gd32_present = true;
-        s_board.motor_running[motor] = speed > 0;
-    }
-    else {
-        gd32_mark_absent();
-    }
-    return err;
 }
 
 static void buzzer_stop(void)
@@ -699,43 +603,16 @@ static esp_err_t ext_output_set(uint8_t index, bool on)
     return err;
 }
 
-static void gd32_probe(bool force)
-{
-    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-
-    if (!force && s_gd32_probe_seen && now_ms - s_last_gd32_probe_ms < GD32_REPROBE_PERIOD_MS) {
-        return;
-    }
-    s_gd32_probe_seen = true;
-    s_last_gd32_probe_ms = now_ms;
-
-    if (!s_i2c_bus || !s_gd32_dev) {
-        s_board.last_gd32_err = ESP_ERR_INVALID_STATE;
-        s_board.gd32_present = false;
-    }
-    else {
-        s_board.last_gd32_err = i2c_master_probe(s_i2c_bus, GD32_ADDR, I2C_TIMEOUT_MS);
-        s_board.gd32_present = (s_board.last_gd32_err == ESP_OK);
-    }
-
-    if (!s_board.gd32_present) {
-        gd32_mark_absent();
-    }
-}
-
 static void i2c_probe_devices(bool force)
 {
     if (!s_i2c_bus) {
         s_board.i2c_ready = false;
-        s_board.gd32_present = false;
         s_board.mpu_present = false;
-        s_board.last_gd32_err = ESP_ERR_INVALID_STATE;
         s_board.last_mpu_err = ESP_ERR_INVALID_STATE;
         return;
     }
 
     s_board.i2c_ready = true;
-    gd32_probe(force);
 
     if (force || !s_board.mpu_present) {
         mpu_probe_and_init(force);
@@ -756,12 +633,14 @@ static void sd_try_mount(void)
         return;
     }
 
-    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.slot = LCD_HOST;
-    host.max_freq_khz = SD_SPI_MAX_FREQ_KHZ;
+     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+     /* Use the SDSPI default host instead of forcing the LCD host.
+         Forcing the same SPI host as the display can cause bus conflicts
+         and white-screen when the SD card is removed at runtime. */
+     host.max_freq_khz = SD_SPI_MAX_FREQ_KHZ;
 
     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_config.host_id = LCD_HOST;
+    slot_config.host_id = host.slot;
     slot_config.gpio_cs = PIN_NUM_SD_CS;
     slot_config.wait_for_miso = 20;
 
@@ -920,24 +799,12 @@ static void i2c_init(void)
         return;
     }
 
-    const i2c_device_config_t gd32_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = GD32_ADDR,
-        .scl_speed_hz = I2C_FREQ_HZ,
-    };
     const i2c_device_config_t mpu_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = MPU6050_ADDR,
         .scl_speed_hz = I2C_FREQ_HZ,
     };
     s_board.i2c_ready = true;
-
-    err = i2c_master_bus_add_device(s_i2c_bus, &gd32_cfg, &s_gd32_dev);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "GD32 I2C device add failed: %s", esp_err_to_name(err));
-        s_board.last_gd32_err = err;
-        s_gd32_dev = NULL;
-    }
 
     err = i2c_master_bus_add_device(s_i2c_bus, &mpu_cfg, &s_mpu_dev);
     if (err != ESP_OK) {
@@ -989,9 +856,6 @@ static void hardware_init(void)
     ext_io_init();
     i2c_init();
     buzzer_init();
-    if (s_board.gd32_present) {
-        gd32_motor_stop_all();
-    }
     hardware_update();
 }
 
@@ -1288,19 +1152,8 @@ static lv_display_t *lvgl_display_init(esp_lcd_panel_io_handle_t io_handle)
 }
 
 static const char *const s_page_names[UI_PAGE_COUNT] = {
-    "LIGHT",
-    "THERM",
-    "MOTION",
-    "LED 1",
-    "LED 2",
     "BUZZER",
-    "MOTOR 1",
-    "MOTOR 2",
     "SD CARD",
-    "GPIO25",
-    "GPIO26",
-    "GPIO32",
-    "GPIO33",
     "SYSTEM",
     "ABOUT",
 };
@@ -1310,9 +1163,6 @@ static const uint32_t UI_BLACK = 0x1B1713;
 static const uint32_t UI_BROWN = 0x5C4220;
 static const uint32_t UI_RED = 0xE64B3C;
 static const uint32_t UI_CREAM = 0xFFF3B0;
-static const int UI_HISTORY_CHART_PAD_X = 2;
-static const int UI_HISTORY_CHART_PAD_Y = 3;
-static const int UI_HISTORY_HEAD_SIZE = 7;
 
 static void ui_refresh(void);
 static void ui_show_page(ui_page_t page, int dir);
@@ -1391,121 +1241,10 @@ static lv_obj_t *ui_bar(lv_obj_t *parent, int value)
     return bar;
 }
 
-static bool ui_page_has_history(ui_page_t page)
-{
-    return page == UI_PAGE_LIGHT || page == UI_PAGE_THERM;
-}
-
-static int32_t *ui_history_for_page(ui_page_t page)
-{
-    return page == UI_PAGE_THERM ? s_therm_history : s_light_history;
-}
-
-static uint32_t ui_history_version_for_page(ui_page_t page)
-{
-    return page == UI_PAGE_THERM ? s_therm_history_version : s_light_history_version;
-}
-
-static uint32_t ui_history_color_for_page(ui_page_t page)
-{
-    (void)page;
-    return UI_BROWN;
-}
-
-static int ui_history_min_for_page(ui_page_t page)
-{
-    return page == UI_PAGE_THERM ? THERM_HISTORY_MIN_PCT : 0;
-}
-
-static int ui_history_max_for_page(ui_page_t page)
-{
-    return page == UI_PAGE_THERM ? THERM_HISTORY_MAX_PCT : 100;
-}
-
-static lv_obj_t *ui_history_chart(lv_obj_t *parent, int32_t *history, uint32_t color)
-{
-    lv_obj_t *chart = lv_chart_create(parent);
-    lv_obj_set_pos(chart, 18, 77);
-    lv_obj_set_size(chart, 124, 25);
-    lv_obj_clear_flag(chart, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_pad_all(chart, 0, 0);
-    lv_obj_set_style_pad_left(chart, UI_HISTORY_CHART_PAD_X, 0);
-    lv_obj_set_style_pad_right(chart, UI_HISTORY_CHART_PAD_X, 0);
-    lv_obj_set_style_pad_top(chart, UI_HISTORY_CHART_PAD_Y, 0);
-    lv_obj_set_style_pad_bottom(chart, UI_HISTORY_CHART_PAD_Y, 0);
-    lv_obj_set_style_radius(chart, 4, 0);
-    lv_obj_set_style_border_width(chart, 0, 0);
-    lv_obj_set_style_bg_opa(chart, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_line_width(chart, 1, LV_PART_MAIN);
-    lv_obj_set_style_line_color(chart, lv_color_hex(UI_BROWN), LV_PART_MAIN);
-    lv_obj_set_style_line_opa(chart, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_style_line_width(chart, 2, LV_PART_ITEMS);
-    lv_obj_set_style_size(chart, 0, 0, LV_PART_INDICATOR);
-    lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
-    lv_chart_set_point_count(chart, UI_HISTORY_POINTS);
-    lv_chart_set_axis_range(chart,
-                            LV_CHART_AXIS_PRIMARY_Y,
-                            ui_history_min_for_page(s_ui.page_id),
-                            ui_history_max_for_page(s_ui.page_id));
-    lv_chart_set_div_line_count(chart, 2, 4);
-
-    s_ui.chart_series = lv_chart_add_series(chart, lv_color_hex(color), LV_CHART_AXIS_PRIMARY_Y);
-    if (s_ui.chart_series) {
-        lv_chart_set_series_ext_y_array(chart, s_ui.chart_series, history);
-    }
-    lv_chart_refresh(chart);
-    return chart;
-}
-
-static lv_obj_t *ui_history_head_dot(lv_obj_t *parent, uint32_t color)
-{
-    lv_obj_t *dot = lv_obj_create(parent);
-    lv_obj_remove_style_all(dot);
-    lv_obj_set_size(dot, UI_HISTORY_HEAD_SIZE, UI_HISTORY_HEAD_SIZE);
-    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(dot, lv_color_hex(color), 0);
-    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(dot, 0, 0);
-    lv_obj_add_flag(dot, LV_OBJ_FLAG_HIDDEN);
-    return dot;
-}
-
-static void ui_update_history_head(void)
-{
-    if (!s_ui.chart || !s_ui.chart_series || !s_ui.chart_head) {
-        return;
-    }
-
-    const int32_t *history = ui_history_for_page(s_ui.page_id);
-    if (history[UI_HISTORY_POINTS - 1] == LV_CHART_POINT_NONE) {
-        lv_obj_add_flag(s_ui.chart_head, LV_OBJ_FLAG_HIDDEN);
-        return;
-    }
-
-    lv_point_t p;
-    lv_chart_get_point_pos_by_id(s_ui.chart, s_ui.chart_series, UI_HISTORY_POINTS - 1, &p);
-    const int32_t dot_half = UI_HISTORY_HEAD_SIZE / 2;
-    lv_obj_set_pos(s_ui.chart_head,
-                   lv_obj_get_x(s_ui.chart) + p.x - dot_half,
-                   lv_obj_get_y(s_ui.chart) + p.y - dot_half);
-    lv_obj_clear_flag(s_ui.chart_head, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(s_ui.chart_head);
-}
-
 static void ui_set_bar(int value)
 {
     if (s_ui.bar) {
         lv_bar_set_value(s_ui.bar, MAX(0, MIN(value, 100)), LV_ANIM_ON);
-    }
-}
-
-static void ui_refresh_history_chart(void)
-{
-    const uint32_t version = ui_history_version_for_page(s_ui.page_id);
-    if (s_ui.chart && s_ui.chart_history_version != version) {
-        lv_chart_refresh(s_ui.chart);
-        ui_update_history_head();
-        s_ui.chart_history_version = version;
     }
 }
 
@@ -1542,11 +1281,10 @@ static void ui_build_about_page(lv_obj_t *page)
              sizeof(details),
              "Model\n"
              "  Xiaomiao Handheld\n"
-             "  ESP32-WROVER-B\n"
-             "  Author: ZYoung\n\n"
+             "  ESP32-WROVER-B\n\n"
+            //  "  Author: ZYoung\n\n"
              "CPU\n"
-             "  Xtensa LX6\n"
-             "    %d MHz x%u\n"
+             "  Xtensa LX6  %d MHz x%u\n"
              "  Chip rev: %u\n\n"
              "System\n"
              "  ESP-IDF: %s\n"
@@ -1573,12 +1311,11 @@ static void ui_build_about_page(lv_obj_t *page)
              "  Keys: 6 active-low\n"
              "  SD: SPI2 CS22\n"
              "  ADC: 36/39/32/33\n"
-             "  I2C: GD32 0x40\n"
-             "       MPU6050 0x68\n"
+             "  I2C: MPU6050 0x68\n"
              "  PWM: GPIO14 Buzzer\n"
-             "       GPIO25/26 EXT\n\n"
-             "wechat/tel:\n"
-             "  15657325738\n",
+             "       GPIO25/26 EXT\n\n",
+            //  "wechat/tel:\n"
+            //  "  15657325738\n",
              CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
              (unsigned)chip_info.cores,
              (unsigned)chip_info.revision,
@@ -1645,20 +1382,10 @@ static void ui_build_page_content(lv_obj_t *page)
 
     s_ui.value = ui_label(page, "--", 38, UI_BLACK, &lv_font_montserrat_14, LV_TEXT_ALIGN_CENTER);
     s_ui.sub = ui_label(page, "--", 63, UI_BROWN, &lv_font_montserrat_10, LV_TEXT_ALIGN_CENTER);
-    if (ui_page_has_history(s_ui.page_id)) {
-        const uint32_t color = ui_history_color_for_page(s_ui.page_id);
-        s_ui.bar = NULL;
-        s_ui.chart = ui_history_chart(page,
-                                      ui_history_for_page(s_ui.page_id),
-                                      color);
-        s_ui.chart_head = ui_history_head_dot(page, color);
-    }
-    else {
-        s_ui.chart = NULL;
-        s_ui.chart_head = NULL;
-        s_ui.chart_series = NULL;
-        s_ui.bar = ui_bar(page, 0);
-    }
+    s_ui.chart = NULL;
+    s_ui.chart_head = NULL;
+    s_ui.chart_series = NULL;
+    s_ui.bar = ui_bar(page, 0);
     s_ui.hint = ui_label(page, "L/R page", 106, UI_BLACK, &lv_font_montserrat_10, LV_TEXT_ALIGN_CENTER);
 }
 
@@ -1717,75 +1444,12 @@ static void ui_refresh(void)
     }
 
     switch (s_ui.page_id) {
-    case UI_PAGE_LIGHT:
-        lv_label_set_text_fmt(s_ui.value, "%d%%", pct_from_raw(s_board.light_raw));
-        if (s_board.adc_ready) {
-            lv_label_set_text_fmt(s_ui.sub, "GPIO36  RAW %04d", s_board.light_raw);
-        }
-        else {
-            lv_label_set_text_fmt(s_ui.sub, "ADC FAIL  %s", short_err(s_board.last_adc_err));
-        }
-        ui_set_hint("A sample   L/R");
-        ui_refresh_history_chart();
-        break;
-    case UI_PAGE_THERM: {
-        const bool therm_changed = s_ui.chart_history_version != s_therm_history_version;
-        if (therm_changed || !s_board.adc_ready || s_board.last_adc_err != ESP_OK) {
-            lv_label_set_text_fmt(s_ui.value, "%d%%", pct_from_raw(s_board.temp_raw));
-            if (s_board.adc_ready) {
-                lv_label_set_text_fmt(s_ui.sub, "GPIO39  RAW %04d", s_board.temp_raw);
-            }
-            else {
-                lv_label_set_text_fmt(s_ui.sub, "ADC FAIL  %s", short_err(s_board.last_adc_err));
-            }
-        }
-        ui_set_hint("A sample   L/R");
-        ui_refresh_history_chart();
-        break;
-    }
-    case UI_PAGE_MOTION:
-        lv_label_set_text(s_ui.value, s_board.mpu_present ? s_board.gesture : "ABSENT");
-        if (s_board.mpu_present) {
-            lv_label_set_text_fmt(s_ui.sub, "P%+.1f  R%+.1f  0x%02X", s_board.pitch, s_board.roll, s_board.mpu_whoami);
-        }
-        else {
-            lv_label_set_text_fmt(s_ui.sub, "MPU 0x68  %s", short_err(s_board.last_mpu_err));
-        }
-        ui_set_hint("A rescan   L/R");
-        ui_set_bar(s_board.mpu_present ? 100 : 0);
-        break;
-    case UI_PAGE_LED1:
-        lv_label_set_text(s_ui.value, s_board.led1_on ? "ON" : "OFF");
-        lv_label_set_text(s_ui.sub, s_board.gd32_present ? "GD32 0x40  REG A0" : "GD32 0x40 ABSENT");
-        ui_set_hint("A toggle   B off");
-        ui_set_bar(s_board.led1_on ? 100 : 0);
-        break;
-    case UI_PAGE_LED2:
-        lv_label_set_text(s_ui.value, s_board.led2_on ? "ON" : "OFF");
-        lv_label_set_text(s_ui.sub, s_board.gd32_present ? "GD32 0x40  REG A1" : "GD32 0x40 ABSENT");
-        ui_set_hint("A toggle   B off");
-        ui_set_bar(s_board.led2_on ? 100 : 0);
-        break;
     case UI_PAGE_BUZZER:
         lv_label_set_text_fmt(s_ui.value, "%lu Hz", (unsigned long)s_buzzer_freq_hz);
         lv_label_set_text(s_ui.sub, s_board.buzzer_ready ? "GPIO14 PWM" : "PWM INIT FAIL");
         ui_set_hint("U/D Hz  A beep  B stop");
         ui_set_bar((int)((s_buzzer_freq_hz - 440) * 100 / (1760 - 440)));
         break;
-    case UI_PAGE_MOTOR1:
-    case UI_PAGE_MOTOR2: {
-        const uint8_t motor = s_ui.page_id == UI_PAGE_MOTOR1 ? 0 : 1;
-        lv_label_set_text_fmt(s_ui.value, "%s %03u", s_board.motor_running[motor] ? "VOUT" : "PWM", s_board.motor_speed[motor]);
-        if (s_board.gd32_present) {
-            lv_label_set_text_fmt(s_ui.sub, "REG %s  DIR %u", motor == 0 ? "0E" : "06", s_board.motor_dir[motor] ? 1 : 0);
-        }
-        else {
-            lv_label_set_text(s_ui.sub, "GD32 0x40 ABSENT");
-        }
-        ui_set_hint(s_board.motor_running[motor] ? "U/D PWM  A off  B stop" : "U/D PWM  A out  B dir");
-        ui_set_bar((int)s_board.motor_speed[motor] * 100 / 255);
-        break;
-    }
     case UI_PAGE_SD:
         lv_label_set_text(s_ui.value, s_board.sd_mounted ? "MOUNTED" : "NO CARD");
         if (s_board.sd_mounted) {
@@ -1797,45 +1461,10 @@ static void ui_refresh(void)
         ui_set_hint(s_board.sd_mounted ? "B unmount  L/R" : "A rescan   L/R");
         ui_set_bar(s_board.sd_mounted ? 100 : 0);
         break;
-    case UI_PAGE_GPIO25:
-        lv_label_set_text_fmt(s_ui.value, "%s %03u", s_board.ext_out[0] ? "PWM" : "OFF", s_board.ext_pwm[0]);
-        lv_label_set_text(s_ui.sub, s_board.ext_pwm_ready ? "GPIO25 LEDC" : "PWM INIT FAIL");
-        ui_set_hint("U/D duty  A toggle  B off");
-        ui_set_bar((int)s_board.ext_pwm[0] * 100 / EXT_PWM_DUTY_MAX);
-        break;
-    case UI_PAGE_GPIO26:
-        lv_label_set_text_fmt(s_ui.value, "%s %03u", s_board.ext_out[1] ? "PWM" : "OFF", s_board.ext_pwm[1]);
-        lv_label_set_text(s_ui.sub, s_board.ext_pwm_ready ? "GPIO26 LEDC" : "PWM INIT FAIL");
-        ui_set_hint("U/D duty  A toggle  B off");
-        ui_set_bar((int)s_board.ext_pwm[1] * 100 / EXT_PWM_DUTY_MAX);
-        break;
-    case UI_PAGE_ADC32:
-        lv_label_set_text_fmt(s_ui.value, "%d%%", pct_from_raw(s_board.ext_raw[0]));
-        if (s_board.adc_ready) {
-            lv_label_set_text_fmt(s_ui.sub, "GPIO32 RAW %04d", s_board.ext_raw[0]);
-        }
-        else {
-            lv_label_set_text_fmt(s_ui.sub, "ADC FAIL  %s", short_err(s_board.last_adc_err));
-        }
-        ui_set_hint("A sample   L/R");
-        ui_set_bar(pct_from_raw(s_board.ext_raw[0]));
-        break;
-    case UI_PAGE_ADC33:
-        lv_label_set_text_fmt(s_ui.value, "%d%%", pct_from_raw(s_board.ext_raw[1]));
-        if (s_board.adc_ready) {
-            lv_label_set_text_fmt(s_ui.sub, "GPIO33 RAW %04d", s_board.ext_raw[1]);
-        }
-        else {
-            lv_label_set_text_fmt(s_ui.sub, "ADC FAIL  %s", short_err(s_board.last_adc_err));
-        }
-        ui_set_hint("A sample   L/R");
-        ui_set_bar(pct_from_raw(s_board.ext_raw[1]));
-        break;
     case UI_PAGE_SYSTEM:
         lv_label_set_text(s_ui.value, s_board.i2c_ready ? "I2C OK" : "I2C --");
         lv_label_set_text_fmt(s_ui.sub,
-                              "G %s  M %s",
-                              s_board.gd32_present ? "OK" : short_err(s_board.last_gd32_err),
+                              "MPU %s",
                               s_board.mpu_present ? "OK" : short_err(s_board.last_mpu_err));
         ui_set_hint("A rescan   L/R");
         ui_set_bar(s_board.i2c_ready ? 100 : 0);
@@ -1847,111 +1476,19 @@ static void ui_refresh(void)
     }
 }
 
-static void ui_motor_stop(uint8_t motor)
-{
-    esp_err_t err = gd32_motor_set(motor, s_board.motor_dir[motor], 0);
-    if (err == ESP_OK) {
-        s_board.motor_running[motor] = false;
-        set_action(motor == 0 ? "Motor1 stopped" : "Motor2 stopped");
-    }
-    else {
-        set_action("Motor cmd fail");
-    }
-}
-
-static void ui_motor_toggle(uint8_t motor)
-{
-    if (s_board.motor_running[motor]) {
-        ui_motor_stop(motor);
-        return;
-    }
-    if (s_board.motor_speed[motor] == 0) {
-        s_board.last_gd32_err = ESP_ERR_INVALID_ARG;
-        set_action("PWM is zero");
-        return;
-    }
-
-    esp_err_t err = gd32_motor_set(motor, s_board.motor_dir[motor], s_board.motor_speed[motor]);
-    if (err == ESP_OK) {
-        s_board.motor_running[motor] = true;
-        set_action(motor == 0 ? "Motor1 output" : "Motor2 output");
-    }
-    else {
-        set_action("Motor cmd fail");
-    }
-}
-
-static esp_err_t ui_ext_toggle(uint8_t index)
-{
-    if (s_board.ext_out[index]) {
-        esp_err_t err = ext_output_set(index, false);
-        set_action(err == ESP_OK ? (index == 0 ? "GPIO25 off" : "GPIO26 off") : "PWM cmd fail");
-        return err;
-    }
-
-    if (s_board.ext_pwm[index] == 0) {
-        set_action("Duty is zero");
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    esp_err_t err = ext_output_set(index, true);
-    set_action(err == ESP_OK ? (index == 0 ? "GPIO25 PWM" : "GPIO26 PWM") : "PWM cmd fail");
-    return err;
-}
-
 static void ui_action(void)
 {
     esp_err_t err = ESP_OK;
 
     switch (s_ui.page_id) {
-    case UI_PAGE_LIGHT:
-    case UI_PAGE_THERM:
-    case UI_PAGE_ADC32:
-    case UI_PAGE_ADC33:
-        err = adc_read_sensors();
-        set_action(err == ESP_OK ? "Sampled" : "ADC read fail");
-        break;
-    case UI_PAGE_MOTION:
-        mpu_probe_and_init(true);
-        err = s_board.mpu_present ? ESP_OK : s_board.last_mpu_err;
-        set_action(s_board.mpu_present ? "MPU ready" : "MPU absent");
-        break;
-    case UI_PAGE_LED1:
-        err = gd32_write_reg(GD32_LED1_REG, s_board.led1_on ? 0 : 1);
-        if (err == ESP_OK) {
-            s_board.led1_on = !s_board.led1_on;
-        }
-        set_action(err == ESP_OK ? "LED1 toggled" : "LED cmd fail");
-        break;
-    case UI_PAGE_LED2:
-        err = gd32_write_reg(GD32_LED2_REG, s_board.led2_on ? 0 : 1);
-        if (err == ESP_OK) {
-            s_board.led2_on = !s_board.led2_on;
-        }
-        set_action(err == ESP_OK ? "LED2 toggled" : "LED cmd fail");
-        break;
     case UI_PAGE_BUZZER:
         buzzer_beep(s_buzzer_freq_hz, 140);
         set_action(s_board.buzzer_ready ? "Beep" : "Buzzer init fail");
-        break;
-    case UI_PAGE_MOTOR1:
-        ui_motor_toggle(0);
-        err = s_board.last_gd32_err;
-        break;
-    case UI_PAGE_MOTOR2:
-        ui_motor_toggle(1);
-        err = s_board.last_gd32_err;
         break;
     case UI_PAGE_SD:
         sd_try_mount();
         err = s_board.sd_mounted ? ESP_OK : s_board.last_sd_err;
         set_action(s_board.sd_mounted ? "SD mounted" : "No SD card");
-        break;
-    case UI_PAGE_GPIO25:
-        err = ui_ext_toggle(0);
-        break;
-    case UI_PAGE_GPIO26:
-        err = ui_ext_toggle(1);
         break;
     case UI_PAGE_SYSTEM:
         i2c_probe_devices(true);
@@ -1971,66 +1508,12 @@ static void ui_action(void)
 static void ui_cancel(void)
 {
     switch (s_ui.page_id) {
-    case UI_PAGE_LED1:
-        if (s_board.led1_on) {
-            esp_err_t err = gd32_write_reg(GD32_LED1_REG, 0);
-            if (err == ESP_OK) {
-                s_board.led1_on = false;
-            }
-            set_action(err == ESP_OK ? "LED1 off" : "LED cmd fail");
-        }
-        else {
-            set_action("LED1 off");
-        }
-        break;
-    case UI_PAGE_LED2:
-        if (s_board.led2_on) {
-            esp_err_t err = gd32_write_reg(GD32_LED2_REG, 0);
-            if (err == ESP_OK) {
-                s_board.led2_on = false;
-            }
-            set_action(err == ESP_OK ? "LED2 off" : "LED cmd fail");
-        }
-        else {
-            set_action("LED2 off");
-        }
-        break;
     case UI_PAGE_BUZZER:
         buzzer_stop();
         set_action("Buzzer stop");
         break;
     case UI_PAGE_SD:
         sd_unmount();
-        break;
-    case UI_PAGE_GPIO25:
-        {
-            esp_err_t err = ext_output_set(0, false);
-            set_action(err == ESP_OK ? "GPIO25 off" : "PWM cmd fail");
-        }
-        break;
-    case UI_PAGE_GPIO26:
-        {
-            esp_err_t err = ext_output_set(1, false);
-            set_action(err == ESP_OK ? "GPIO26 off" : "PWM cmd fail");
-        }
-        break;
-    case UI_PAGE_MOTOR1:
-        if (s_board.motor_running[0]) {
-            ui_motor_stop(0);
-        }
-        else {
-            s_board.motor_dir[0] = !s_board.motor_dir[0];
-            set_action("Motor1 dir");
-        }
-        break;
-    case UI_PAGE_MOTOR2:
-        if (s_board.motor_running[1]) {
-            ui_motor_stop(1);
-        }
-        else {
-            s_board.motor_dir[1] = !s_board.motor_dir[1];
-            set_action("Motor2 dir");
-        }
         break;
     default:
         buzzer_stop();
@@ -2047,37 +1530,6 @@ static void ui_adjust(int step)
         int freq = (int)s_buzzer_freq_hz + step * 110;
         s_buzzer_freq_hz = MAX(440, MIN(freq, 1760));
         set_action("Pitch set");
-        break;
-    }
-    case UI_PAGE_MOTOR1:
-    case UI_PAGE_MOTOR2: {
-        const uint8_t motor = s_ui.page_id == UI_PAGE_MOTOR1 ? 0 : 1;
-        int speed = s_board.motor_speed[motor] + step * 10;
-        s_board.motor_speed[motor] = MAX(0, MIN(speed, 255));
-        if (s_board.motor_running[motor]) {
-            esp_err_t err = gd32_motor_set(motor, s_board.motor_dir[motor], s_board.motor_speed[motor]);
-            set_action(err == ESP_OK ? "Power set" : "Motor cmd fail");
-        }
-        else {
-            set_action("Power set");
-        }
-        break;
-    }
-    case UI_PAGE_GPIO25:
-    case UI_PAGE_GPIO26: {
-        const uint8_t index = s_ui.page_id == UI_PAGE_GPIO25 ? 0 : 1;
-        int duty = s_board.ext_pwm[index] + step * 16;
-        s_board.ext_pwm[index] = MAX(0, MIN(duty, EXT_PWM_DUTY_MAX));
-        if (!s_board.ext_pwm_ready) {
-            set_action("PWM init fail");
-        }
-        else if (s_board.ext_out[index]) {
-            esp_err_t err = ext_output_set(index, true);
-            set_action(err == ESP_OK ? (s_board.ext_out[index] ? "Duty set" : "Duty zero") : "PWM cmd fail");
-        }
-        else {
-            set_action("Duty set");
-        }
         break;
     }
     default:
@@ -2142,7 +1594,7 @@ static void ui_key_event_cb(lv_event_t *e)
 static void ui_create(lv_group_t *group)
 {
     s_ui.group = group;
-    s_ui.page_id = UI_PAGE_LIGHT;
+    s_ui.page_id = UI_PAGE_BUZZER;
     s_ui.screen = lv_obj_create(lv_screen_active());
     lv_obj_remove_style_all(s_ui.screen);
     lv_obj_set_size(s_ui.screen, LCD_H_RES, LCD_V_RES);
@@ -2153,7 +1605,7 @@ static void ui_create(lv_group_t *group)
     lv_group_add_obj(group, s_ui.screen);
     lv_group_focus_obj(s_ui.screen);
     lv_obj_add_event_cb(s_ui.screen, ui_key_event_cb, LV_EVENT_KEY, NULL);
-    ui_show_page(UI_PAGE_LIGHT, 0);
+    ui_show_page(UI_PAGE_BUZZER, 0);
 }
 
 static lv_group_t *lvgl_input_init(lv_display_t *display)

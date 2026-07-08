@@ -1,5 +1,5 @@
 {
-  "idf.currentSetup": "/home/zyoung/esp/v5.5.4/esp-idf",
+  "idf.currentSetup": "D:\\esp\\v5.5.4\\esp-idf",
   "idf.openOcdConfigs": [
     "board/esp32-wrover-kit-3.3v.cfg"
   ],
