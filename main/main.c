@@ -36,6 +36,8 @@
 #include "lvgl.h"
 #include "sdmmc_cmd.h"
 #include "sdkconfig.h"
+#include <dirent.h>
+#include <sys/stat.h>
 
 #ifndef CONFIG_IDF_TARGET
 #define CONFIG_IDF_TARGET "esp32"
@@ -151,6 +153,11 @@
 #define I2C_FREQ_HZ                 100000
 #define MPU_REPROBE_PERIOD_MS       1500
 #define SD_SPI_MAX_FREQ_KHZ         10000
+
+#define SD_BROWSER_MAX_ENTRIES      16
+#define SD_DISPLAY_LINE_COUNT       4
+#define SD_FILE_TEXT_BUFFER         4096
+#define SD_TEXT_CHUNK               320
 
 #define MPU6050_ADDR                0x68
 #define MPU6050_REG_ACCEL_XOUT_H    0x3B
@@ -306,6 +313,56 @@ static uint32_t s_therm_accum;
 static uint16_t s_therm_accum_count;
 static uint32_t s_last_therm_publish_ms;
 
+#define SD_PATH_PREFIX "/sdcard/"
+
+typedef struct {
+    char name[32];
+    bool is_dir;
+} sd_entry_t;
+
+static sd_entry_t s_sd_entries[SD_BROWSER_MAX_ENTRIES];
+static size_t s_sd_entry_count;
+static int s_sd_selection;
+static bool s_sd_file_view_open;
+static char s_sd_file_path[80];
+static char s_sd_file_text[SD_FILE_TEXT_BUFFER];
+static size_t s_sd_file_text_len;
+static size_t s_sd_file_view_pos;
+static char s_sd_cwd[80] = SD_PATH_PREFIX;
+
+static void sd_browser_go_up(void)
+{
+    /* Trim trailing slash */
+    size_t len = strlen(s_sd_cwd);
+    if (len <= 1) {
+        strncpy(s_sd_cwd, SD_PATH_PREFIX, sizeof(s_sd_cwd) - 1);
+        s_sd_cwd[sizeof(s_sd_cwd) - 1] = '\0';
+        return;
+    }
+    /* remove trailing slash if present */
+    if (s_sd_cwd[len - 1] == '/') {
+        s_sd_cwd[len - 1] = '\0';
+        len--;
+    }
+    /* find previous slash */
+    char *p = strrchr(s_sd_cwd, '/');
+    if (!p) {
+        strncpy(s_sd_cwd, SD_PATH_PREFIX, sizeof(s_sd_cwd) - 1);
+        s_sd_cwd[sizeof(s_sd_cwd) - 1] = '\0';
+        return;
+    }
+    /* keep root as /sdcard/ */
+    size_t root_len = strlen(SD_PATH_PREFIX) - 1; /* without trailing slash */
+    if ((size_t)(p - s_sd_cwd) < root_len) {
+        strncpy(s_sd_cwd, SD_PATH_PREFIX, sizeof(s_sd_cwd) - 1);
+        s_sd_cwd[sizeof(s_sd_cwd) - 1] = '\0';
+        return;
+    }
+    *p = '\0';
+    /* ensure trailing slash */
+    strncat(s_sd_cwd, "/", sizeof(s_sd_cwd) - strlen(s_sd_cwd) - 1);
+}
+
 static int pct_from_raw(int raw)
 {
     raw = MAX(0, MIN(raw, ADC_RAW_MAX));
@@ -358,6 +415,232 @@ static void set_action(const char *msg)
 {
     copy_text(s_board.action, sizeof(s_board.action), msg);
     s_action_until_ms = lv_tick_get() + UI_ACTION_MSG_MS;
+}
+
+/* forward declarations used by SD browser (defined later) */
+static void ui_set_hint(const char *normal);
+static void ui_set_bar(int value);
+
+static bool sd_is_text_file(const char *name)
+{
+    const char *ext = strrchr(name, '.');
+    if (!ext || ext == name) {
+        return false;
+    }
+    return strcasecmp(ext, ".txt") == 0 ||
+           strcasecmp(ext, ".md") == 0 ||
+           strcasecmp(ext, ".log") == 0 ||
+           strcasecmp(ext, ".csv") == 0 ||
+           strcasecmp(ext, ".json") == 0 ||
+           strcasecmp(ext, ".ini") == 0 ||
+           strcasecmp(ext, ".c") == 0 ||
+           strcasecmp(ext, ".h") == 0 ||
+           strcasecmp(ext, ".py") == 0;
+}
+
+static void sd_browser_scan(void)
+{
+    s_sd_entry_count = 0;
+    s_sd_selection = 0;
+    s_sd_file_view_open = false;
+
+    DIR *dir = opendir(s_sd_cwd);
+    if (!dir) {
+        return;
+    }
+
+    struct dirent *entry;
+    /* if not at root, offer parent entry */
+    if (strcmp(s_sd_cwd, SD_PATH_PREFIX) != 0 && s_sd_entry_count < SD_BROWSER_MAX_ENTRIES) {
+        sd_entry_t *p = &s_sd_entries[s_sd_entry_count++];
+        strncpy(p->name, "..", sizeof(p->name) - 1);
+        p->name[sizeof(p->name) - 1] = '\0';
+        p->is_dir = true;
+    }
+
+    while ((entry = readdir(dir)) != NULL && s_sd_entry_count < SD_BROWSER_MAX_ENTRIES) {
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+
+        sd_entry_t *target = &s_sd_entries[s_sd_entry_count];
+        /* copy name with explicit truncation to avoid format-truncation warnings */
+        size_t nlen = strnlen(entry->d_name, sizeof(((struct dirent *)0)->d_name));
+        size_t copy_n = nlen < (sizeof(target->name) - 1) ? nlen : (sizeof(target->name) - 1);
+        memcpy(target->name, entry->d_name, copy_n);
+        target->name[copy_n] = '\0';
+        target->is_dir = false;
+
+        if (entry->d_type == DT_DIR) {
+            target->is_dir = true;
+        } else if (entry->d_type == DT_UNKNOWN) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s%s", s_sd_cwd, entry->d_name);
+            struct stat st;
+            if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                target->is_dir = true;
+            }
+        }
+
+        s_sd_entry_count++;
+    }
+
+    closedir(dir);
+    if (s_sd_selection >= (int)s_sd_entry_count) {
+        s_sd_selection = s_sd_entry_count ? (int)s_sd_entry_count - 1 : 0;
+    }
+}
+
+static void sd_browser_close_file(void)
+{
+    s_sd_file_view_open = false;
+    s_sd_file_view_pos = 0;
+}
+
+static void sd_browser_open_file(void)
+{
+    if (!s_board.sd_mounted || s_sd_entry_count == 0 || s_sd_selection < 0 || s_sd_selection >= (int)s_sd_entry_count) {
+        return;
+    }
+
+    sd_entry_t *entry = &s_sd_entries[s_sd_selection];
+    if (entry->is_dir) {
+        /* enter directory or go up */
+        if (strcmp(entry->name, "..") == 0) {
+            sd_browser_go_up();
+        } else {
+            /* append directory name to cwd */
+            size_t len = strlen(s_sd_cwd);
+            if (len + strlen(entry->name) + 2 < sizeof(s_sd_cwd)) {
+                /* ensure trailing slash */
+                if (s_sd_cwd[len - 1] != '/') {
+                    strncat(s_sd_cwd, "/", sizeof(s_sd_cwd) - len - 1);
+                    len++;
+                }
+                strncat(s_sd_cwd, entry->name, sizeof(s_sd_cwd) - len - 1);
+                strncat(s_sd_cwd, "/", sizeof(s_sd_cwd) - strlen(s_sd_cwd) - 1);
+            }
+        }
+        sd_browser_scan();
+        return;
+    }
+
+    if (!sd_is_text_file(entry->name)) {
+        set_action("Only text files");
+        return;
+    }
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s%s", s_sd_cwd, entry->name);
+    /* copy truncated path into s_sd_file_path for UI display (explicit truncate) */
+    size_t plen = strlen(path);
+    size_t cp = plen < (sizeof(s_sd_file_path) - 1) ? plen : (sizeof(s_sd_file_path) - 1);
+    memcpy(s_sd_file_path, path, cp);
+    s_sd_file_path[cp] = '\0';
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        set_action("Open failed");
+        return;
+    }
+
+    size_t read_len = fread(s_sd_file_text, 1, sizeof(s_sd_file_text) - 1, fp);
+    fclose(fp);
+    s_sd_file_text_len = read_len;
+    s_sd_file_text[read_len] = '\0';
+    s_sd_file_view_pos = 0;
+    s_sd_file_view_open = true;
+    set_action(read_len ? "Text opened" : "Empty file");
+}
+
+static void sd_browser_scroll_file(int step)
+{
+    if (!s_sd_file_view_open || s_sd_file_text_len == 0) {
+        return;
+    }
+
+    if (step < 0) {
+        if (s_sd_file_view_pos <= SD_TEXT_CHUNK) {
+            s_sd_file_view_pos = 0;
+        } else {
+            s_sd_file_view_pos -= SD_TEXT_CHUNK;
+        }
+    } else {
+        size_t max_pos = s_sd_file_text_len > SD_TEXT_CHUNK ? s_sd_file_text_len - SD_TEXT_CHUNK : 0;
+        s_sd_file_view_pos = MIN(s_sd_file_view_pos + SD_TEXT_CHUNK, max_pos);
+    }
+}
+
+static void sd_browser_select(int step)
+{
+    if (s_sd_entry_count == 0) {
+        return;
+    }
+
+    int next = s_sd_selection + step;
+    if (next < 0) {
+        next = 0;
+    }
+    if (next >= (int)s_sd_entry_count) {
+        next = (int)s_sd_entry_count - 1;
+    }
+    s_sd_selection = next;
+}
+
+static void sd_browser_update_display(void)
+{
+    if (!s_ui.value || !s_ui.sub) {
+        return;
+    }
+
+    if (s_sd_file_view_open) {
+        char preview[512];
+        const char *text = s_sd_file_text + s_sd_file_view_pos;
+        strncpy(preview, text, sizeof(preview) - 1);
+        preview[sizeof(preview) - 1] = '\0';
+
+        lv_label_set_text(s_ui.value, preview);
+        lv_obj_set_style_text_align(s_ui.value, LV_TEXT_ALIGN_LEFT, 0);
+        lv_label_set_text_fmt(s_ui.sub,
+                              "%s %u/%u",
+                              s_sd_file_path + strlen(SD_PATH_PREFIX),
+                              (unsigned)(s_sd_file_view_pos / SD_TEXT_CHUNK + 1),
+                              (unsigned)((s_sd_file_text_len + SD_TEXT_CHUNK - 1) / SD_TEXT_CHUNK));
+        ui_set_hint("U/D scroll  B back");
+        ui_set_bar(s_sd_file_text_len ? (int)((s_sd_file_view_pos * 100) / (s_sd_file_text_len - 1)) : 0);
+    } else {
+        char buffer[512] = "";
+        size_t first = 0;
+        if (s_sd_entry_count > SD_DISPLAY_LINE_COUNT && s_sd_selection >= SD_DISPLAY_LINE_COUNT) {
+            first = s_sd_selection - SD_DISPLAY_LINE_COUNT + 1;
+        }
+
+        for (size_t i = first; i < s_sd_entry_count && i < first + SD_DISPLAY_LINE_COUNT; ++i) {
+            if ((int)i == s_sd_selection) {
+                strncat(buffer, "> ", sizeof(buffer) - strlen(buffer) - 1);
+            } else {
+                strncat(buffer, "  ", sizeof(buffer) - strlen(buffer) - 1);
+            }
+            strncat(buffer, s_sd_entries[i].name, sizeof(buffer) - strlen(buffer) - 1);
+            strncat(buffer, s_sd_entries[i].is_dir ? "/\n" : "\n", sizeof(buffer) - strlen(buffer) - 1);
+        }
+
+        if (s_sd_entry_count == 0) {
+            strncpy(buffer, "No files found", sizeof(buffer) - 1);
+            buffer[sizeof(buffer) - 1] = '\0';
+        }
+
+        lv_label_set_text(s_ui.value, buffer);
+        lv_obj_set_style_text_align(s_ui.value, LV_TEXT_ALIGN_LEFT, 0);
+        lv_label_set_text_fmt(s_ui.sub, "%u files", (unsigned)s_sd_entry_count);
+        if (s_ui.status) {
+            /* show short cwd in status */
+            const char *rel = s_sd_cwd + strlen(SD_PATH_PREFIX);
+            if (!*rel) rel = "/";
+            lv_label_set_text(s_ui.status, rel);
+        }
+        ui_set_hint("U/D sel  A open  B unmount");
+        ui_set_bar(s_sd_entry_count ? (int)((s_sd_selection * 100) / (s_sd_entry_count - 1)) : 0);
+    }
 }
 
 static esp_err_t i2c_write(i2c_master_dev_handle_t dev, const uint8_t *data, size_t len)
@@ -1152,10 +1435,10 @@ static lv_display_t *lvgl_display_init(esp_lcd_panel_io_handle_t io_handle)
 }
 
 static const char *const s_page_names[UI_PAGE_COUNT] = {
-    "BUZZER",
-    "SD CARD",
-    "SYSTEM",
-    "ABOUT",
+    "Buzzer",
+    "SD Card",
+    "System",
+    "About",
 };
 
 static const uint32_t UI_YELLOW = 0xF6D34A;
@@ -1313,7 +1596,7 @@ static void ui_build_about_page(lv_obj_t *page)
              "  ADC: 36/39/32/33\n"
              "  I2C: MPU6050 0x68\n"
              "  PWM: GPIO14 Buzzer\n"
-             "       GPIO25/26 EXT\n\n",
+             "               GPIO25/26 EXT\n\n",
             //  "wechat/tel:\n"
             //  "  15657325738\n",
              CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
@@ -1451,15 +1734,17 @@ static void ui_refresh(void)
         ui_set_bar((int)((s_buzzer_freq_hz - 440) * 100 / (1760 - 440)));
         break;
     case UI_PAGE_SD:
-        lv_label_set_text(s_ui.value, s_board.sd_mounted ? "MOUNTED" : "NO CARD");
-        if (s_board.sd_mounted) {
-            lv_label_set_text_fmt(s_ui.sub, "%s  %luMB", s_board.sd_name, (unsigned long)s_board.sd_mb);
-        }
-        else {
+        if (!s_board.sd_mounted) {
+            lv_label_set_text(s_ui.value, "NO CARD");
             lv_label_set_text_fmt(s_ui.sub, "GPIO22 CS  %s", short_err(s_board.last_sd_err));
+            ui_set_hint("A mount   L/R");
+            ui_set_bar(0);
+        } else {
+            if (s_sd_entry_count == 0 && !s_sd_file_view_open) {
+                sd_browser_scan();
+            }
+            sd_browser_update_display();
         }
-        ui_set_hint(s_board.sd_mounted ? "B unmount  L/R" : "A rescan   L/R");
-        ui_set_bar(s_board.sd_mounted ? 100 : 0);
         break;
     case UI_PAGE_SYSTEM:
         lv_label_set_text(s_ui.value, s_board.i2c_ready ? "I2C OK" : "I2C --");
@@ -1486,9 +1771,23 @@ static void ui_action(void)
         set_action(s_board.buzzer_ready ? "Beep" : "Buzzer init fail");
         break;
     case UI_PAGE_SD:
-        sd_try_mount();
-        err = s_board.sd_mounted ? ESP_OK : s_board.last_sd_err;
-        set_action(s_board.sd_mounted ? "SD mounted" : "No SD card");
+        if (!s_board.sd_mounted) {
+            sd_try_mount();
+            err = s_board.sd_mounted ? ESP_OK : s_board.last_sd_err;
+            set_action(s_board.sd_mounted ? "SD mounted" : "No SD card");
+            if (err == ESP_OK) {
+                sd_browser_scan();
+            }
+        } else {
+            /* Open selected file */
+            if (s_sd_entry_count == 0) {
+                sd_browser_scan();
+            }
+            else {
+                sd_browser_open_file();
+            }
+            err = ESP_OK;
+        }
         break;
     case UI_PAGE_SYSTEM:
         i2c_probe_devices(true);
@@ -1513,7 +1812,16 @@ static void ui_cancel(void)
         set_action("Buzzer stop");
         break;
     case UI_PAGE_SD:
-        sd_unmount();
+        if (s_sd_file_view_open) {
+            sd_browser_close_file();
+            set_action("Closed");
+        } else if (strcmp(s_sd_cwd, SD_PATH_PREFIX) != 0) {
+            sd_browser_go_up();
+            sd_browser_scan();
+            set_action("Up");
+        } else {
+            sd_unmount();
+        }
         break;
     default:
         buzzer_stop();
@@ -1532,6 +1840,13 @@ static void ui_adjust(int step)
         set_action("Pitch set");
         break;
     }
+    case UI_PAGE_SD:
+        if (s_sd_file_view_open) {
+            sd_browser_scroll_file(step);
+        } else {
+            sd_browser_select(step);
+        }
+        break;
     default:
         return;
     }

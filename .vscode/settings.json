@@ -13,5 +13,6 @@
     "--query-driver=**",
     "--compile-commands-dir=/home/zyoung/project/esp/xiaomiao/build"
   ],
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.portWin": "COM3"
 }
