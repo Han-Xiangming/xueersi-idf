@@ -7,11 +7,11 @@
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32"
   },
-  "clangd.path": "/home/zyoung/.espressif/tools/esp-clang/esp-19.1.2_20250312/esp-clang/bin/clangd",
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
   "clangd.arguments": [
     "--background-index",
     "--query-driver=**",
-    "--compile-commands-dir=/home/zyoung/project/esp/xiaomiao/build"
+    "--compile-commands-dir=c:\\Users\\OpenTankOfBeta\\Desktop\\Xiaomao\\DEV\\xueersi-idf\\build"
   ],
   "idf.flashType": "UART",
   "idf.portWin": "COM3"
