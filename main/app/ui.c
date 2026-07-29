@@ -10,20 +10,17 @@
 
 #include "board_config.h"
 #include "hardware/buttons.h"
-#include "hardware/buzzer.h"
+#include "hardware/audio.h"
 #include "hardware/sd.h"
 #include "app/ui.h"
 
-#include "esp_chip_info.h"
 #include "esp_err.h"
-#include "esp_heap_caps.h"
-#include "esp_idf_version.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "lvgl.h"
 #include "sdkconfig.h"
 
-/* Build-info macros (read from sdkconfig for the ABOUT page). */
+/* Build-info macros (read from sdkconfig). */
 #ifndef CONFIG_IDF_TARGET
 #define CONFIG_IDF_TARGET "esp32"
 #endif
@@ -89,15 +86,27 @@
 #define UI_ACTION_MSG_MS            850
 
 static const char *const s_page_names[UI_PAGE_COUNT] = {
-    "BUZZER",
+    "I2S",
     "SD CARD",
-    "ABOUT",
+    "SETTINGS",
 };
+
+/* Settings sub-menu: up/down to select an item, left/right to change it.
+ * Add new options here and they appear automatically in the list. */
+typedef enum {
+    SETTING_VOLUME = 0,
+    SETTING_SFX,
+    SETTING_COUNT,
+} setting_item_t;
+
+static const int s_setting_y[SETTING_COUNT] = {40, 64};
+static int s_setting_sel = 0;
 
 /* BIOS/DOS-style menu palette: dark base + cyan accent + gray monochrome text. */
 static const uint32_t UI_CYAN = 0x00E0E0;
 static const uint32_t UI_GRAY = 0x808080;
 static const uint32_t UI_BG_DARK = 0x000000;
+static const uint32_t UI_TITLE = 0x49F26B; /* retro-green title */
 
 /* Main-menu layout: up to 5 list rows (first UI_PAGE_COUNT are active). */
 #define UI_MENU_ROWS 5
@@ -119,6 +128,9 @@ typedef struct {
     lv_obj_t *menu_text[UI_MENU_ROWS];
     lv_obj_t *menu_status;
 
+    lv_obj_t *set_cursor[SETTING_COUNT];
+    lv_obj_t *set_text[SETTING_COUNT];
+
     lv_group_t *group;
     ui_page_t page_id;
 } ui_state_t;
@@ -126,7 +138,7 @@ typedef struct {
 static ui_state_t s_ui;
 static bool s_in_menu;
 static int s_menu_sel;
-static uint32_t s_buzzer_freq_hz = 988;
+static uint32_t s_audio_freq_hz = 988;
 static uint32_t s_action_until_ms;
 static char s_action[32];
 
@@ -190,17 +202,7 @@ static lv_obj_t *ui_make_page(int x)
     lv_obj_set_size(page, LCD_H_RES, LCD_V_RES);
     lv_obj_set_style_bg_color(page, lv_color_hex(UI_BG_DARK), 0);
     lv_obj_set_style_bg_opa(page, LV_OPA_COVER, 0);
-    if (s_ui.page_id == UI_PAGE_ABOUT) {
-        lv_obj_add_flag(page, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_scroll_dir(page, LV_DIR_VER);
-        lv_obj_set_scrollbar_mode(page, LV_SCROLLBAR_MODE_AUTO);
-        lv_obj_set_style_width(page, 3, LV_PART_SCROLLBAR);
-        lv_obj_set_style_bg_color(page, lv_color_hex(UI_GRAY), LV_PART_SCROLLBAR);
-        lv_obj_set_style_bg_opa(page, LV_OPA_80, LV_PART_SCROLLBAR);
-    }
-    else {
-        lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
-    }
+    lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
     return page;
 }
 
@@ -239,93 +241,28 @@ static void ui_set_hint(const char *normal)
     }
 }
 
-static unsigned ui_kb(size_t bytes)
+static void ui_build_settings(lv_obj_t *page)
 {
-    return (unsigned)((bytes + 512) / 1024);
-}
+    s_setting_sel = 0;
 
-static void ui_build_about_page(lv_obj_t *page)
-{
-    esp_chip_info_t chip_info;
-    char details[1200];
+    for (int i = 0; i < SETTING_COUNT; i++) {
+        lv_obj_t *cur = lv_label_create(page);
+        lv_label_set_text(cur, " ");
+        lv_obj_set_pos(cur, 8, s_setting_y[i]);
+        lv_obj_set_style_text_font(cur, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(cur, lv_color_hex(UI_GRAY), 0);
+        s_ui.set_cursor[i] = cur;
 
-    esp_chip_info(&chip_info);
+        lv_obj_t *txt = lv_label_create(page);
+        lv_label_set_long_mode(txt, LV_LABEL_LONG_MODE_CLIP);
+        lv_obj_set_pos(txt, 18, s_setting_y[i]);
+        lv_obj_set_style_text_font(txt, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(txt, lv_color_hex(UI_GRAY), 0);
+        s_ui.set_text[i] = txt;
+    }
 
-    const size_t sram_total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
-    const size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-
-    snprintf(details,
-             sizeof(details),
-             "Model\n"
-             "  Xiaomiao Handheld\n"
-             "  ESP32-WROVER-B\n"
-             "  Author: ZYoung\n\n"
-             "CPU\n"
-             "  Xtensa LX6\n"
-             "    %d MHz x%u\n"
-             "  Chip rev: %u\n\n"
-             "System\n"
-             "  ESP-IDF: %s\n"
-             "  FreeRTOS: %s\n"
-             "  Target: %s\n"
-             "  Build: %s\n\n"
-             "Clocks\n"
-             "  Flash: %s %s\n"
-             "  PSRAM: %d MHz\n"
-             "  LCD SPI2: %u MHz\n"
-             "  SD SPI2: %u MHz\n\n"
-             "Storage\n"
-             "  Flash: %s\n"
-             "  SRAM: %u KB\n"
-             "  PSRAM: %u KB\n\n"
-             "Display\n"
-             "  ST7735 160x128\n"
-             "  SPI2 %u MHz\n"
-             "  RGB565 DMA x%u\n"
-             "  LVGL %d.%d.%d\n\n"
-             "Board IO\n"
-             "  Keys: 6 active-low\n"
-             "  SD: SPI2 CS22\n"
-             "  PWM: GPIO14 Buzzer\n\n"
-             "wechat/tel:\n"
-             "  15657325738\n",
-             CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
-             (unsigned)chip_info.cores,
-             (unsigned)chip_info.revision,
-             esp_get_idf_version(),
-             tskKERNEL_VERSION_NUMBER,
-             UI_TARGET_NAME,
-             __DATE__,
-             UI_FLASH_MODE,
-             UI_FLASH_FREQ,
-             CONFIG_SPIRAM_SPEED,
-             (unsigned)(LCD_PIXEL_CLOCK_HZ / 1000000),
-             (unsigned)(SD_SPI_MAX_FREQ_KHZ / 1000),
-             UI_FLASH_SIZE,
-             ui_kb(sram_total),
-             ui_kb(psram_total),
-             (unsigned)(LCD_PIXEL_CLOCK_HZ / 1000000),
-             (unsigned)LCD_DRAW_BUF_COUNT,
-             LVGL_VERSION_MAJOR,
-             LVGL_VERSION_MINOR,
-             LVGL_VERSION_PATCH);
-
-    lv_obj_t *label = lv_label_create(page);
-    lv_label_set_text(label, details);
-    lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_WRAP);
-    lv_obj_set_pos(label, 8, 28);
-    lv_obj_set_width(label, LCD_H_RES - 22);
-    lv_obj_set_style_text_color(label, lv_color_hex(UI_GRAY), 0);
-    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_line_space(label, 1, 0);
-
-    s_ui.value = lv_label_create(page);
-    lv_obj_add_flag(s_ui.value, LV_OBJ_FLAG_HIDDEN);
-    s_ui.sub = lv_label_create(page);
-    lv_obj_add_flag(s_ui.sub, LV_OBJ_FLAG_HIDDEN);
-    s_ui.hint = lv_label_create(page);
-    lv_obj_add_flag(s_ui.hint, LV_OBJ_FLAG_HIDDEN);
-    s_ui.bar = NULL;
+    s_ui.hint = ui_label(page, "U/D sel  L/R set  B menu", 106,
+                         UI_GRAY, &lv_font_montserrat_10, LV_TEXT_ALIGN_CENTER);
 }
 
 static void ui_build_page_content(lv_obj_t *page)
@@ -344,8 +281,8 @@ static void ui_build_page_content(lv_obj_t *page)
     lv_obj_set_style_bg_color(sep, lv_color_hex(UI_GRAY), 0);
     lv_obj_set_style_bg_opa(sep, LV_OPA_COVER, 0);
 
-    if (s_ui.page_id == UI_PAGE_ABOUT) {
-        ui_build_about_page(page);
+    if (s_ui.page_id == UI_PAGE_SETTINGS) {
+        ui_build_settings(page);
         return;
     }
 
@@ -386,12 +323,12 @@ static void ui_build_menu(void)
     lv_obj_clear_flag(mp, LV_OBJ_FLAG_SCROLLABLE);
     s_ui.menu_page = mp;
 
-    /* Title bar: "- XiaoMiao -" in cyan, left-aligned. */
+    /* Title bar: ASCII cat kaomoji in retro-green, left-aligned. */
     lv_obj_t *title = lv_label_create(mp);
-    lv_label_set_text(title, "- XiaoMiao -");
+    lv_label_set_text(title, "=^_^=");
     lv_obj_set_pos(title, 4, 2);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_10, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(UI_CYAN), 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(UI_TITLE), 0);
 
     /* Separator line spanning the full width, clear of the title. */
     lv_obj_t *sep = lv_obj_create(mp);
@@ -462,8 +399,8 @@ static void ui_enter_page(ui_page_t page)
     s_ui.accent = NULL;
     ui_build_page_content(s_ui.page);
     ui_refresh();
-    if (hw_buzzer_ready()) {
-        hw_buzzer_beep(660, 30);
+    if (hw_audio_ready()) {
+        hw_audio_tone(660, 30);
     }
 }
 
@@ -472,16 +409,21 @@ void ui_refresh(void)
     if (s_in_menu) {
         return;
     }
-    if (!s_ui.value || !s_ui.sub || !s_ui.hint) {
+    if (s_ui.page_id == UI_PAGE_SETTINGS) {
+        if (!s_ui.set_cursor[0] || !s_ui.hint) {
+            return;
+        }
+    }
+    else if (!s_ui.value || !s_ui.sub || !s_ui.hint) {
         return;
     }
 
     switch (s_ui.page_id) {
-    case UI_PAGE_BUZZER:
-        lv_label_set_text_fmt(s_ui.value, "%lu Hz", (unsigned long)s_buzzer_freq_hz);
-        lv_label_set_text(s_ui.sub, hw_buzzer_ready() ? "GPIO14 PWM" : "PWM INIT FAIL");
-        ui_set_hint("U/D Hz  A beep  B stop");
-        ui_set_bar((int)((s_buzzer_freq_hz - 440) * 100 / (1760 - 440)));
+    case UI_PAGE_AUDIO:
+        lv_label_set_text_fmt(s_ui.value, "%lu Hz", (unsigned long)s_audio_freq_hz);
+        lv_label_set_text(s_ui.sub, hw_audio_ready() ? "MAX98357 I2S" : "I2S INIT FAIL");
+        ui_set_hint("U/D Hz  A tone  B menu");
+        ui_set_bar((int)((s_audio_freq_hz - 440) * 100 / (1760 - 440)));
         break;
     case UI_PAGE_SD:
         lv_label_set_text(s_ui.value, hw_sd_is_mounted() ? "MOUNTED" : "NO CARD");
@@ -494,8 +436,28 @@ void ui_refresh(void)
         ui_set_hint(hw_sd_is_mounted() ? "B menu" : "A rescan  B menu");
         ui_set_bar(hw_sd_is_mounted() ? 100 : 0);
         break;
-    case UI_PAGE_ABOUT:
+    case UI_PAGE_SETTINGS: {
+        static const char *const names[SETTING_COUNT] = {"VOLUME", "SFX"};
+        char buf[24];
+        for (int i = 0; i < SETTING_COUNT; i++) {
+            const int sel = (i == s_setting_sel);
+            lv_label_set_text(s_ui.set_cursor[i], sel ? ">" : " ");
+            lv_obj_set_style_text_color(s_ui.set_cursor[i], lv_color_hex(UI_CYAN), 0);
+            lv_obj_set_style_text_color(s_ui.set_text[i],
+                                        lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
+            if (i == SETTING_VOLUME) {
+                snprintf(buf, sizeof(buf), "%-8s %u%%",
+                         names[i], (unsigned)hw_audio_get_volume());
+            }
+            else {
+                snprintf(buf, sizeof(buf), "%-8s %s",
+                         names[i], hw_audio_is_enabled() ? "ON" : "OFF");
+            }
+            lv_label_set_text(s_ui.set_text[i], buf);
+        }
+        ui_set_hint("U/D sel  L/R set  B menu");
         break;
+    }
     default:
         break;
     }
@@ -506,9 +468,9 @@ static void ui_action(void)
     esp_err_t err = ESP_OK;
 
     switch (s_ui.page_id) {
-    case UI_PAGE_BUZZER:
-        hw_buzzer_beep(s_buzzer_freq_hz, 140);
-        set_action(hw_buzzer_ready() ? "Beep" : "Buzzer init fail");
+    case UI_PAGE_AUDIO:
+        hw_audio_tone(s_audio_freq_hz, 140);
+        set_action(hw_audio_ready() ? "Tone" : "I2S init fail");
         break;
     case UI_PAGE_SD:
         hw_sd_try_mount();
@@ -519,8 +481,8 @@ static void ui_action(void)
         break;
     }
 
-    if (err == ESP_OK && s_ui.page_id != UI_PAGE_BUZZER) {
-        hw_buzzer_beep(660, 35);
+    if (err == ESP_OK && s_ui.page_id == UI_PAGE_SD) {
+        hw_audio_tone(660, 35);
     }
     ui_refresh();
 }
@@ -530,27 +492,43 @@ static void ui_action(void)
 static void ui_adjust(int step)
 {
     switch (s_ui.page_id) {
-    case UI_PAGE_BUZZER: {
-        int freq = (int)s_buzzer_freq_hz + step * 110;
-        s_buzzer_freq_hz = MAX(440, MIN(freq, 1760));
+    case UI_PAGE_AUDIO: {
+        int freq = (int)s_audio_freq_hz + step * 110;
+        s_audio_freq_hz = MAX(440, MIN(freq, 1760));
         set_action("Pitch set");
         break;
     }
+    case UI_PAGE_SETTINGS:
+        s_setting_sel = (s_setting_sel - step + SETTING_COUNT) % SETTING_COUNT;
+        set_action("Select");
+        break;
     default:
         return;
     }
     ui_refresh();
 }
 
-static void ui_scroll_about(int step)
+/* Left/right changes the value of the selected settings item. */
+static void ui_adjust_lr(int dir)
 {
-    if (!s_ui.page) {
+    if (s_ui.page_id != UI_PAGE_SETTINGS) {
         return;
     }
-
-    const int32_t scroll_step = 26;
-    const int32_t scroll_y = lv_obj_get_scroll_y(s_ui.page) + step * scroll_step;
-    lv_obj_scroll_to_y(s_ui.page, MAX(0, scroll_y), LV_ANIM_ON);
+    switch (s_setting_sel) {
+    case SETTING_VOLUME: {
+        int v = (int)hw_audio_get_volume() + dir * 10;
+        hw_audio_set_volume((uint8_t)MAX(0, MIN(v, 100)));
+        set_action("Volume set");
+        break;
+    }
+    case SETTING_SFX:
+        hw_audio_set_enabled(dir > 0);
+        set_action(dir > 0 ? "SFX ON" : "SFX OFF");
+        break;
+    default:
+        return;
+    }
+    ui_refresh();
 }
 
 static void ui_key_event_cb(lv_event_t *e)
@@ -565,15 +543,15 @@ static void ui_key_event_cb(lv_event_t *e)
         if (key == LV_KEY_UP) {
             s_menu_sel = (s_menu_sel + UI_PAGE_COUNT - 1) % UI_PAGE_COUNT;
             ui_refresh_menu();
-            if (hw_buzzer_ready()) {
-                hw_buzzer_beep(990, 16);
+            if (hw_audio_ready()) {
+                hw_audio_tone(990, 16);
             }
         }
         else if (key == LV_KEY_DOWN) {
             s_menu_sel = (s_menu_sel + 1) % UI_PAGE_COUNT;
             ui_refresh_menu();
-            if (hw_buzzer_ready()) {
-                hw_buzzer_beep(990, 16);
+            if (hw_audio_ready()) {
+                hw_audio_tone(990, 16);
             }
         }
         else if (key == LV_KEY_ENTER) {
@@ -586,8 +564,8 @@ static void ui_key_event_cb(lv_event_t *e)
     /* Inside a detail page. */
     if (key == LV_KEY_ESC) {
         ui_show_menu();
-        if (hw_buzzer_ready()) {
-            hw_buzzer_beep(520, 24);
+        if (hw_audio_ready()) {
+            hw_audio_tone(520, 24);
         }
         return;
     }
@@ -596,21 +574,19 @@ static void ui_key_event_cb(lv_event_t *e)
         return;
     }
     if (key == LV_KEY_UP) {
-        if (s_ui.page_id == UI_PAGE_ABOUT) {
-            ui_scroll_about(-1);
-        }
-        else {
-            ui_adjust(1);
-        }
+        ui_adjust(1);
         return;
     }
     if (key == LV_KEY_DOWN) {
-        if (s_ui.page_id == UI_PAGE_ABOUT) {
-            ui_scroll_about(1);
-        }
-        else {
-            ui_adjust(-1);
-        }
+        ui_adjust(-1);
+        return;
+    }
+    if (key == LV_KEY_LEFT) {
+        ui_adjust_lr(-1);
+        return;
+    }
+    if (key == LV_KEY_RIGHT) {
+        ui_adjust_lr(1);
         return;
     }
 }
@@ -618,7 +594,7 @@ static void ui_key_event_cb(lv_event_t *e)
 void ui_create(lv_group_t *group)
 {
     s_ui.group = group;
-    s_ui.page_id = UI_PAGE_BUZZER;
+    s_ui.page_id = UI_PAGE_AUDIO;
     s_in_menu = true;
     s_menu_sel = 0;
 

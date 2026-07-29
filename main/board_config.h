@@ -38,5 +38,7 @@
 #define PIN_NUM_SD_CS           GPIO_NUM_22
 #define SD_SPI_MAX_FREQ_KHZ     10000
 
-/* Passive buzzer (LEDC PWM) */
-#define PIN_NUM_BUZZER          GPIO_NUM_14
+/* I2S audio output (MAX98357 Class-D DAC, internal PLL, no MCLK) */
+#define PIN_NUM_I2S_BCLK        GPIO_NUM_25
+#define PIN_NUM_I2S_LRC         GPIO_NUM_32
+#define PIN_NUM_I2S_DIN         GPIO_NUM_33

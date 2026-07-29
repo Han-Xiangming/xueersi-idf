@@ -1,6 +1,6 @@
 idf_component_register(SRCS "main.c"
                              "hardware/lcd.c"
-                             "hardware/buzzer.c"
+                             "hardware/audio.c"
                              "hardware/sd.c"
                              "hardware/buttons.c"
                              "app/ui.c"
@@ -9,7 +9,7 @@ idf_component_register(SRCS "main.c"
                                      esp_timer
                                      esp_driver_gpio
                                      esp_driver_spi
-                                     esp_driver_ledc
+                                     esp_driver_i2s
                                      esp_driver_sdspi
                                      esp_hw_support
                                      heap

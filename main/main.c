@@ -15,7 +15,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "hardware/buttons.h"
-#include "hardware/buzzer.h"
+#include "hardware/audio.h"
 #include "hardware/lcd.h"
 #include "lvgl.h"
 #include "app/ui.h"
@@ -39,7 +39,7 @@ static void lvgl_task(void *arg)
     hw_lcd_display_on();
 
     while (true) {
-        hw_buzzer_process_timers();
+        hw_audio_process_timers();
         if (lv_tick_elaps(last_update_ms) >= UI_REFRESH_PERIOD_MS) {
             last_update_ms = lv_tick_get();
             ui_refresh();
@@ -58,7 +58,7 @@ void app_main(void)
 
     hw_buttons_init();
     hw_lcd_init();
-    hw_buzzer_init();
+    hw_audio_init();
 
     lv_init();
     lv_display_t *display = hw_lcd_create_display();

@@ -1,7 +1,7 @@
 /*
  * Software layer: LVGL user interface and application state machine.
  *
- * Consumes the hardware-layer drivers (buzzer, SD, buttons, LCD) through
+ * Consumes the hardware-layer drivers (audio, SD, buttons, LCD) through
  * their public APIs and never touches registers or LVGL display internals.
  */
 #pragma once
@@ -19,9 +19,9 @@
 #define LVGL_TASK_MAX_DELAY_MS      16
 
 typedef enum {
-    UI_PAGE_BUZZER = 0,
+    UI_PAGE_AUDIO = 0,
     UI_PAGE_SD,
-    UI_PAGE_ABOUT,
+    UI_PAGE_SETTINGS,
     UI_PAGE_COUNT,
 } ui_page_t;
 
