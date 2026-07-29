@@ -1,11 +1,11 @@
 /*
  * Hardware layer: SD card over SDSPI.
- * See hw_sd.h.
+ * See hardware/sd.h.
  */
 #include <string.h>
 
-#include "board.h"
-#include "hw/hw_sd.h"
+#include "board_config.h"
+#include "hardware/sd.h"
 
 #include "driver/sdspi_host.h"
 #include "driver/spi_master.h"

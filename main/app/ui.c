@@ -8,11 +8,11 @@
 #include <string.h>
 #include <sys/param.h>
 
-#include "board.h"
-#include "hw/hw_buttons.h"
-#include "hw/hw_buzzer.h"
-#include "hw/hw_sd.h"
-#include "sw/ui.h"
+#include "board_config.h"
+#include "hardware/buttons.h"
+#include "hardware/buzzer.h"
+#include "hardware/sd.h"
+#include "app/ui.h"
 
 #include "esp_chip_info.h"
 #include "esp_err.h"
