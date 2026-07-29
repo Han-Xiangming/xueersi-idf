@@ -19,8 +19,9 @@
 #define LVGL_TASK_MAX_DELAY_MS      16
 
 typedef enum {
-    UI_PAGE_AUDIO = 0,
+    UI_PAGE_PLAYER = 0,
     UI_PAGE_SD,
+    UI_PAGE_BT,
     UI_PAGE_SETTINGS,
     UI_PAGE_COUNT,
 } ui_page_t;

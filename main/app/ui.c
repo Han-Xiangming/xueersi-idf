@@ -11,10 +11,14 @@
 #include "board_config.h"
 #include "hardware/buttons.h"
 #include "hardware/audio.h"
+#include "hardware/bt_audio.h"
 #include "hardware/sd.h"
 #include "app/ui.h"
+#include "player.h"
 
+#include "esp_attr.h"
 #include "esp_err.h"
+#include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "lvgl.h"
@@ -86,8 +90,9 @@
 #define UI_ACTION_MSG_MS            850
 
 static const char *const s_page_names[UI_PAGE_COUNT] = {
-    "I2S",
+    "MP3",
     "SD CARD",
+    "BLUETOOTH",
     "SETTINGS",
 };
 
@@ -95,12 +100,37 @@ static const char *const s_page_names[UI_PAGE_COUNT] = {
  * Add new options here and they appear automatically in the list. */
 typedef enum {
     SETTING_VOLUME = 0,
-    SETTING_SFX,
+    SETTING_BTOUT,
+    SETTING_LOG,
     SETTING_COUNT,
 } setting_item_t;
 
-static const int s_setting_y[SETTING_COUNT] = {40, 64};
+static const int s_setting_y[SETTING_COUNT] = {40, 60, 80};
+
+/* Verbose (DEBUG) logging for the audio/player tags; off = normal INFO. */
+static bool s_log_debug;
+
+static void ui_apply_log_level(void)
+{
+    esp_log_level_t lvl = s_log_debug ? ESP_LOG_DEBUG : ESP_LOG_INFO;
+    esp_log_level_set("player", lvl);
+    esp_log_level_set("hw_audio", lvl);
+    esp_log_level_set("bt_audio", lvl);
+}
 static int s_setting_sel = 0;
+
+#define MP3_LIST_ROWS 4
+static const int s_pl_row_y[MP3_LIST_ROWS] = {34, 54, 74, 94};
+
+/* Bluetooth sink picker: same 4-row list layout as the MP3 page. */
+#define BT_LIST_ROWS 4
+static const int s_bt_row_y[BT_LIST_ROWS] = {34, 54, 74, 94};
+static int s_bt_sel;
+/* 4 KB of song names is UI-only data: keep it in external PSRAM so it does
+ * not compete with the Bluetooth stack for internal DRAM. */
+EXT_RAM_BSS_ATTR static char s_mp3_names[64][MP3_NAME_LEN];
+static int s_mp3_count;
+static int s_mp3_sel;
 
 /* BIOS/DOS-style menu palette: dark base + cyan accent + gray monochrome text. */
 static const uint32_t UI_CYAN = 0x00E0E0;
@@ -131,6 +161,14 @@ typedef struct {
     lv_obj_t *set_cursor[SETTING_COUNT];
     lv_obj_t *set_text[SETTING_COUNT];
 
+    lv_obj_t *pl_cursor[MP3_LIST_ROWS];
+    lv_obj_t *pl_text[MP3_LIST_ROWS];
+    lv_obj_t *pl_prog;
+
+    lv_obj_t *bt_cursor[BT_LIST_ROWS];
+    lv_obj_t *bt_text[BT_LIST_ROWS];
+    lv_obj_t *bt_status;
+
     lv_group_t *group;
     ui_page_t page_id;
 } ui_state_t;
@@ -138,7 +176,6 @@ typedef struct {
 static ui_state_t s_ui;
 static bool s_in_menu;
 static int s_menu_sel;
-static uint32_t s_audio_freq_hz = 988;
 static uint32_t s_action_until_ms;
 static char s_action[32];
 
@@ -154,6 +191,23 @@ static void set_action(const char *msg)
 {
     copy_text(s_action, sizeof(s_action), msg);
     s_action_until_ms = lv_tick_get() + UI_ACTION_MSG_MS;
+}
+
+/* Step the master volume by `dir` (+1/-1) with fine control near silence:
+ * below 10% the step is 1% (quiet speech is very sensitive there), above it
+ * the given coarse step applies. Boundary cases resolve to the fine step so
+ * e.g. 10% - coarse lands on 9%, not 0%/5%. */
+static void ui_volume_step(int dir, int coarse)
+{
+    int v = (int)hw_audio_get_volume();
+    int step = (v < 10 || (v == 10 && dir < 0)) ? 1 : coarse;
+    v += dir * step;
+    /* Snap coarse upward moves onto multiples of the coarse step once out of
+     * the fine zone (9% + coarse -> 10%, keeps the scale tidy). */
+    if (step == 1 && dir > 0 && v > 10) {
+        v = 10;
+    }
+    hw_audio_set_volume((uint8_t)MAX(0, MIN(v, 100)));
 }
 
 static const char *short_err(esp_err_t err)
@@ -265,6 +319,61 @@ static void ui_build_settings(lv_obj_t *page)
                          UI_GRAY, &lv_font_montserrat_10, LV_TEXT_ALIGN_CENTER);
 }
 
+static void ui_build_player(lv_obj_t *page)
+{
+    s_mp3_sel = 0;
+    s_mp3_count = 0;
+    player_scan(s_mp3_names, (int)(sizeof(s_mp3_names) / sizeof(s_mp3_names[0])), &s_mp3_count);
+
+    for (int i = 0; i < MP3_LIST_ROWS; i++) {
+        lv_obj_t *cur = lv_label_create(page);
+        lv_label_set_text(cur, " ");
+        lv_obj_set_pos(cur, 6, s_pl_row_y[i]);
+        lv_obj_set_style_text_font(cur, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(cur, lv_color_hex(UI_CYAN), 0);
+        s_ui.pl_cursor[i] = cur;
+
+        lv_obj_t *txt = lv_label_create(page);
+        lv_label_set_long_mode(txt, LV_LABEL_LONG_MODE_CLIP);
+        lv_obj_set_pos(txt, 16, s_pl_row_y[i]);
+        lv_obj_set_style_text_font(txt, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(txt, lv_color_hex(UI_GRAY), 0);
+        s_ui.pl_text[i] = txt;
+    }
+
+    s_ui.pl_prog = ui_label(page, "IDLE", 108, UI_GRAY, &lv_font_montserrat_10, LV_TEXT_ALIGN_CENTER);
+    s_ui.hint = ui_label(page, "U/D sel  A play  B back", 120, UI_GRAY, &lv_font_montserrat_10, LV_TEXT_ALIGN_CENTER);
+}
+
+/* Bluetooth page: entering it kicks off a scan; the list fills live. */
+static void ui_build_bt(lv_obj_t *page)
+{
+    s_bt_sel = 0;
+
+    for (int i = 0; i < BT_LIST_ROWS; i++) {
+        lv_obj_t *cur = lv_label_create(page);
+        lv_label_set_text(cur, " ");
+        lv_obj_set_pos(cur, 6, s_bt_row_y[i]);
+        lv_obj_set_style_text_font(cur, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(cur, lv_color_hex(UI_CYAN), 0);
+        s_ui.bt_cursor[i] = cur;
+
+        lv_obj_t *txt = lv_label_create(page);
+        lv_label_set_long_mode(txt, LV_LABEL_LONG_MODE_CLIP);
+        lv_obj_set_pos(txt, 16, s_bt_row_y[i]);
+        lv_obj_set_style_text_font(txt, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(txt, lv_color_hex(UI_GRAY), 0);
+        s_ui.bt_text[i] = txt;
+    }
+
+    s_ui.bt_status = ui_label(page, "SCANNING...", 108, UI_GRAY,
+                              &lv_font_montserrat_10, LV_TEXT_ALIGN_CENTER);
+    s_ui.hint = ui_label(page, "U/D sel  A conn  B back", 120, UI_GRAY,
+                         &lv_font_montserrat_10, LV_TEXT_ALIGN_CENTER);
+
+    bt_audio_scan_start();
+}
+
 static void ui_build_page_content(lv_obj_t *page)
 {
     char idx[10];
@@ -285,11 +394,20 @@ static void ui_build_page_content(lv_obj_t *page)
         ui_build_settings(page);
         return;
     }
+    if (s_ui.page_id == UI_PAGE_PLAYER) {
+        ui_build_player(page);
+        return;
+    }
+    if (s_ui.page_id == UI_PAGE_BT) {
+        ui_build_bt(page);
+        return;
+    }
 
+    /* Generic value/bar page (used by the SD CARD page). */
     s_ui.value = ui_label(page, "--", 38, UI_CYAN, &lv_font_montserrat_14, LV_TEXT_ALIGN_CENTER);
     s_ui.sub = ui_label(page, "--", 63, UI_GRAY, &lv_font_montserrat_10, LV_TEXT_ALIGN_CENTER);
     s_ui.bar = ui_bar(page, 0);
-    s_ui.hint = ui_label(page, "U/D Hz  A beep  B menu", 106, UI_GRAY, &lv_font_montserrat_10, LV_TEXT_ALIGN_CENTER);
+    s_ui.hint = ui_label(page, "A rescan  B menu", 106, UI_GRAY, &lv_font_montserrat_10, LV_TEXT_ALIGN_CENTER);
 }
 
 /* Menu uses show/hide transitions instead of LVGL swipe animations. */
@@ -399,9 +517,6 @@ static void ui_enter_page(ui_page_t page)
     s_ui.accent = NULL;
     ui_build_page_content(s_ui.page);
     ui_refresh();
-    if (hw_audio_ready()) {
-        hw_audio_tone(660, 30);
-    }
 }
 
 void ui_refresh(void)
@@ -414,17 +529,21 @@ void ui_refresh(void)
             return;
         }
     }
+    else if (s_ui.page_id == UI_PAGE_PLAYER) {
+        if (!s_ui.pl_cursor[0] || !s_ui.hint) {
+            return;
+        }
+    }
+    else if (s_ui.page_id == UI_PAGE_BT) {
+        if (!s_ui.bt_cursor[0] || !s_ui.hint) {
+            return;
+        }
+    }
     else if (!s_ui.value || !s_ui.sub || !s_ui.hint) {
         return;
     }
 
     switch (s_ui.page_id) {
-    case UI_PAGE_AUDIO:
-        lv_label_set_text_fmt(s_ui.value, "%lu Hz", (unsigned long)s_audio_freq_hz);
-        lv_label_set_text(s_ui.sub, hw_audio_ready() ? "MAX98357 I2S" : "I2S INIT FAIL");
-        ui_set_hint("U/D Hz  A tone  B menu");
-        ui_set_bar((int)((s_audio_freq_hz - 440) * 100 / (1760 - 440)));
-        break;
     case UI_PAGE_SD:
         lv_label_set_text(s_ui.value, hw_sd_is_mounted() ? "MOUNTED" : "NO CARD");
         if (hw_sd_is_mounted()) {
@@ -437,7 +556,7 @@ void ui_refresh(void)
         ui_set_bar(hw_sd_is_mounted() ? 100 : 0);
         break;
     case UI_PAGE_SETTINGS: {
-        static const char *const names[SETTING_COUNT] = {"VOLUME", "SFX"};
+        static const char *const names[SETTING_COUNT] = {"VOLUME", "BT OUT", "LOG"};
         char buf[24];
         for (int i = 0; i < SETTING_COUNT; i++) {
             const int sel = (i == s_setting_sel);
@@ -445,17 +564,140 @@ void ui_refresh(void)
             lv_obj_set_style_text_color(s_ui.set_cursor[i], lv_color_hex(UI_CYAN), 0);
             lv_obj_set_style_text_color(s_ui.set_text[i],
                                         lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
-            if (i == SETTING_VOLUME) {
+            switch (i) {
+            case SETTING_VOLUME:
                 snprintf(buf, sizeof(buf), "%-8s %u%%",
                          names[i], (unsigned)hw_audio_get_volume());
-            }
-            else {
-                snprintf(buf, sizeof(buf), "%-8s %s",
-                         names[i], hw_audio_is_enabled() ? "ON" : "OFF");
+                break;
+            case SETTING_BTOUT:
+                /* LINK = enabled and a sink is connected. */
+                snprintf(buf, sizeof(buf), "%-8s %s", names[i],
+                         !bt_audio_is_enabled() ? "OFF"
+                         : bt_audio_is_connected() ? "LINK" : "ON");
+                break;
+            case SETTING_LOG:
+                snprintf(buf, sizeof(buf), "%-8s %s", names[i],
+                         s_log_debug ? "DEBUG" : "INFO");
+                break;
+            default:
+                buf[0] = '\0';
+                break;
             }
             lv_label_set_text(s_ui.set_text[i], buf);
         }
         ui_set_hint("U/D sel  L/R set  B menu");
+        break;
+    }
+    case UI_PAGE_PLAYER: {
+        int top = s_mp3_sel - 1;
+        if (top < 0) {
+            top = 0;
+        }
+        if (top > s_mp3_count - MP3_LIST_ROWS) {
+            top = MAX(0, s_mp3_count - MP3_LIST_ROWS);
+        }
+        for (int i = 0; i < MP3_LIST_ROWS; i++) {
+            int idx = top + i;
+            const int sel = (idx == s_mp3_sel);
+            if (idx < s_mp3_count) {
+                lv_label_set_text(s_ui.pl_cursor[i], sel ? ">" : " ");
+                lv_obj_set_style_text_color(s_ui.pl_cursor[i], lv_color_hex(UI_CYAN), 0);
+                lv_obj_set_style_text_color(s_ui.pl_text[i],
+                                            lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
+                char tmp[20];
+                strncpy(tmp, s_mp3_names[idx], 19);
+                tmp[19] = '\0';
+                lv_label_set_text(s_ui.pl_text[i], tmp);
+            }
+            else {
+                lv_label_set_text(s_ui.pl_cursor[i], " ");
+                lv_label_set_text(s_ui.pl_text[i], "");
+            }
+        }
+        player_state_t st = player_state();
+        lv_label_set_text(s_ui.status,
+                          st == PLAYER_PLAYING ? ">>" : st == PLAYER_PAUSED ? "||" : "--");
+        if (st == PLAYER_IDLE) {
+            lv_label_set_text(s_ui.pl_prog, s_mp3_count ? "IDLE" : "NO MP3 FILES");
+        }
+        else {
+            /* Now-playing line: just the track name. */
+            char prog[28];
+            snprintf(prog, sizeof(prog), "%s", player_current_name());
+            prog[27] = '\0';
+            lv_label_set_text(s_ui.pl_prog, prog);
+        }
+        if (st == PLAYER_PLAYING || st == PLAYER_PAUSED) {
+            ui_set_hint("U/D vol  A pause  B stop");
+        }
+        else {
+            ui_set_hint("U/D sel  A play  B back");
+        }
+        break;
+    }
+    case UI_PAGE_BT: {
+        int count = bt_audio_device_count();
+        if (s_bt_sel >= count) {
+            s_bt_sel = count > 0 ? count - 1 : 0;
+        }
+        int top = s_bt_sel - 1;
+        if (top < 0) {
+            top = 0;
+        }
+        if (top > count - BT_LIST_ROWS) {
+            top = MAX(0, count - BT_LIST_ROWS);
+        }
+        for (int i = 0; i < BT_LIST_ROWS; i++) {
+            int idx = top + i;
+            const int sel = (idx == s_bt_sel);
+            if (idx < count) {
+                lv_label_set_text(s_ui.bt_cursor[i], sel ? ">" : " ");
+                lv_obj_set_style_text_color(s_ui.bt_text[i],
+                                            lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
+                char tmp[26];
+                strncpy(tmp, bt_audio_device_name(idx), sizeof(tmp) - 1);
+                tmp[sizeof(tmp) - 1] = '\0';
+                lv_label_set_text(s_ui.bt_text[i], tmp);
+            }
+            else {
+                lv_label_set_text(s_ui.bt_cursor[i], " ");
+                lv_label_set_text(s_ui.bt_text[i], "");
+            }
+        }
+        if (bt_audio_is_connected()) {
+            char st[28];
+            snprintf(st, sizeof(st), "LINK %s", bt_audio_peer_name());
+            st[27] = '\0';
+            lv_label_set_text(s_ui.bt_status, st);
+            ui_set_hint("A discon  B back");
+        }
+        else if (bt_audio_pair_state() == BT_PAIR_PAIRING) {
+            /* Show the SSP passkey so the user can verify it on the sink. */
+            lv_label_set_text_fmt(s_ui.bt_status, "PAIR CODE %06u",
+                                  (unsigned)bt_audio_passkey());
+            ui_set_hint("Pairing...  B back");
+        }
+        else if (bt_audio_pair_state() == BT_PAIR_CONNECTING) {
+            char st[28];
+            snprintf(st, sizeof(st), "PAIRING %s", bt_audio_peer_name());
+            st[27] = '\0';
+            lv_label_set_text(s_ui.bt_status, st);
+            ui_set_hint("Connecting...  B back");
+        }
+        else if (bt_audio_pair_state() == BT_PAIR_FAIL) {
+            lv_label_set_text(s_ui.bt_status, "PAIR FAILED");
+            ui_set_hint("A retry  B back");
+        }
+        else if (bt_audio_is_scanning()) {
+            lv_label_set_text_fmt(s_ui.bt_status, "SCANNING... %d", count);
+            ui_set_hint("U/D sel  A conn  B back");
+        }
+        else {
+            lv_label_set_text_fmt(s_ui.bt_status,
+                                  count ? "%d FOUND" : "NO DEVICES", count);
+            ui_set_hint(count ? "U/D sel  A conn  B back"
+                              : "A rescan  B back");
+        }
         break;
     }
     default:
@@ -465,24 +707,41 @@ void ui_refresh(void)
 
 static void ui_action(void)
 {
-    esp_err_t err = ESP_OK;
-
     switch (s_ui.page_id) {
-    case UI_PAGE_AUDIO:
-        hw_audio_tone(s_audio_freq_hz, 140);
-        set_action(hw_audio_ready() ? "Tone" : "I2S init fail");
-        break;
     case UI_PAGE_SD:
         hw_sd_try_mount();
-        err = hw_sd_is_mounted() ? ESP_OK : hw_sd_last_err();
         set_action(hw_sd_is_mounted() ? "SD mounted" : "No SD card");
+        break;
+    case UI_PAGE_PLAYER:
+        if (s_mp3_count == 0) {
+            set_action("No MP3 files");
+            break;
+        }
+        if (player_state() == PLAYER_PLAYING || player_state() == PLAYER_PAUSED) {
+            player_toggle();
+            set_action(player_state() == PLAYER_PAUSED ? "Paused" : "Playing");
+        }
+        else {
+            player_play(s_mp3_names[s_mp3_sel]);
+            set_action("Playing");
+        }
+        break;
+    case UI_PAGE_BT:
+        if (bt_audio_is_connected()) {
+            bt_audio_disconnect();
+            set_action("Disconnecting");
+        }
+        else if (bt_audio_device_count() > 0) {
+            set_action(bt_audio_connect_index(s_bt_sel) ? "Connecting"
+                                                        : "Conn failed");
+        }
+        else {
+            bt_audio_scan_start();
+            set_action("Scanning");
+        }
         break;
     default:
         break;
-    }
-
-    if (err == ESP_OK && s_ui.page_id == UI_PAGE_SD) {
-        hw_audio_tone(660, 35);
     }
     ui_refresh();
 }
@@ -492,16 +751,34 @@ static void ui_action(void)
 static void ui_adjust(int step)
 {
     switch (s_ui.page_id) {
-    case UI_PAGE_AUDIO: {
-        int freq = (int)s_audio_freq_hz + step * 110;
-        s_audio_freq_hz = MAX(440, MIN(freq, 1760));
-        set_action("Pitch set");
-        break;
-    }
     case UI_PAGE_SETTINGS:
         s_setting_sel = (s_setting_sel - step + SETTING_COUNT) % SETTING_COUNT;
         set_action("Select");
         break;
+    case UI_PAGE_PLAYER:
+        if (player_state() == PLAYER_PLAYING ||
+            player_state() == PLAYER_PAUSED) {
+            /* While a track plays, up/down adjusts the output volume
+             * (1% steps below 10%, else 5%). */
+            ui_volume_step(step, 5);
+            char buf[24];
+            snprintf(buf, sizeof(buf), "VOL %u%%",
+                     (unsigned)hw_audio_get_volume());
+            set_action(buf);
+        }
+        else if (s_mp3_count > 0) {
+            s_mp3_sel = (s_mp3_sel - step + s_mp3_count) % s_mp3_count;
+            set_action("Select");
+        }
+        break;
+    case UI_PAGE_BT: {
+        int count = bt_audio_device_count();
+        if (count > 0) {
+            s_bt_sel = (s_bt_sel - step + count) % count;
+            set_action("Select");
+        }
+        break;
+    }
     default:
         return;
     }
@@ -516,14 +793,21 @@ static void ui_adjust_lr(int dir)
     }
     switch (s_setting_sel) {
     case SETTING_VOLUME: {
-        int v = (int)hw_audio_get_volume() + dir * 10;
-        hw_audio_set_volume((uint8_t)MAX(0, MIN(v, 100)));
-        set_action("Volume set");
+        /* 1% steps below 10% for fine control, else 10%. */
+        ui_volume_step(dir, 10);
+        char buf[24];
+        snprintf(buf, sizeof(buf), "VOL %u%%", (unsigned)hw_audio_get_volume());
+        set_action(buf);
         break;
     }
-    case SETTING_SFX:
-        hw_audio_set_enabled(dir > 0);
-        set_action(dir > 0 ? "SFX ON" : "SFX OFF");
+    case SETTING_BTOUT:
+        bt_audio_set_enabled(dir > 0);
+        set_action(dir > 0 ? "BT scanning" : "BT OFF");
+        break;
+    case SETTING_LOG:
+        s_log_debug = (dir > 0);
+        ui_apply_log_level();
+        set_action(s_log_debug ? "LOG DEBUG" : "LOG INFO");
         break;
     default:
         return;
@@ -543,16 +827,10 @@ static void ui_key_event_cb(lv_event_t *e)
         if (key == LV_KEY_UP) {
             s_menu_sel = (s_menu_sel + UI_PAGE_COUNT - 1) % UI_PAGE_COUNT;
             ui_refresh_menu();
-            if (hw_audio_ready()) {
-                hw_audio_tone(990, 16);
-            }
         }
         else if (key == LV_KEY_DOWN) {
             s_menu_sel = (s_menu_sel + 1) % UI_PAGE_COUNT;
             ui_refresh_menu();
-            if (hw_audio_ready()) {
-                hw_audio_tone(990, 16);
-            }
         }
         else if (key == LV_KEY_ENTER) {
             ui_enter_page((ui_page_t)s_menu_sel);
@@ -563,10 +841,10 @@ static void ui_key_event_cb(lv_event_t *e)
 
     /* Inside a detail page. */
     if (key == LV_KEY_ESC) {
-        ui_show_menu();
-        if (hw_audio_ready()) {
-            hw_audio_tone(520, 24);
+        if (s_ui.page_id == UI_PAGE_PLAYER) {
+            player_stop();
         }
+        ui_show_menu();
         return;
     }
     if (key == LV_KEY_ENTER) {
@@ -594,7 +872,7 @@ static void ui_key_event_cb(lv_event_t *e)
 void ui_create(lv_group_t *group)
 {
     s_ui.group = group;
-    s_ui.page_id = UI_PAGE_AUDIO;
+    s_ui.page_id = UI_PAGE_PLAYER;
     s_in_menu = true;
     s_menu_sel = 0;
 

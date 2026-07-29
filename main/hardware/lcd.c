@@ -9,6 +9,7 @@
 #include "hardware/lcd.h"
 
 #include "driver/spi_master.h"
+#include "esp_heap_caps.h"
 #include "esp_err.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_log.h"
@@ -217,6 +218,17 @@ void hw_lcd_init(void)
     st7735_init_black_tab_rot90(io_handle);
 }
 
+/* Full-screen LVGL draw buffer. Prefer external PSRAM (DMA-capable); fall back
+ * to the internal DMA pool if PSRAM is not present. */
+static void *alloc_draw_buf(size_t sz)
+{
+    void *p = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    if (p == NULL) {
+        p = spi_bus_dma_memory_alloc(LCD_HOST, sz, 0);
+    }
+    return p;
+}
+
 lv_display_t *hw_lcd_create_display(void)
 {
 #if LCD_DRAW_BUF_LINES != LCD_V_RES
@@ -232,9 +244,13 @@ lv_display_t *hw_lcd_create_display(void)
     const lv_color_format_t color_format = LV_COLOR_FORMAT_RGB565_SWAPPED;
     const uint32_t stride = lv_draw_buf_width_to_stride(LCD_H_RES, color_format);
     const size_t draw_buffer_sz = stride * LCD_DRAW_BUF_LINES;
-    void *buf1 = spi_bus_dma_memory_alloc(LCD_HOST, draw_buffer_sz, 0);
-    void *buf2 = spi_bus_dma_memory_alloc(LCD_HOST, draw_buffer_sz, 0);
-    void *buf3 = spi_bus_dma_memory_alloc(LCD_HOST, draw_buffer_sz, 0);
+    /* Allocate the full-screen draw buffers from external PSRAM (DMA-capable)
+     * first; fall back to the internal DMA pool if PSRAM is unavailable.
+     * Using only spi_bus_dma_memory_alloc() draws from the very small internal
+     * DMA pool and the 3rd triple-buffer allocation fails on boot. */
+    void *buf1 = alloc_draw_buf(draw_buffer_sz);
+    void *buf2 = alloc_draw_buf(draw_buffer_sz);
+    void *buf3 = alloc_draw_buf(draw_buffer_sz);
     assert(buf1);
     assert(buf2);
     assert(buf3);

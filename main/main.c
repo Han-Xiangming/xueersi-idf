@@ -16,9 +16,12 @@
 #include "freertos/task.h"
 #include "hardware/buttons.h"
 #include "hardware/audio.h"
+#include "hardware/bt_audio.h"
 #include "hardware/lcd.h"
+#include "hardware/sd.h"
 #include "lvgl.h"
 #include "app/ui.h"
+#include "app/player.h"
 
 /* LVGL UI refresh cadence in the main loop (milliseconds). */
 #define UI_REFRESH_PERIOD_MS        16
@@ -39,7 +42,6 @@ static void lvgl_task(void *arg)
     hw_lcd_display_on();
 
     while (true) {
-        hw_audio_process_timers();
         if (lv_tick_elaps(last_update_ms) >= UI_REFRESH_PERIOD_MS) {
             last_update_ms = lv_tick_get();
             ui_refresh();
@@ -59,6 +61,9 @@ void app_main(void)
     hw_buttons_init();
     hw_lcd_init();
     hw_audio_init();
+    bt_audio_init();
+    hw_sd_try_mount();
+    player_init();
 
     lv_init();
     lv_display_t *display = hw_lcd_create_display();
