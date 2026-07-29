@@ -3,12 +3,10 @@
  *
  * Board resources from README.md:
  *   ST7735-compatible SPI TFT, MicroSD on shared SPI2, 6 active-low keys,
- *   GPIO14 passive buzzer, GPIO36/GPIO39 ADC sensors, I2C0 (MPU6050),
- *   and GPIO25/26/32/33 extension IO.
+ *   GPIO14 passive buzzer.
  */
 
 #include <assert.h>
-#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -18,11 +16,9 @@
 #include <unistd.h>
 
 #include "driver/gpio.h"
-#include "driver/i2c_master.h"
 #include "driver/ledc.h"
 #include "driver/sdspi_host.h"
 #include "driver/spi_master.h"
-#include "esp_adc/adc_oneshot.h"
 #include "esp_chip_info.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -36,8 +32,6 @@
 #include "lvgl.h"
 #include "sdmmc_cmd.h"
 #include "sdkconfig.h"
-#include <dirent.h>
-#include <sys/stat.h>
 
 #ifndef CONFIG_IDF_TARGET
 #define CONFIG_IDF_TARGET "esp32"
@@ -124,12 +118,6 @@
 #define PIN_NUM_LCD_DC              GPIO_NUM_4
 #define PIN_NUM_SD_CS               GPIO_NUM_22
 #define PIN_NUM_BUZZER              GPIO_NUM_14
-#define PIN_NUM_I2C_SCL             GPIO_NUM_15
-#define PIN_NUM_I2C_SDA             GPIO_NUM_21
-#define PIN_NUM_EXT_OUT1            GPIO_NUM_25
-#define PIN_NUM_EXT_OUT2            GPIO_NUM_26
-#define PIN_NUM_EXT_IN1             GPIO_NUM_32
-#define PIN_NUM_EXT_IN2             GPIO_NUM_33
 
 #define LCD_X_GAP                   0
 #define LCD_Y_GAP                   0
@@ -144,43 +132,12 @@
 #define BUTTON_DEBOUNCE_MS          25
 #define UI_REFRESH_PERIOD_MS        16
 #define UI_ACTION_MSG_MS            850
-#define UI_HISTORY_POINTS           48
-#define LIGHT_HISTORY_AVG_SAMPLES   4
-#define THERM_UPDATE_PERIOD_MS      1000
-#define THERM_HISTORY_MIN_PCT       35
-#define THERM_HISTORY_MAX_PCT       65
-#define I2C_TIMEOUT_MS              30
-#define I2C_FREQ_HZ                 100000
-#define MPU_REPROBE_PERIOD_MS       1500
 #define SD_SPI_MAX_FREQ_KHZ         10000
-
-#define SD_BROWSER_MAX_ENTRIES      16
-#define SD_DISPLAY_LINE_COUNT       4
-#define SD_FILE_TEXT_BUFFER         4096
-#define SD_TEXT_CHUNK               320
-
-#define MPU6050_ADDR                0x68
-#define MPU6050_REG_ACCEL_XOUT_H    0x3B
-#define MPU6050_REG_PWR_MGMT_1      0x6B
-#define MPU6050_REG_WHO_AM_I        0x75
-#define MPU6050_WHO_AM_I_VALUE      0x68
-
-#define ADC_LIGHT_CHAN              ADC_CHANNEL_0
-#define ADC_TEMP_CHAN               ADC_CHANNEL_3
-#define ADC_EXT_IN1_CHAN            ADC_CHANNEL_4
-#define ADC_EXT_IN2_CHAN            ADC_CHANNEL_5
-#define ADC_RAW_MAX                 4095
 
 #define BUZZER_LEDC_MODE            LEDC_LOW_SPEED_MODE
 #define BUZZER_LEDC_TIMER           LEDC_TIMER_0
 #define BUZZER_LEDC_CHANNEL         LEDC_CHANNEL_0
 #define BUZZER_DUTY                 128
-
-#define EXT_LEDC_TIMER              LEDC_TIMER_1
-#define EXT_LEDC_CHANNEL1           LEDC_CHANNEL_1
-#define EXT_LEDC_CHANNEL2           LEDC_CHANNEL_2
-#define EXT_PWM_FREQ_HZ             1000
-#define EXT_PWM_DUTY_MAX            255
 
 #define ST7735_SWRESET              0x01
 #define ST7735_SLPOUT               0x11
@@ -220,34 +177,15 @@ typedef struct {
 typedef enum {
     UI_PAGE_BUZZER = 0,
     UI_PAGE_SD,
-    UI_PAGE_SYSTEM,
     UI_PAGE_ABOUT,
     UI_PAGE_COUNT,
 } ui_page_t;
 
 typedef struct {
-    bool i2c_ready;
-    bool mpu_present;
     bool sd_mounted;
     bool buzzer_ready;
-    bool adc_ready;
-    bool ext_pwm_ready;
-    bool ext_out[2];
-    uint8_t ext_pwm[2];
-    uint8_t mpu_whoami;
-    uint32_t samples;
-    int light_raw;
-    int temp_raw;
-    int ext_raw[2];
-    int16_t acc[3];
-    int16_t gyro[3];
-    float pitch;
-    float roll;
-    char gesture[12];
     char sd_name[24];
     uint32_t sd_mb;
-    esp_err_t last_adc_err;
-    esp_err_t last_mpu_err;
     esp_err_t last_sd_err;
     char action[32];
 } board_state_t;
@@ -259,13 +197,9 @@ typedef struct {
     lv_obj_t *value;
     lv_obj_t *sub;
     lv_obj_t *bar;
-    lv_obj_t *chart;
-    lv_obj_t *chart_head;
     lv_obj_t *status;
     lv_obj_t *hint;
     lv_obj_t *accent;
-    lv_chart_series_t *chart_series;
-    uint32_t chart_history_version;
     lv_group_t *group;
     ui_page_t page_id;
 } ui_state_t;
@@ -284,124 +218,18 @@ static const board_button_t s_buttons[] = {
 static lv_draw_buf_t s_draw_buf3;
 static ui_state_t s_ui;
 static board_state_t s_board = {
-    .gesture = "ABSENT",
     .sd_name = "NO CARD",
-    .ext_pwm = {128, 128},
     .last_sd_err = ESP_ERR_NOT_FOUND,
     .action = "Ready",
 };
 
-static adc_oneshot_unit_handle_t s_adc_handle;
 static esp_lcd_panel_io_handle_t s_lcd_io_handle;
-static i2c_master_bus_handle_t s_i2c_bus;
-static i2c_master_dev_handle_t s_mpu_dev;
 static sdmmc_card_t *s_sd_card;
 static uint32_t s_buzzer_stop_at;
 static uint32_t s_buzzer_freq_hz = 988;
 static uint32_t s_action_until_ms;
-static uint32_t s_last_mpu_probe_ms;
-static bool s_mpu_probe_seen;
 static bool s_lcd_display_on;
 static volatile bool s_lcd_first_flush_done;
-static int32_t s_light_history[UI_HISTORY_POINTS];
-static int32_t s_therm_history[UI_HISTORY_POINTS];
-static uint32_t s_light_history_version;
-static uint32_t s_therm_history_version;
-static uint32_t s_light_hist_accum;
-static uint8_t s_light_hist_count;
-static uint32_t s_therm_accum;
-static uint16_t s_therm_accum_count;
-static uint32_t s_last_therm_publish_ms;
-
-#define SD_PATH_PREFIX "/sdcard/"
-
-typedef struct {
-    char name[32];
-    bool is_dir;
-} sd_entry_t;
-
-static sd_entry_t s_sd_entries[SD_BROWSER_MAX_ENTRIES];
-static size_t s_sd_entry_count;
-static int s_sd_selection;
-static bool s_sd_file_view_open;
-static char s_sd_file_path[80];
-static char s_sd_file_text[SD_FILE_TEXT_BUFFER];
-static size_t s_sd_file_text_len;
-static size_t s_sd_file_view_pos;
-static char s_sd_cwd[80] = SD_PATH_PREFIX;
-
-static void sd_browser_go_up(void)
-{
-    /* Trim trailing slash */
-    size_t len = strlen(s_sd_cwd);
-    if (len <= 1) {
-        strncpy(s_sd_cwd, SD_PATH_PREFIX, sizeof(s_sd_cwd) - 1);
-        s_sd_cwd[sizeof(s_sd_cwd) - 1] = '\0';
-        return;
-    }
-    /* remove trailing slash if present */
-    if (s_sd_cwd[len - 1] == '/') {
-        s_sd_cwd[len - 1] = '\0';
-        len--;
-    }
-    /* find previous slash */
-    char *p = strrchr(s_sd_cwd, '/');
-    if (!p) {
-        strncpy(s_sd_cwd, SD_PATH_PREFIX, sizeof(s_sd_cwd) - 1);
-        s_sd_cwd[sizeof(s_sd_cwd) - 1] = '\0';
-        return;
-    }
-    /* keep root as /sdcard/ */
-    size_t root_len = strlen(SD_PATH_PREFIX) - 1; /* without trailing slash */
-    if ((size_t)(p - s_sd_cwd) < root_len) {
-        strncpy(s_sd_cwd, SD_PATH_PREFIX, sizeof(s_sd_cwd) - 1);
-        s_sd_cwd[sizeof(s_sd_cwd) - 1] = '\0';
-        return;
-    }
-    *p = '\0';
-    /* ensure trailing slash */
-    strncat(s_sd_cwd, "/", sizeof(s_sd_cwd) - strlen(s_sd_cwd) - 1);
-}
-
-static int pct_from_raw(int raw)
-{
-    raw = MAX(0, MIN(raw, ADC_RAW_MAX));
-    return (raw * 100) / ADC_RAW_MAX;
-}
-
-static void sensor_history_init(void)
-{
-    for (size_t i = 0; i < UI_HISTORY_POINTS; ++i) {
-        s_light_history[i] = LV_CHART_POINT_NONE;
-        s_therm_history[i] = LV_CHART_POINT_NONE;
-    }
-    s_light_history_version = 0;
-    s_therm_history_version = 0;
-    s_light_hist_accum = 0;
-    s_light_hist_count = 0;
-    s_therm_accum = 0;
-    s_therm_accum_count = 0;
-    s_last_therm_publish_ms = 0;
-}
-
-static void sensor_history_push(int32_t *history, uint32_t *version, int value)
-{
-    for (size_t i = 1; i < UI_HISTORY_POINTS; ++i) {
-        history[i - 1] = history[i];
-    }
-    history[UI_HISTORY_POINTS - 1] = MAX(0, MIN(value, 100));
-    (*version)++;
-}
-
-static void sensor_history_push_range(int32_t *history, uint32_t *version, int value, int min_value, int max_value)
-{
-    sensor_history_push(history, version, MAX(min_value, MIN(value, max_value)));
-}
-
-static int16_t i16_be(const uint8_t *p)
-{
-    return (int16_t)((uint16_t)p[0] << 8 | p[1]);
-}
 
 static void copy_text(char *dst, size_t dst_size, const char *src)
 {
@@ -415,254 +243,6 @@ static void set_action(const char *msg)
 {
     copy_text(s_board.action, sizeof(s_board.action), msg);
     s_action_until_ms = lv_tick_get() + UI_ACTION_MSG_MS;
-}
-
-/* forward declarations used by SD browser (defined later) */
-static void ui_set_hint(const char *normal);
-static void ui_set_bar(int value);
-
-static bool sd_is_text_file(const char *name)
-{
-    const char *ext = strrchr(name, '.');
-    if (!ext || ext == name) {
-        return false;
-    }
-    return strcasecmp(ext, ".txt") == 0 ||
-           strcasecmp(ext, ".md") == 0 ||
-           strcasecmp(ext, ".log") == 0 ||
-           strcasecmp(ext, ".csv") == 0 ||
-           strcasecmp(ext, ".json") == 0 ||
-           strcasecmp(ext, ".ini") == 0 ||
-           strcasecmp(ext, ".c") == 0 ||
-           strcasecmp(ext, ".h") == 0 ||
-           strcasecmp(ext, ".py") == 0;
-}
-
-static void sd_browser_scan(void)
-{
-    s_sd_entry_count = 0;
-    s_sd_selection = 0;
-    s_sd_file_view_open = false;
-
-    DIR *dir = opendir(s_sd_cwd);
-    if (!dir) {
-        return;
-    }
-
-    struct dirent *entry;
-    /* if not at root, offer parent entry */
-    if (strcmp(s_sd_cwd, SD_PATH_PREFIX) != 0 && s_sd_entry_count < SD_BROWSER_MAX_ENTRIES) {
-        sd_entry_t *p = &s_sd_entries[s_sd_entry_count++];
-        strncpy(p->name, "..", sizeof(p->name) - 1);
-        p->name[sizeof(p->name) - 1] = '\0';
-        p->is_dir = true;
-    }
-
-    while ((entry = readdir(dir)) != NULL && s_sd_entry_count < SD_BROWSER_MAX_ENTRIES) {
-        if (entry->d_name[0] == '.') {
-            continue;
-        }
-
-        sd_entry_t *target = &s_sd_entries[s_sd_entry_count];
-        /* copy name with explicit truncation to avoid format-truncation warnings */
-        size_t nlen = strnlen(entry->d_name, sizeof(((struct dirent *)0)->d_name));
-        size_t copy_n = nlen < (sizeof(target->name) - 1) ? nlen : (sizeof(target->name) - 1);
-        memcpy(target->name, entry->d_name, copy_n);
-        target->name[copy_n] = '\0';
-        target->is_dir = false;
-
-        if (entry->d_type == DT_DIR) {
-            target->is_dir = true;
-        } else if (entry->d_type == DT_UNKNOWN) {
-            char path[512];
-            snprintf(path, sizeof(path), "%s%s", s_sd_cwd, entry->d_name);
-            struct stat st;
-            if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
-                target->is_dir = true;
-            }
-        }
-
-        s_sd_entry_count++;
-    }
-
-    closedir(dir);
-    if (s_sd_selection >= (int)s_sd_entry_count) {
-        s_sd_selection = s_sd_entry_count ? (int)s_sd_entry_count - 1 : 0;
-    }
-}
-
-static void sd_browser_close_file(void)
-{
-    s_sd_file_view_open = false;
-    s_sd_file_view_pos = 0;
-}
-
-static void sd_browser_open_file(void)
-{
-    if (!s_board.sd_mounted || s_sd_entry_count == 0 || s_sd_selection < 0 || s_sd_selection >= (int)s_sd_entry_count) {
-        return;
-    }
-
-    sd_entry_t *entry = &s_sd_entries[s_sd_selection];
-    if (entry->is_dir) {
-        /* enter directory or go up */
-        if (strcmp(entry->name, "..") == 0) {
-            sd_browser_go_up();
-        } else {
-            /* append directory name to cwd */
-            size_t len = strlen(s_sd_cwd);
-            if (len + strlen(entry->name) + 2 < sizeof(s_sd_cwd)) {
-                /* ensure trailing slash */
-                if (s_sd_cwd[len - 1] != '/') {
-                    strncat(s_sd_cwd, "/", sizeof(s_sd_cwd) - len - 1);
-                    len++;
-                }
-                strncat(s_sd_cwd, entry->name, sizeof(s_sd_cwd) - len - 1);
-                strncat(s_sd_cwd, "/", sizeof(s_sd_cwd) - strlen(s_sd_cwd) - 1);
-            }
-        }
-        sd_browser_scan();
-        return;
-    }
-
-    if (!sd_is_text_file(entry->name)) {
-        set_action("Only text files");
-        return;
-    }
-
-    char path[512];
-    snprintf(path, sizeof(path), "%s%s", s_sd_cwd, entry->name);
-    /* copy truncated path into s_sd_file_path for UI display (explicit truncate) */
-    size_t plen = strlen(path);
-    size_t cp = plen < (sizeof(s_sd_file_path) - 1) ? plen : (sizeof(s_sd_file_path) - 1);
-    memcpy(s_sd_file_path, path, cp);
-    s_sd_file_path[cp] = '\0';
-    FILE *fp = fopen(path, "r");
-    if (!fp) {
-        set_action("Open failed");
-        return;
-    }
-
-    size_t read_len = fread(s_sd_file_text, 1, sizeof(s_sd_file_text) - 1, fp);
-    fclose(fp);
-    s_sd_file_text_len = read_len;
-    s_sd_file_text[read_len] = '\0';
-    s_sd_file_view_pos = 0;
-    s_sd_file_view_open = true;
-    set_action(read_len ? "Text opened" : "Empty file");
-}
-
-static void sd_browser_scroll_file(int step)
-{
-    if (!s_sd_file_view_open || s_sd_file_text_len == 0) {
-        return;
-    }
-
-    if (step < 0) {
-        if (s_sd_file_view_pos <= SD_TEXT_CHUNK) {
-            s_sd_file_view_pos = 0;
-        } else {
-            s_sd_file_view_pos -= SD_TEXT_CHUNK;
-        }
-    } else {
-        size_t max_pos = s_sd_file_text_len > SD_TEXT_CHUNK ? s_sd_file_text_len - SD_TEXT_CHUNK : 0;
-        s_sd_file_view_pos = MIN(s_sd_file_view_pos + SD_TEXT_CHUNK, max_pos);
-    }
-}
-
-static void sd_browser_select(int step)
-{
-    if (s_sd_entry_count == 0) {
-        return;
-    }
-
-    int next = s_sd_selection + step;
-    if (next < 0) {
-        next = 0;
-    }
-    if (next >= (int)s_sd_entry_count) {
-        next = (int)s_sd_entry_count - 1;
-    }
-    s_sd_selection = next;
-}
-
-static void sd_browser_update_display(void)
-{
-    if (!s_ui.value || !s_ui.sub) {
-        return;
-    }
-
-    if (s_sd_file_view_open) {
-        char preview[512];
-        const char *text = s_sd_file_text + s_sd_file_view_pos;
-        strncpy(preview, text, sizeof(preview) - 1);
-        preview[sizeof(preview) - 1] = '\0';
-
-        lv_label_set_text(s_ui.value, preview);
-        lv_obj_set_style_text_align(s_ui.value, LV_TEXT_ALIGN_LEFT, 0);
-        lv_label_set_text_fmt(s_ui.sub,
-                              "%s %u/%u",
-                              s_sd_file_path + strlen(SD_PATH_PREFIX),
-                              (unsigned)(s_sd_file_view_pos / SD_TEXT_CHUNK + 1),
-                              (unsigned)((s_sd_file_text_len + SD_TEXT_CHUNK - 1) / SD_TEXT_CHUNK));
-        ui_set_hint("U/D scroll  B back");
-        ui_set_bar(s_sd_file_text_len ? (int)((s_sd_file_view_pos * 100) / (s_sd_file_text_len - 1)) : 0);
-    } else {
-        char buffer[512] = "";
-        size_t first = 0;
-        if (s_sd_entry_count > SD_DISPLAY_LINE_COUNT && s_sd_selection >= SD_DISPLAY_LINE_COUNT) {
-            first = s_sd_selection - SD_DISPLAY_LINE_COUNT + 1;
-        }
-
-        for (size_t i = first; i < s_sd_entry_count && i < first + SD_DISPLAY_LINE_COUNT; ++i) {
-            if ((int)i == s_sd_selection) {
-                strncat(buffer, "> ", sizeof(buffer) - strlen(buffer) - 1);
-            } else {
-                strncat(buffer, "  ", sizeof(buffer) - strlen(buffer) - 1);
-            }
-            strncat(buffer, s_sd_entries[i].name, sizeof(buffer) - strlen(buffer) - 1);
-            strncat(buffer, s_sd_entries[i].is_dir ? "/\n" : "\n", sizeof(buffer) - strlen(buffer) - 1);
-        }
-
-        if (s_sd_entry_count == 0) {
-            strncpy(buffer, "No files found", sizeof(buffer) - 1);
-            buffer[sizeof(buffer) - 1] = '\0';
-        }
-
-        lv_label_set_text(s_ui.value, buffer);
-        lv_obj_set_style_text_align(s_ui.value, LV_TEXT_ALIGN_LEFT, 0);
-        lv_label_set_text_fmt(s_ui.sub, "%u files", (unsigned)s_sd_entry_count);
-        if (s_ui.status) {
-            /* show short cwd in status */
-            const char *rel = s_sd_cwd + strlen(SD_PATH_PREFIX);
-            if (!*rel) rel = "/";
-            lv_label_set_text(s_ui.status, rel);
-        }
-        ui_set_hint("U/D sel  A open  B unmount");
-        ui_set_bar(s_sd_entry_count ? (int)((s_sd_selection * 100) / (s_sd_entry_count - 1)) : 0);
-    }
-}
-
-static esp_err_t i2c_write(i2c_master_dev_handle_t dev, const uint8_t *data, size_t len)
-{
-    if (!dev) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    return i2c_master_transmit(dev, data, len, I2C_TIMEOUT_MS);
-}
-
-static esp_err_t i2c_write_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t value)
-{
-    const uint8_t data[] = {reg, value};
-    return i2c_write(dev, data, sizeof(data));
-}
-
-static esp_err_t i2c_read_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t *data, size_t len)
-{
-    if (!dev) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    return i2c_master_transmit_receive(dev, &reg, 1, data, len, I2C_TIMEOUT_MS);
 }
 
 static void buzzer_stop(void)
@@ -704,226 +284,18 @@ static void hardware_process_timers(void)
     }
 }
 
-static void mpu_probe_and_init(bool force)
-{
-    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-
-    if (!force && s_mpu_probe_seen && now_ms - s_last_mpu_probe_ms < MPU_REPROBE_PERIOD_MS) {
-        return;
-    }
-    s_mpu_probe_seen = true;
-    s_last_mpu_probe_ms = now_ms;
-
-    s_board.mpu_present = false;
-    s_board.mpu_whoami = 0;
-    copy_text(s_board.gesture, sizeof(s_board.gesture), "ABSENT");
-
-    if (!s_i2c_bus || !s_mpu_dev) {
-        s_board.last_mpu_err = ESP_ERR_INVALID_STATE;
-        return;
-    }
-
-    esp_err_t err = i2c_master_probe(s_i2c_bus, MPU6050_ADDR, I2C_TIMEOUT_MS);
-    if (err != ESP_OK) {
-        s_board.last_mpu_err = err;
-        return;
-    }
-
-    uint8_t who = 0;
-    err = i2c_read_reg(s_mpu_dev, MPU6050_REG_WHO_AM_I, &who, 1);
-    if (err != ESP_OK) {
-        s_board.last_mpu_err = err;
-        return;
-    }
-
-    s_board.mpu_whoami = who;
-    if (who != MPU6050_WHO_AM_I_VALUE) {
-        s_board.last_mpu_err = ESP_ERR_INVALID_ARG;
-        return;
-    }
-
-    err = i2c_write_reg(s_mpu_dev, MPU6050_REG_PWR_MGMT_1, 0x00);
-    if (err != ESP_OK) {
-        s_board.last_mpu_err = err;
-        return;
-    }
-
-    s_board.mpu_present = true;
-    s_board.last_mpu_err = ESP_OK;
-    copy_text(s_board.gesture, sizeof(s_board.gesture), "READY");
-}
-
-static void mpu_read(void)
-{
-    if (!s_board.mpu_present) {
-        mpu_probe_and_init(false);
-        return;
-    }
-
-    uint8_t data[14] = {0};
-    esp_err_t err = i2c_read_reg(s_mpu_dev, MPU6050_REG_ACCEL_XOUT_H, data, sizeof(data));
-    s_board.last_mpu_err = err;
-    if (err != ESP_OK) {
-        s_board.mpu_present = false;
-        copy_text(s_board.gesture, sizeof(s_board.gesture), "ABSENT");
-        return;
-    }
-
-    s_board.acc[0] = i16_be(&data[0]);
-    s_board.acc[1] = i16_be(&data[2]);
-    s_board.acc[2] = i16_be(&data[4]);
-    s_board.gyro[0] = i16_be(&data[8]);
-    s_board.gyro[1] = i16_be(&data[10]);
-    s_board.gyro[2] = i16_be(&data[12]);
-
-    const float ax = s_board.acc[0] / 16384.0f;
-    const float ay = s_board.acc[1] / 16384.0f;
-    const float az = s_board.acc[2] / 16384.0f;
-    s_board.pitch = atan2f(-ax, sqrtf(ay * ay + az * az)) * 57.29578f;
-    s_board.roll = atan2f(ay, az) * 57.29578f;
-
-    if (s_board.pitch > 25.0f) {
-        copy_text(s_board.gesture, sizeof(s_board.gesture), "TILT UP");
-    }
-    else if (s_board.pitch < -25.0f) {
-        copy_text(s_board.gesture, sizeof(s_board.gesture), "TILT DN");
-    }
-    else if (s_board.roll > 25.0f) {
-        copy_text(s_board.gesture, sizeof(s_board.gesture), "TILT R");
-    }
-    else if (s_board.roll < -25.0f) {
-        copy_text(s_board.gesture, sizeof(s_board.gesture), "TILT L");
-    }
-    else {
-        copy_text(s_board.gesture, sizeof(s_board.gesture), "LEVEL");
-    }
-}
-
-static esp_err_t adc_read_one(adc_channel_t channel, int *raw)
-{
-    esp_err_t err = adc_oneshot_read(s_adc_handle, channel, raw);
-    if (err != ESP_OK && s_board.last_adc_err == ESP_OK) {
-        s_board.last_adc_err = err;
-    }
-    return err;
-}
-
-static esp_err_t adc_read_sensors(void)
-{
-    if (!s_board.adc_ready) {
-        if (s_board.last_adc_err == ESP_OK) {
-            s_board.last_adc_err = ESP_ERR_INVALID_STATE;
-        }
-        return s_board.last_adc_err;
-    }
-
-    if (!s_adc_handle) {
-        s_board.last_adc_err = ESP_ERR_INVALID_STATE;
-        return s_board.last_adc_err;
-    }
-
-    int raw = 0;
-    s_board.last_adc_err = ESP_OK;
-    if (adc_read_one(ADC_LIGHT_CHAN, &raw) == ESP_OK) {
-        s_board.light_raw = raw;
-        s_light_hist_accum += pct_from_raw(raw);
-        s_light_hist_count++;
-        if (s_light_hist_count >= LIGHT_HISTORY_AVG_SAMPLES) {
-            sensor_history_push(s_light_history,
-                                &s_light_history_version,
-                                (int)((s_light_hist_accum + s_light_hist_count / 2) / s_light_hist_count));
-            s_light_hist_accum = 0;
-            s_light_hist_count = 0;
-        }
-    }
-    if (adc_read_one(ADC_TEMP_CHAN, &raw) == ESP_OK) {
-        const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-        s_therm_accum += raw;
-        s_therm_accum_count++;
-        if (s_last_therm_publish_ms == 0 || now_ms - s_last_therm_publish_ms >= THERM_UPDATE_PERIOD_MS) {
-            const int avg_raw = (int)((s_therm_accum + s_therm_accum_count / 2) / s_therm_accum_count);
-            s_board.temp_raw = avg_raw;
-            sensor_history_push_range(s_therm_history,
-                                      &s_therm_history_version,
-                                      pct_from_raw(avg_raw),
-                                      THERM_HISTORY_MIN_PCT,
-                                      THERM_HISTORY_MAX_PCT);
-            s_therm_accum = 0;
-            s_therm_accum_count = 0;
-            s_last_therm_publish_ms = now_ms;
-        }
-    }
-    if (adc_read_one(ADC_EXT_IN1_CHAN, &raw) == ESP_OK) {
-        s_board.ext_raw[0] = raw;
-    }
-    if (adc_read_one(ADC_EXT_IN2_CHAN, &raw) == ESP_OK) {
-        s_board.ext_raw[1] = raw;
-    }
-    return s_board.last_adc_err;
-}
-
-static ledc_channel_t ext_pwm_channel(uint8_t index)
-{
-    return index == 0 ? EXT_LEDC_CHANNEL1 : EXT_LEDC_CHANNEL2;
-}
-
-static esp_err_t ext_output_set(uint8_t index, bool on)
-{
-    if (index >= 2 || !s_board.ext_pwm_ready) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    const ledc_channel_t channel = ext_pwm_channel(index);
-    const uint32_t duty = on ? s_board.ext_pwm[index] : 0;
-
-    esp_err_t err = ledc_set_duty(BUZZER_LEDC_MODE, channel, duty);
-    if (err == ESP_OK) {
-        err = ledc_update_duty(BUZZER_LEDC_MODE, channel);
-    }
-    if (err == ESP_OK) {
-        s_board.ext_out[index] = on && duty > 0;
-    }
-    return err;
-}
-
-static void i2c_probe_devices(bool force)
-{
-    if (!s_i2c_bus) {
-        s_board.i2c_ready = false;
-        s_board.mpu_present = false;
-        s_board.last_mpu_err = ESP_ERR_INVALID_STATE;
-        return;
-    }
-
-    s_board.i2c_ready = true;
-
-    if (force || !s_board.mpu_present) {
-        mpu_probe_and_init(force);
-    }
-}
-
-static void hardware_update(void)
-{
-    (void)adc_read_sensors();
-    i2c_probe_devices(false);
-    mpu_read();
-    s_board.samples++;
-}
-
 static void sd_try_mount(void)
 {
     if (s_board.sd_mounted) {
         return;
     }
 
-     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-     /* Use the SDSPI default host instead of forcing the LCD host.
-         Forcing the same SPI host as the display can cause bus conflicts
-         and white-screen when the SD card is removed at runtime. */
-     host.max_freq_khz = SD_SPI_MAX_FREQ_KHZ;
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = LCD_HOST;
+    host.max_freq_khz = SD_SPI_MAX_FREQ_KHZ;
 
     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_config.host_id = host.slot;
+    slot_config.host_id = LCD_HOST;
     slot_config.gpio_cs = PIN_NUM_SD_CS;
     slot_config.wait_for_miso = 20;
 
@@ -979,126 +351,6 @@ static esp_err_t sd_unmount(void)
     return ESP_OK;
 }
 
-static void adc_init(void)
-{
-    adc_oneshot_unit_init_cfg_t init_cfg = {
-        .unit_id = ADC_UNIT_1,
-        .ulp_mode = ADC_ULP_MODE_DISABLE,
-    };
-    esp_err_t err = adc_oneshot_new_unit(&init_cfg, &s_adc_handle);
-    if (err != ESP_OK) {
-        s_board.last_adc_err = err;
-        ESP_LOGW(TAG, "ADC init failed: %s", esp_err_to_name(err));
-        return;
-    }
-
-    adc_oneshot_chan_cfg_t chan_cfg = {
-        .atten = ADC_ATTEN_DB_12,
-        .bitwidth = ADC_BITWIDTH_12,
-    };
-    err = adc_oneshot_config_channel(s_adc_handle, ADC_LIGHT_CHAN, &chan_cfg);
-    if (err == ESP_OK) {
-        err = adc_oneshot_config_channel(s_adc_handle, ADC_TEMP_CHAN, &chan_cfg);
-    }
-    if (err == ESP_OK) {
-        err = adc_oneshot_config_channel(s_adc_handle, ADC_EXT_IN1_CHAN, &chan_cfg);
-    }
-    if (err == ESP_OK) {
-        err = adc_oneshot_config_channel(s_adc_handle, ADC_EXT_IN2_CHAN, &chan_cfg);
-    }
-    if (err != ESP_OK) {
-        s_board.last_adc_err = err;
-        ESP_LOGW(TAG, "ADC channel config failed: %s", esp_err_to_name(err));
-        return;
-    }
-    s_board.last_adc_err = ESP_OK;
-    s_board.adc_ready = true;
-}
-
-static void ext_io_init(void)
-{
-    ledc_timer_config_t timer_cfg = {
-        .speed_mode = BUZZER_LEDC_MODE,
-        .duty_resolution = LEDC_TIMER_8_BIT,
-        .timer_num = EXT_LEDC_TIMER,
-        .freq_hz = EXT_PWM_FREQ_HZ,
-        .clk_cfg = LEDC_AUTO_CLK,
-    };
-    esp_err_t err = ledc_timer_config(&timer_cfg);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Extension PWM timer init failed: %s", esp_err_to_name(err));
-        return;
-    }
-
-    const ledc_channel_config_t channel_cfg[] = {
-        {
-            .gpio_num = PIN_NUM_EXT_OUT1,
-            .speed_mode = BUZZER_LEDC_MODE,
-            .channel = EXT_LEDC_CHANNEL1,
-            .intr_type = LEDC_INTR_DISABLE,
-            .timer_sel = EXT_LEDC_TIMER,
-            .duty = 0,
-            .hpoint = 0,
-            .sleep_mode = LEDC_SLEEP_MODE_NO_ALIVE_NO_PD,
-        },
-        {
-            .gpio_num = PIN_NUM_EXT_OUT2,
-            .speed_mode = BUZZER_LEDC_MODE,
-            .channel = EXT_LEDC_CHANNEL2,
-            .intr_type = LEDC_INTR_DISABLE,
-            .timer_sel = EXT_LEDC_TIMER,
-            .duty = 0,
-            .hpoint = 0,
-            .sleep_mode = LEDC_SLEEP_MODE_NO_ALIVE_NO_PD,
-        },
-    };
-
-    err = ledc_channel_config(&channel_cfg[0]);
-    if (err == ESP_OK) {
-        err = ledc_channel_config(&channel_cfg[1]);
-    }
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Extension PWM channel init failed: %s", esp_err_to_name(err));
-        return;
-    }
-    s_board.ext_pwm_ready = true;
-    (void)ext_output_set(0, false);
-    (void)ext_output_set(1, false);
-}
-
-static void i2c_init(void)
-{
-    i2c_master_bus_config_t bus_cfg = {
-        .i2c_port = I2C_NUM_0,
-        .sda_io_num = PIN_NUM_I2C_SDA,
-        .scl_io_num = PIN_NUM_I2C_SCL,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    esp_err_t err = i2c_new_master_bus(&bus_cfg, &s_i2c_bus);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "I2C init failed: %s", esp_err_to_name(err));
-        return;
-    }
-
-    const i2c_device_config_t mpu_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = MPU6050_ADDR,
-        .scl_speed_hz = I2C_FREQ_HZ,
-    };
-    s_board.i2c_ready = true;
-
-    err = i2c_master_bus_add_device(s_i2c_bus, &mpu_cfg, &s_mpu_dev);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "MPU I2C device add failed: %s", esp_err_to_name(err));
-        s_board.last_mpu_err = err;
-        s_mpu_dev = NULL;
-    }
-
-    i2c_probe_devices(true);
-}
-
 static void buzzer_init(void)
 {
     ledc_timer_config_t timer_cfg = {
@@ -1135,11 +387,7 @@ static void buzzer_init(void)
 
 static void hardware_init(void)
 {
-    adc_init();
-    ext_io_init();
-    i2c_init();
     buzzer_init();
-    hardware_update();
 }
 
 static bool lcd_flush_ready_cb(esp_lcd_panel_io_handle_t panel_io,
@@ -1435,10 +683,9 @@ static lv_display_t *lvgl_display_init(esp_lcd_panel_io_handle_t io_handle)
 }
 
 static const char *const s_page_names[UI_PAGE_COUNT] = {
-    "Buzzer",
-    "SD Card",
-    "System",
-    "About",
+    "BUZZER",
+    "SD CARD",
+    "ABOUT",
 };
 
 static const uint32_t UI_YELLOW = 0xF6D34A;
@@ -1446,6 +693,7 @@ static const uint32_t UI_BLACK = 0x1B1713;
 static const uint32_t UI_BROWN = 0x5C4220;
 static const uint32_t UI_RED = 0xE64B3C;
 static const uint32_t UI_CREAM = 0xFFF3B0;
+
 
 static void ui_refresh(void);
 static void ui_show_page(ui_page_t page, int dir);
@@ -1564,10 +812,11 @@ static void ui_build_about_page(lv_obj_t *page)
              sizeof(details),
              "Model\n"
              "  Xiaomiao Handheld\n"
-             "  ESP32-WROVER-B\n\n"
-            //  "  Author: ZYoung\n\n"
+             "  ESP32-WROVER-B\n"
+             "  Author: ZYoung\n\n"
              "CPU\n"
-             "  Xtensa LX6  %d MHz x%u\n"
+             "  Xtensa LX6\n"
+             "    %d MHz x%u\n"
              "  Chip rev: %u\n\n"
              "System\n"
              "  ESP-IDF: %s\n"
@@ -1578,9 +827,7 @@ static void ui_build_about_page(lv_obj_t *page)
              "  Flash: %s %s\n"
              "  PSRAM: %d MHz\n"
              "  LCD SPI2: %u MHz\n"
-             "  SD SPI2: %u MHz\n"
-             "  I2C0: %u kHz\n"
-             "  Light ADC: 60 Hz\n\n"
+             "  SD SPI2: %u MHz\n\n"
              "Storage\n"
              "  Flash: %s\n"
              "  SRAM: %u KB\n"
@@ -1593,12 +840,9 @@ static void ui_build_about_page(lv_obj_t *page)
              "Board IO\n"
              "  Keys: 6 active-low\n"
              "  SD: SPI2 CS22\n"
-             "  ADC: 36/39/32/33\n"
-             "  I2C: MPU6050 0x68\n"
-             "  PWM: GPIO14 Buzzer\n"
-             "               GPIO25/26 EXT\n\n",
-            //  "wechat/tel:\n"
-            //  "  15657325738\n",
+             "  PWM: GPIO14 Buzzer\n\n"
+             "wechat/tel:\n"
+             "  15657325738\n",
              CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
              (unsigned)chip_info.cores,
              (unsigned)chip_info.revision,
@@ -1611,7 +855,6 @@ static void ui_build_about_page(lv_obj_t *page)
              CONFIG_SPIRAM_SPEED,
              (unsigned)(LCD_PIXEL_CLOCK_HZ / 1000000),
              (unsigned)(SD_SPI_MAX_FREQ_KHZ / 1000),
-             (unsigned)(I2C_FREQ_HZ / 1000),
              UI_FLASH_SIZE,
              ui_kb(sram_total),
              ui_kb(psram_total),
@@ -1637,9 +880,6 @@ static void ui_build_about_page(lv_obj_t *page)
     s_ui.hint = lv_label_create(page);
     lv_obj_add_flag(s_ui.hint, LV_OBJ_FLAG_HIDDEN);
     s_ui.bar = NULL;
-    s_ui.chart = NULL;
-    s_ui.chart_head = NULL;
-    s_ui.chart_series = NULL;
 }
 
 static void ui_build_page_content(lv_obj_t *page)
@@ -1665,9 +905,6 @@ static void ui_build_page_content(lv_obj_t *page)
 
     s_ui.value = ui_label(page, "--", 38, UI_BLACK, &lv_font_montserrat_14, LV_TEXT_ALIGN_CENTER);
     s_ui.sub = ui_label(page, "--", 63, UI_BROWN, &lv_font_montserrat_10, LV_TEXT_ALIGN_CENTER);
-    s_ui.chart = NULL;
-    s_ui.chart_head = NULL;
-    s_ui.chart_series = NULL;
     s_ui.bar = ui_bar(page, 0);
     s_ui.hint = ui_label(page, "L/R page", 106, UI_BLACK, &lv_font_montserrat_10, LV_TEXT_ALIGN_CENTER);
 }
@@ -1697,10 +934,6 @@ static void ui_show_page(ui_page_t page, int dir)
     s_ui.value = NULL;
     s_ui.sub = NULL;
     s_ui.bar = NULL;
-    s_ui.chart = NULL;
-    s_ui.chart_head = NULL;
-    s_ui.chart_series = NULL;
-    s_ui.chart_history_version = UINT32_MAX;
     s_ui.status = NULL;
     s_ui.hint = NULL;
     s_ui.accent = NULL;
@@ -1734,25 +967,15 @@ static void ui_refresh(void)
         ui_set_bar((int)((s_buzzer_freq_hz - 440) * 100 / (1760 - 440)));
         break;
     case UI_PAGE_SD:
-        if (!s_board.sd_mounted) {
-            lv_label_set_text(s_ui.value, "NO CARD");
-            lv_label_set_text_fmt(s_ui.sub, "GPIO22 CS  %s", short_err(s_board.last_sd_err));
-            ui_set_hint("A mount   L/R");
-            ui_set_bar(0);
-        } else {
-            if (s_sd_entry_count == 0 && !s_sd_file_view_open) {
-                sd_browser_scan();
-            }
-            sd_browser_update_display();
+        lv_label_set_text(s_ui.value, s_board.sd_mounted ? "MOUNTED" : "NO CARD");
+        if (s_board.sd_mounted) {
+            lv_label_set_text_fmt(s_ui.sub, "%s  %luMB", s_board.sd_name, (unsigned long)s_board.sd_mb);
         }
-        break;
-    case UI_PAGE_SYSTEM:
-        lv_label_set_text(s_ui.value, s_board.i2c_ready ? "I2C OK" : "I2C --");
-        lv_label_set_text_fmt(s_ui.sub,
-                              "MPU %s",
-                              s_board.mpu_present ? "OK" : short_err(s_board.last_mpu_err));
-        ui_set_hint("A rescan   L/R");
-        ui_set_bar(s_board.i2c_ready ? 100 : 0);
+        else {
+            lv_label_set_text_fmt(s_ui.sub, "GPIO22 CS  %s", short_err(s_board.last_sd_err));
+        }
+        ui_set_hint(s_board.sd_mounted ? "B unmount  L/R" : "A rescan   L/R");
+        ui_set_bar(s_board.sd_mounted ? 100 : 0);
         break;
     case UI_PAGE_ABOUT:
         break;
@@ -1771,28 +994,9 @@ static void ui_action(void)
         set_action(s_board.buzzer_ready ? "Beep" : "Buzzer init fail");
         break;
     case UI_PAGE_SD:
-        if (!s_board.sd_mounted) {
-            sd_try_mount();
-            err = s_board.sd_mounted ? ESP_OK : s_board.last_sd_err;
-            set_action(s_board.sd_mounted ? "SD mounted" : "No SD card");
-            if (err == ESP_OK) {
-                sd_browser_scan();
-            }
-        } else {
-            /* Open selected file */
-            if (s_sd_entry_count == 0) {
-                sd_browser_scan();
-            }
-            else {
-                sd_browser_open_file();
-            }
-            err = ESP_OK;
-        }
-        break;
-    case UI_PAGE_SYSTEM:
-        i2c_probe_devices(true);
-        err = s_board.i2c_ready ? ESP_OK : ESP_ERR_INVALID_STATE;
-        set_action(s_board.i2c_ready ? "Rescanned" : "I2C init fail");
+        sd_try_mount();
+        err = s_board.sd_mounted ? ESP_OK : s_board.last_sd_err;
+        set_action(s_board.sd_mounted ? "SD mounted" : "No SD card");
         break;
     default:
         break;
@@ -1812,16 +1016,7 @@ static void ui_cancel(void)
         set_action("Buzzer stop");
         break;
     case UI_PAGE_SD:
-        if (s_sd_file_view_open) {
-            sd_browser_close_file();
-            set_action("Closed");
-        } else if (strcmp(s_sd_cwd, SD_PATH_PREFIX) != 0) {
-            sd_browser_go_up();
-            sd_browser_scan();
-            set_action("Up");
-        } else {
-            sd_unmount();
-        }
+        sd_unmount();
         break;
     default:
         buzzer_stop();
@@ -1840,13 +1035,6 @@ static void ui_adjust(int step)
         set_action("Pitch set");
         break;
     }
-    case UI_PAGE_SD:
-        if (s_sd_file_view_open) {
-            sd_browser_scroll_file(step);
-        } else {
-            sd_browser_select(step);
-        }
-        break;
     default:
         return;
     }
@@ -1959,7 +1147,6 @@ static void lvgl_task(void *arg)
         hardware_process_timers();
         if (lv_tick_elaps(last_update_ms) >= UI_REFRESH_PERIOD_MS) {
             last_update_ms = lv_tick_get();
-            hardware_update();
             ui_refresh();
         }
 
@@ -1974,7 +1161,6 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "Xiaomiao LVGL 9.5 dashboard boot");
 
-    sensor_history_init();
     buttons_init();
 
     esp_lcd_panel_io_handle_t io_handle = lcd_init();
