@@ -1,9 +1,9 @@
 /*
  * Hardware layer: key button input.
- * See hw_buttons.h.
+ * See buttons.h.
  */
-#include "board.h"
-#include "hw/hw_buttons.h"
+#include "board_config.h"
+#include "hardware/buttons.h"
 
 #include "driver/gpio.h"
 #include "lvgl.h"

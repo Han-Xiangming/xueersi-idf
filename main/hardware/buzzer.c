@@ -1,9 +1,9 @@
 /*
  * Hardware layer: passive buzzer driven by LEDC PWM.
- * See hw_buzzer.h.
+ * See buzzer.h.
  */
-#include "board.h"
-#include "hw/hw_buzzer.h"
+#include "board_config.h"
+#include "hardware/buzzer.h"
 
 #include "driver/ledc.h"
 #include "esp_err.h"
