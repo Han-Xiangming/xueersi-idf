@@ -3,22 +3,22 @@
  *
  * Application layer: boot the hardware drivers, create the LVGL display
  * and UI, then run the LVGL service loop. All peripheral logic lives in
- * the hardware/ drivers and all UI logic lives in app/ui; this file only wires
+ * the hw/ drivers and all UI logic lives in sw/ui; this file only wires
  * them together.
  */
 
 #include <unistd.h>
 #include <sys/param.h>
 
-#include "board_config.h"
+#include "board.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "hardware/buttons.h"
-#include "hardware/buzzer.h"
-#include "hardware/lcd.h"
+#include "hw/hw_buttons.h"
+#include "hw/hw_buzzer.h"
+#include "hw/hw_lcd.h"
 #include "lvgl.h"
-#include "app/ui.h"
+#include "sw/ui.h"
 
 /* LVGL UI refresh cadence in the main loop (milliseconds). */
 #define UI_REFRESH_PERIOD_MS        16

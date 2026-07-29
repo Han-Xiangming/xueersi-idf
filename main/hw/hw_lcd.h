@@ -9,7 +9,7 @@
 
 #include <stdbool.h>
 
-#include "board_config.h"
+#include "board.h"
 #include "esp_lcd_panel_io.h"
 #include "lvgl.h"
 

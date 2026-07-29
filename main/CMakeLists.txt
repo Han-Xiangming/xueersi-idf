@@ -1,9 +1,9 @@
 idf_component_register(SRCS "main.c"
-                             "hardware/lcd.c"
-                             "hardware/buzzer.c"
-                             "hardware/sd.c"
-                             "hardware/buttons.c"
-                             "app/ui.c"
+                             "hw/hw_lcd.c"
+                             "hw/hw_buzzer.c"
+                             "hw/hw_sd.c"
+                             "hw/hw_buttons.c"
+                             "sw/ui.c"
                        INCLUDE_DIRS "."
                        PRIV_REQUIRES esp_lcd
                                      esp_timer

@@ -8,7 +8,7 @@
 
 #include <stdint.h>
 
-#include "board_config.h"
+#include "board.h"
 #include "lvgl.h"
 
 /* LVGL service timing / task parameters (application layer). */

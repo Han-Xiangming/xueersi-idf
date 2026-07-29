@@ -1,12 +1,12 @@
 /*
  * Hardware layer: ST7735 LCD driver and LVGL display binding.
- * See lcd.h.
+ * See hw_lcd.h.
  */
 #include <assert.h>
 #include <sys/param.h>
 
-#include "board_config.h"
-#include "hardware/lcd.h"
+#include "board.h"
+#include "hw/hw_lcd.h"
 
 #include "driver/spi_master.h"
 #include "esp_err.h"
