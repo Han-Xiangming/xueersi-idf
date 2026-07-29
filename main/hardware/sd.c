@@ -1,11 +1,11 @@
 /*
  * Hardware layer: SD card over SDSPI.
- * See hw_sd.h.
+ * See hardware/sd.h.
  */
 #include <string.h>
 
-#include "board.h"
-#include "hw/hw_sd.h"
+#include "board_config.h"
+#include "hardware/sd.h"
 
 #include "driver/sdspi_host.h"
 #include "driver/spi_master.h"
@@ -65,6 +65,7 @@ void hw_sd_try_mount(void)
                s_sd_card->cid.name,
                MIN(sizeof(s_sd_card->cid.name), sizeof(s_name) - 1));
         s_mb = (uint32_t)(((uint64_t)s_sd_card->csd.capacity * s_sd_card->csd.sector_size) / (1024 * 1024));
+        ESP_LOGI(TAG, "SD mounted: %s, %lu MB", s_sd_card->cid.name, (unsigned long)s_mb);
     }
     else {
         s_mounted = false;
@@ -72,6 +73,7 @@ void hw_sd_try_mount(void)
         memset(s_name, 0, sizeof(s_name));
         memcpy(s_name, "NO CARD", sizeof("NO CARD"));
         s_mb = 0;
+        ESP_LOGE(TAG, "SD mount failed: %s", esp_err_to_name(s_last_err));
     }
 }
 
