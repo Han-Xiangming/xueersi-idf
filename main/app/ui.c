@@ -24,6 +24,16 @@
 #include "lvgl.h"
 #include "sdkconfig.h"
 
+/* Embedded CJK bitmap font (main/fonts/lv_font_cn_10.c): ~570 KB, covers
+ * ASCII + ~22000 Chinese ideographs + Japanese kana/kanji + CJK symbols.
+ * Generated with lv_font_conv from SourceHanSansSC. Used as the UI default
+ * so both static labels and dynamic text (SD/BT names) render Chinese. */
+extern const lv_font_t lv_font_cn_10;
+
+/* Single UI font: the CJK font includes Latin glyphs too, so there is no
+ * need to mix multiple faces. */
+#define UI_FONT (&lv_font_cn_10)
+
 /* Build-info macros (read from sdkconfig). */
 #ifndef CONFIG_IDF_TARGET
 #define CONFIG_IDF_TARGET "esp32"
@@ -91,10 +101,18 @@
 
 static const char *const s_page_names[UI_PAGE_COUNT] = {
     "MP3",
-    "SD CARD",
-    "BLUETOOTH",
-    "SETTINGS",
+    "SD卡",
+    "蓝牙",
+    "设置",
 };
+
+/* Main menu lists only these pages. Bluetooth was moved into Settings as a
+ * sub-page (opened from the 蓝牙 settings item), so it is no longer a
+ * top-level tab in the main menu. */
+static const ui_page_t s_menu_pages[] = {
+    UI_PAGE_PLAYER, UI_PAGE_SD, UI_PAGE_SETTINGS,
+};
+#define UI_MENU_PAGE_COUNT ((int)(sizeof(s_menu_pages) / sizeof(s_menu_pages[0])))
 
 /* Settings sub-menu: up/down to select an item, left/right to change it.
  * Add new options here and they appear automatically in the list. */
@@ -105,9 +123,11 @@ typedef enum {
     SETTING_COUNT,
 } setting_item_t;
 
-static const int s_setting_y[SETTING_COUNT] = {40, 60, 80};
+static const int s_setting_y[SETTING_COUNT] = {30, 50, 70};
 
-/* Verbose (DEBUG) logging for the audio/player tags; off = normal INFO. */
+/* Verbose (DEBUG) logging; off = normal INFO. Covers the audio/player tags
+ * and the Bluetooth stack (our bt_audio wrapper plus the classic-BT Bluedroid
+ * components that surface discovery / connection internals). */
 static bool s_log_debug;
 
 static void ui_apply_log_level(void)
@@ -120,11 +140,11 @@ static void ui_apply_log_level(void)
 static int s_setting_sel = 0;
 
 #define MP3_LIST_ROWS 4
-static const int s_pl_row_y[MP3_LIST_ROWS] = {34, 54, 74, 94};
+static const int s_pl_row_y[MP3_LIST_ROWS] = {22, 40, 58, 76};
 
 /* Bluetooth sink picker: same 4-row list layout as the MP3 page. */
 #define BT_LIST_ROWS 4
-static const int s_bt_row_y[BT_LIST_ROWS] = {34, 54, 74, 94};
+static const int s_bt_row_y[BT_LIST_ROWS] = {22, 40, 58, 76};
 static int s_bt_sel;
 /* 4 KB of song names is UI-only data: keep it in external PSRAM so it does
  * not compete with the Bluetooth stack for internal DRAM. */
@@ -138,9 +158,9 @@ static const uint32_t UI_GRAY = 0x808080;
 static const uint32_t UI_BG_DARK = 0x000000;
 static const uint32_t UI_TITLE = 0x49F26B; /* retro-green title */
 
-/* Main-menu layout: up to 5 list rows (first UI_PAGE_COUNT are active). */
+/* Main-menu layout: up to 5 list rows (first UI_MENU_PAGE_COUNT are active). */
 #define UI_MENU_ROWS 5
-static const int s_menu_y[UI_MENU_ROWS] = {16, 38, 60, 82, 104};
+static const int s_menu_y[UI_MENU_ROWS] = {22, 42, 62, 82, 102};
 
 typedef struct {
     lv_obj_t *screen;
@@ -303,20 +323,20 @@ static void ui_build_settings(lv_obj_t *page)
         lv_obj_t *cur = lv_label_create(page);
         lv_label_set_text(cur, " ");
         lv_obj_set_pos(cur, 8, s_setting_y[i]);
-        lv_obj_set_style_text_font(cur, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_font(cur, &lv_font_cn_10, 0);
         lv_obj_set_style_text_color(cur, lv_color_hex(UI_GRAY), 0);
         s_ui.set_cursor[i] = cur;
 
         lv_obj_t *txt = lv_label_create(page);
         lv_label_set_long_mode(txt, LV_LABEL_LONG_MODE_CLIP);
         lv_obj_set_pos(txt, 18, s_setting_y[i]);
-        lv_obj_set_style_text_font(txt, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_font(txt, &lv_font_cn_10, 0);
         lv_obj_set_style_text_color(txt, lv_color_hex(UI_GRAY), 0);
         s_ui.set_text[i] = txt;
     }
 
-    s_ui.hint = ui_label(page, "U/D sel  L/R set  B menu", 106,
-                         UI_GRAY, &lv_font_montserrat_10, LV_TEXT_ALIGN_CENTER);
+    s_ui.hint = ui_label(page, "上/下选 A进入 左/右设 B返回", 110,
+                         UI_GRAY, &lv_font_cn_10, LV_TEXT_ALIGN_CENTER);
 }
 
 static void ui_build_player(lv_obj_t *page)
@@ -329,20 +349,20 @@ static void ui_build_player(lv_obj_t *page)
         lv_obj_t *cur = lv_label_create(page);
         lv_label_set_text(cur, " ");
         lv_obj_set_pos(cur, 6, s_pl_row_y[i]);
-        lv_obj_set_style_text_font(cur, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_font(cur, &lv_font_cn_10, 0);
         lv_obj_set_style_text_color(cur, lv_color_hex(UI_CYAN), 0);
         s_ui.pl_cursor[i] = cur;
 
         lv_obj_t *txt = lv_label_create(page);
         lv_label_set_long_mode(txt, LV_LABEL_LONG_MODE_CLIP);
         lv_obj_set_pos(txt, 16, s_pl_row_y[i]);
-        lv_obj_set_style_text_font(txt, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_font(txt, &lv_font_cn_10, 0);
         lv_obj_set_style_text_color(txt, lv_color_hex(UI_GRAY), 0);
         s_ui.pl_text[i] = txt;
     }
 
-    s_ui.pl_prog = ui_label(page, "IDLE", 108, UI_GRAY, &lv_font_montserrat_10, LV_TEXT_ALIGN_CENTER);
-    s_ui.hint = ui_label(page, "U/D sel  A play  B back", 120, UI_GRAY, &lv_font_montserrat_10, LV_TEXT_ALIGN_CENTER);
+    s_ui.pl_prog = ui_label(page, "空闲", 92, UI_GRAY, &lv_font_cn_10, LV_TEXT_ALIGN_CENTER);
+    s_ui.hint = ui_label(page, "上/下选择 A播放 B返回", 110, UI_GRAY, &lv_font_cn_10, LV_TEXT_ALIGN_CENTER);
 }
 
 /* Bluetooth page: entering it kicks off a scan; the list fills live. */
@@ -354,22 +374,22 @@ static void ui_build_bt(lv_obj_t *page)
         lv_obj_t *cur = lv_label_create(page);
         lv_label_set_text(cur, " ");
         lv_obj_set_pos(cur, 6, s_bt_row_y[i]);
-        lv_obj_set_style_text_font(cur, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_font(cur, &lv_font_cn_10, 0);
         lv_obj_set_style_text_color(cur, lv_color_hex(UI_CYAN), 0);
         s_ui.bt_cursor[i] = cur;
 
         lv_obj_t *txt = lv_label_create(page);
         lv_label_set_long_mode(txt, LV_LABEL_LONG_MODE_CLIP);
         lv_obj_set_pos(txt, 16, s_bt_row_y[i]);
-        lv_obj_set_style_text_font(txt, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_font(txt, &lv_font_cn_10, 0);
         lv_obj_set_style_text_color(txt, lv_color_hex(UI_GRAY), 0);
         s_ui.bt_text[i] = txt;
     }
 
-    s_ui.bt_status = ui_label(page, "SCANNING...", 108, UI_GRAY,
-                              &lv_font_montserrat_10, LV_TEXT_ALIGN_CENTER);
-    s_ui.hint = ui_label(page, "U/D sel  A conn  B back", 120, UI_GRAY,
-                         &lv_font_montserrat_10, LV_TEXT_ALIGN_CENTER);
+    s_ui.bt_status = ui_label(page, "扫描中...", 92, UI_GRAY,
+                              &lv_font_cn_10, LV_TEXT_ALIGN_CENTER);
+    s_ui.hint = ui_label(page, "上/下选 A连接 B返回", 110, UI_GRAY,
+                         &lv_font_cn_10, LV_TEXT_ALIGN_CENTER);
 
     bt_audio_scan_start();
 }
@@ -378,14 +398,31 @@ static void ui_build_page_content(lv_obj_t *page)
 {
     char idx[10];
 
-    s_ui.title = ui_label(page, s_page_names[s_ui.page_id], 7, UI_CYAN, &lv_font_montserrat_14, LV_TEXT_ALIGN_LEFT);
-    snprintf(idx, sizeof(idx), "%02u/%02u", (unsigned)s_ui.page_id + 1, (unsigned)UI_PAGE_COUNT);
-    s_ui.status = ui_label(page, idx, 7, UI_GRAY, &lv_font_montserrat_10, LV_TEXT_ALIGN_RIGHT);
+    s_ui.title = ui_label(page, s_page_names[s_ui.page_id], 2, UI_CYAN, &lv_font_cn_10, LV_TEXT_ALIGN_LEFT);
+    /* Header number = position in the main menu. The Bluetooth sub-page
+     * shows the Settings position since it is entered from there. */
+    int hdr_idx = 0;
+    for (int i = 0; i < UI_MENU_PAGE_COUNT; i++) {
+        if (s_menu_pages[i] == s_ui.page_id) {
+            hdr_idx = i;
+            break;
+        }
+    }
+    if (s_ui.page_id == UI_PAGE_BT) {
+        for (int i = 0; i < UI_MENU_PAGE_COUNT; i++) {
+            if (s_menu_pages[i] == UI_PAGE_SETTINGS) {
+                hdr_idx = i;
+                break;
+            }
+        }
+    }
+    snprintf(idx, sizeof(idx), "%02u/%02u", (unsigned)hdr_idx + 1, (unsigned)UI_MENU_PAGE_COUNT);
+    s_ui.status = ui_label(page, idx, 2, UI_GRAY, &lv_font_cn_10, LV_TEXT_ALIGN_RIGHT);
 
     /* Header separator, matching the main-menu style. */
     lv_obj_t *sep = lv_obj_create(page);
     lv_obj_remove_style_all(sep);
-    lv_obj_set_pos(sep, 0, 22);
+    lv_obj_set_pos(sep, 0, 20);
     lv_obj_set_size(sep, LCD_H_RES, 1);
     lv_obj_set_style_bg_color(sep, lv_color_hex(UI_GRAY), 0);
     lv_obj_set_style_bg_opa(sep, LV_OPA_COVER, 0);
@@ -404,10 +441,10 @@ static void ui_build_page_content(lv_obj_t *page)
     }
 
     /* Generic value/bar page (used by the SD CARD page). */
-    s_ui.value = ui_label(page, "--", 38, UI_CYAN, &lv_font_montserrat_14, LV_TEXT_ALIGN_CENTER);
-    s_ui.sub = ui_label(page, "--", 63, UI_GRAY, &lv_font_montserrat_10, LV_TEXT_ALIGN_CENTER);
+    s_ui.value = ui_label(page, "--", 38, UI_CYAN, &lv_font_cn_10, LV_TEXT_ALIGN_CENTER);
+    s_ui.sub = ui_label(page, "--", 63, UI_GRAY, &lv_font_cn_10, LV_TEXT_ALIGN_CENTER);
     s_ui.bar = ui_bar(page, 0);
-    s_ui.hint = ui_label(page, "A rescan  B menu", 106, UI_GRAY, &lv_font_montserrat_10, LV_TEXT_ALIGN_CENTER);
+    s_ui.hint = ui_label(page, "A重扫 B返回", 106, UI_GRAY, &lv_font_cn_10, LV_TEXT_ALIGN_CENTER);
 }
 
 /* Menu uses show/hide transitions instead of LVGL swipe animations. */
@@ -415,7 +452,7 @@ static void ui_build_page_content(lv_obj_t *page)
 static void ui_refresh_menu(void)
 {
     for (int i = 0; i < UI_MENU_ROWS; i++) {
-        if (i >= UI_PAGE_COUNT) {
+        if (i >= UI_MENU_PAGE_COUNT) {
             continue;
         }
         const int sel = (i == s_menu_sel);
@@ -426,7 +463,7 @@ static void ui_refresh_menu(void)
     }
 
     char buf[32];
-    snprintf(buf, sizeof(buf), "[%d/%d]", (int)(s_menu_sel + 1), (int)UI_PAGE_COUNT);
+    snprintf(buf, sizeof(buf), "[%d/%d]", (int)(s_menu_sel + 1), (int)UI_MENU_PAGE_COUNT);
     lv_label_set_text(s_ui.menu_status, buf);
 }
 
@@ -445,13 +482,13 @@ static void ui_build_menu(void)
     lv_obj_t *title = lv_label_create(mp);
     lv_label_set_text(title, "=^_^=");
     lv_obj_set_pos(title, 4, 2);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_font(title, &lv_font_cn_10, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(UI_TITLE), 0);
 
     /* Separator line spanning the full width, clear of the title. */
     lv_obj_t *sep = lv_obj_create(mp);
     lv_obj_remove_style_all(sep);
-    lv_obj_set_pos(sep, 0, 14);
+    lv_obj_set_pos(sep, 0, 20);
     lv_obj_set_size(sep, LCD_H_RES, 1);
     lv_obj_set_style_bg_color(sep, lv_color_hex(UI_GRAY), 0);
     lv_obj_set_style_bg_opa(sep, LV_OPA_COVER, 0);
@@ -461,30 +498,32 @@ static void ui_build_menu(void)
         lv_obj_t *cur = lv_label_create(mp);
         lv_label_set_text(cur, " ");
         lv_obj_set_pos(cur, 8, s_menu_y[i]);
-        lv_obj_set_style_text_font(cur, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_font(cur, &lv_font_cn_10, 0);
         lv_obj_set_style_text_color(cur, lv_color_hex(UI_GRAY), 0);
         s_ui.menu_cursor[i] = cur;
 
         lv_obj_t *txt = lv_label_create(mp);
         lv_label_set_long_mode(txt, LV_LABEL_LONG_MODE_CLIP);
-        lv_label_set_text(txt, i < UI_PAGE_COUNT ? s_page_names[i] : "");
+        lv_label_set_text(txt, i < UI_MENU_PAGE_COUNT ? s_page_names[s_menu_pages[i]] : "");
         lv_obj_set_pos(txt, 18, s_menu_y[i]);
-        lv_obj_set_style_text_font(txt, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_font(txt, &lv_font_cn_10, 0);
         lv_obj_set_style_text_color(txt, lv_color_hex(UI_GRAY), 0);
         s_ui.menu_text[i] = txt;
     }
 
     /* Bottom status bar: "[n/3]" left, "A:OK B:BK" right, both gray. */
+    char mbuf[32];
+    snprintf(mbuf, sizeof(mbuf), "[1/%d]", (int)UI_MENU_PAGE_COUNT);
     s_ui.menu_status = lv_label_create(mp);
-    lv_label_set_text(s_ui.menu_status, "[1/3]");
-    lv_obj_set_pos(s_ui.menu_status, 4, 114);
-    lv_obj_set_style_text_font(s_ui.menu_status, &lv_font_montserrat_10, 0);
+    lv_label_set_text(s_ui.menu_status, mbuf);
+    lv_obj_set_pos(s_ui.menu_status, 4, 110);
+    lv_obj_set_style_text_font(s_ui.menu_status, &lv_font_cn_10, 0);
     lv_obj_set_style_text_color(s_ui.menu_status, lv_color_hex(UI_GRAY), 0);
 
     lv_obj_t *hint = lv_label_create(mp);
     lv_label_set_text(hint, "A:OK B:BK");
-    lv_obj_set_pos(hint, 104, 114);
-    lv_obj_set_style_text_font(hint, &lv_font_montserrat_10, 0);
+    lv_obj_set_pos(hint, 104, 110);
+    lv_obj_set_style_text_font(hint, &lv_font_cn_10, 0);
     lv_obj_set_style_text_color(hint, lv_color_hex(UI_GRAY), 0);
 }
 
@@ -545,18 +584,18 @@ void ui_refresh(void)
 
     switch (s_ui.page_id) {
     case UI_PAGE_SD:
-        lv_label_set_text(s_ui.value, hw_sd_is_mounted() ? "MOUNTED" : "NO CARD");
+        lv_label_set_text(s_ui.value, hw_sd_is_mounted() ? "已挂载" : "无卡");
         if (hw_sd_is_mounted()) {
             lv_label_set_text_fmt(s_ui.sub, "%s  %luMB", hw_sd_name(), (unsigned long)hw_sd_mb());
         }
         else {
             lv_label_set_text_fmt(s_ui.sub, "GPIO22 CS  %s", short_err(hw_sd_last_err()));
         }
-        ui_set_hint(hw_sd_is_mounted() ? "B menu" : "A rescan  B menu");
+        ui_set_hint(hw_sd_is_mounted() ? "B返回" : "A重扫 B返回");
         ui_set_bar(hw_sd_is_mounted() ? 100 : 0);
         break;
     case UI_PAGE_SETTINGS: {
-        static const char *const names[SETTING_COUNT] = {"VOLUME", "BT OUT", "LOG"};
+        static const char *const names[SETTING_COUNT] = {"音量", "蓝牙", "日志等级"};
         char buf[24];
         for (int i = 0; i < SETTING_COUNT; i++) {
             const int sel = (i == s_setting_sel);
@@ -570,14 +609,14 @@ void ui_refresh(void)
                          names[i], (unsigned)hw_audio_get_volume());
                 break;
             case SETTING_BTOUT:
-                /* LINK = enabled and a sink is connected. */
+                /* Replaced the on/off toggle: this item opens the Bluetooth
+                 * screen. Show whether a sink is currently linked. */
                 snprintf(buf, sizeof(buf), "%-8s %s", names[i],
-                         !bt_audio_is_enabled() ? "OFF"
-                         : bt_audio_is_connected() ? "LINK" : "ON");
+                         bt_audio_is_connected() ? "已连接" : "进入");
                 break;
             case SETTING_LOG:
                 snprintf(buf, sizeof(buf), "%-8s %s", names[i],
-                         s_log_debug ? "DEBUG" : "INFO");
+                         s_log_debug ? "Debug" : "Normal");
                 break;
             default:
                 buf[0] = '\0';
@@ -585,7 +624,7 @@ void ui_refresh(void)
             }
             lv_label_set_text(s_ui.set_text[i], buf);
         }
-        ui_set_hint("U/D sel  L/R set  B menu");
+        ui_set_hint("上/下选 A进入 左/右设 B返回");
         break;
     }
     case UI_PAGE_PLAYER: {
@@ -618,7 +657,7 @@ void ui_refresh(void)
         lv_label_set_text(s_ui.status,
                           st == PLAYER_PLAYING ? ">>" : st == PLAYER_PAUSED ? "||" : "--");
         if (st == PLAYER_IDLE) {
-            lv_label_set_text(s_ui.pl_prog, s_mp3_count ? "IDLE" : "NO MP3 FILES");
+            lv_label_set_text(s_ui.pl_prog, s_mp3_count ? "空闲" : "无MP3文件");
         }
         else {
             /* Now-playing line: just the track name. */
@@ -628,10 +667,10 @@ void ui_refresh(void)
             lv_label_set_text(s_ui.pl_prog, prog);
         }
         if (st == PLAYER_PLAYING || st == PLAYER_PAUSED) {
-            ui_set_hint("U/D vol  A pause  B stop");
+            ui_set_hint("上/下音量 A暂停 B停止");
         }
         else {
-            ui_set_hint("U/D sel  A play  B back");
+            ui_set_hint("上/下选择 A播放 B返回");
         }
         break;
     }
@@ -654,8 +693,9 @@ void ui_refresh(void)
                 lv_label_set_text(s_ui.bt_cursor[i], sel ? ">" : " ");
                 lv_obj_set_style_text_color(s_ui.bt_text[i],
                                             lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
-                char tmp[26];
-                strncpy(tmp, bt_audio_device_name(idx), sizeof(tmp) - 1);
+                char tmp[32];
+                const char *nm = bt_audio_device_name(idx);
+                strncpy(tmp, nm, sizeof(tmp) - 1);
                 tmp[sizeof(tmp) - 1] = '\0';
                 lv_label_set_text(s_ui.bt_text[i], tmp);
             }
@@ -666,37 +706,37 @@ void ui_refresh(void)
         }
         if (bt_audio_is_connected()) {
             char st[28];
-            snprintf(st, sizeof(st), "LINK %s", bt_audio_peer_name());
+            snprintf(st, sizeof(st), "已连接 %s", bt_audio_peer_name());
             st[27] = '\0';
             lv_label_set_text(s_ui.bt_status, st);
-            ui_set_hint("A discon  B back");
+            ui_set_hint("A断开 B返回");
         }
         else if (bt_audio_pair_state() == BT_PAIR_PAIRING) {
             /* Show the SSP passkey so the user can verify it on the sink. */
-            lv_label_set_text_fmt(s_ui.bt_status, "PAIR CODE %06u",
+            lv_label_set_text_fmt(s_ui.bt_status, "配对码 %06u",
                                   (unsigned)bt_audio_passkey());
-            ui_set_hint("Pairing...  B back");
+            ui_set_hint("配对中... B返回");
         }
         else if (bt_audio_pair_state() == BT_PAIR_CONNECTING) {
             char st[28];
-            snprintf(st, sizeof(st), "PAIRING %s", bt_audio_peer_name());
+            snprintf(st, sizeof(st), "配对中 %s", bt_audio_peer_name());
             st[27] = '\0';
             lv_label_set_text(s_ui.bt_status, st);
-            ui_set_hint("Connecting...  B back");
+            ui_set_hint("连接中... B返回");
         }
         else if (bt_audio_pair_state() == BT_PAIR_FAIL) {
-            lv_label_set_text(s_ui.bt_status, "PAIR FAILED");
-            ui_set_hint("A retry  B back");
+            lv_label_set_text(s_ui.bt_status, "配对失败");
+            ui_set_hint("A重试 B返回");
         }
         else if (bt_audio_is_scanning()) {
-            lv_label_set_text_fmt(s_ui.bt_status, "SCANNING... %d", count);
-            ui_set_hint("U/D sel  A conn  B back");
+            lv_label_set_text_fmt(s_ui.bt_status, "扫描中... %d", count);
+            ui_set_hint("上/下选 A连接 B返回");
         }
         else {
             lv_label_set_text_fmt(s_ui.bt_status,
-                                  count ? "%d FOUND" : "NO DEVICES", count);
-            ui_set_hint(count ? "U/D sel  A conn  B back"
-                              : "A rescan  B back");
+                                  count ? "%d 个设备" : "无设备", count);
+            ui_set_hint(count ? "上/下选 A连接 B返回"
+                              : "A重扫 B返回");
         }
         break;
     }
@@ -710,34 +750,40 @@ static void ui_action(void)
     switch (s_ui.page_id) {
     case UI_PAGE_SD:
         hw_sd_try_mount();
-        set_action(hw_sd_is_mounted() ? "SD mounted" : "No SD card");
+        set_action(hw_sd_is_mounted() ? "SD已挂载" : "无SD卡");
         break;
     case UI_PAGE_PLAYER:
         if (s_mp3_count == 0) {
-            set_action("No MP3 files");
+            set_action("无MP3文件");
             break;
         }
         if (player_state() == PLAYER_PLAYING || player_state() == PLAYER_PAUSED) {
             player_toggle();
-            set_action(player_state() == PLAYER_PAUSED ? "Paused" : "Playing");
+            set_action(player_state() == PLAYER_PAUSED ? "已暂停" : "播放中");
         }
         else {
             player_play(s_mp3_names[s_mp3_sel]);
-            set_action("Playing");
+            set_action("播放中");
         }
         break;
     case UI_PAGE_BT:
         if (bt_audio_is_connected()) {
             bt_audio_disconnect();
-            set_action("Disconnecting");
+            set_action("断开中");
         }
         else if (bt_audio_device_count() > 0) {
-            set_action(bt_audio_connect_index(s_bt_sel) ? "Connecting"
-                                                        : "Conn failed");
+            set_action(bt_audio_connect_index(s_bt_sel) ? "连接中"
+                                                        : "连接失败");
         }
         else {
             bt_audio_scan_start();
-            set_action("Scanning");
+            set_action("扫描中");
+        }
+        break;
+    case UI_PAGE_SETTINGS:
+        /* The 蓝牙 item opens the Bluetooth management screen. */
+        if (s_setting_sel == SETTING_BTOUT) {
+            ui_enter_page(UI_PAGE_BT);
         }
         break;
     default:
@@ -753,7 +799,7 @@ static void ui_adjust(int step)
     switch (s_ui.page_id) {
     case UI_PAGE_SETTINGS:
         s_setting_sel = (s_setting_sel - step + SETTING_COUNT) % SETTING_COUNT;
-        set_action("Select");
+        set_action("选择");
         break;
     case UI_PAGE_PLAYER:
         if (player_state() == PLAYER_PLAYING ||
@@ -762,20 +808,20 @@ static void ui_adjust(int step)
              * (1% steps below 10%, else 5%). */
             ui_volume_step(step, 5);
             char buf[24];
-            snprintf(buf, sizeof(buf), "VOL %u%%",
+            snprintf(buf, sizeof(buf), "音量 %u%%",
                      (unsigned)hw_audio_get_volume());
             set_action(buf);
         }
         else if (s_mp3_count > 0) {
             s_mp3_sel = (s_mp3_sel - step + s_mp3_count) % s_mp3_count;
-            set_action("Select");
+            set_action("选择");
         }
         break;
     case UI_PAGE_BT: {
         int count = bt_audio_device_count();
         if (count > 0) {
             s_bt_sel = (s_bt_sel - step + count) % count;
-            set_action("Select");
+            set_action("选择");
         }
         break;
     }
@@ -800,14 +846,10 @@ static void ui_adjust_lr(int dir)
         set_action(buf);
         break;
     }
-    case SETTING_BTOUT:
-        bt_audio_set_enabled(dir > 0);
-        set_action(dir > 0 ? "BT scanning" : "BT OFF");
-        break;
     case SETTING_LOG:
         s_log_debug = (dir > 0);
         ui_apply_log_level();
-        set_action(s_log_debug ? "LOG DEBUG" : "LOG INFO");
+        set_action(s_log_debug ? "Debug" : "Normal");
         break;
     default:
         return;
@@ -825,15 +867,15 @@ static void ui_key_event_cb(lv_event_t *e)
 
     if (s_in_menu) {
         if (key == LV_KEY_UP) {
-            s_menu_sel = (s_menu_sel + UI_PAGE_COUNT - 1) % UI_PAGE_COUNT;
+            s_menu_sel = (s_menu_sel + UI_MENU_PAGE_COUNT - 1) % UI_MENU_PAGE_COUNT;
             ui_refresh_menu();
         }
         else if (key == LV_KEY_DOWN) {
-            s_menu_sel = (s_menu_sel + 1) % UI_PAGE_COUNT;
+            s_menu_sel = (s_menu_sel + 1) % UI_MENU_PAGE_COUNT;
             ui_refresh_menu();
         }
         else if (key == LV_KEY_ENTER) {
-            ui_enter_page((ui_page_t)s_menu_sel);
+            ui_enter_page(s_menu_pages[s_menu_sel]);
         }
         /* B (ESC) is a no-op while already on the main menu. */
         return;
@@ -844,7 +886,13 @@ static void ui_key_event_cb(lv_event_t *e)
         if (s_ui.page_id == UI_PAGE_PLAYER) {
             player_stop();
         }
-        ui_show_menu();
+        if (s_ui.page_id == UI_PAGE_BT) {
+            /* Return to Settings, the screen this sub-page was opened from. */
+            ui_enter_page(UI_PAGE_SETTINGS);
+        }
+        else {
+            ui_show_menu();
+        }
         return;
     }
     if (key == LV_KEY_ENTER) {
@@ -886,6 +934,8 @@ void ui_create(lv_group_t *group)
     lv_group_add_obj(group, s_ui.screen);
     lv_group_focus_obj(s_ui.screen);
     lv_obj_add_event_cb(s_ui.screen, ui_key_event_cb, LV_EVENT_KEY, NULL);
+    /* Use the embedded CJK font everywhere so Chinese text renders. */
+    lv_obj_set_style_text_font(s_ui.screen, UI_FONT, 0);
 
     ui_build_menu();
     ui_refresh_menu();

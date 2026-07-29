@@ -109,20 +109,21 @@ static bool bt_prop_get_name(esp_bt_gap_cb_param_t *param, char *out, size_t out
     return false;
 }
 
-/* Inquiry result: append every audio-rendering device to the scan list
- * (deduplicated by address); the user picks the one to connect. */
+/* Inquiry result: append every discoverable device to the scan list
+ * (deduplicated by address). The RENDERING-only filter was dropped to widen
+ * the scan range — the user can still only A2DP-connect to a real audio sink,
+ * but now phones/speakers that omit the rendering service bit are visible. */
 static void bt_handle_disc_res(esp_bt_gap_cb_param_t *param)
 {
-    bool is_sink = false;
+    bool accept = false;
     for (int i = 0; i < param->disc_res.num_prop; i++) {
         esp_bt_gap_dev_prop_t *p = &param->disc_res.prop[i];
         if (p->type == ESP_BT_GAP_DEV_PROP_COD) {
             uint32_t cod = *(uint32_t *)p->val;
-            is_sink = esp_bt_gap_is_valid_cod(cod) &&
-                      (esp_bt_gap_get_cod_srvc(cod) & ESP_BT_COD_SRVC_RENDERING);
+            accept = esp_bt_gap_is_valid_cod(cod);
         }
     }
-    if (!is_sink) {
+    if (!accept) {
         return;
     }
 

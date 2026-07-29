@@ -6,6 +6,7 @@ idf_component_register(SRCS "main.c"
                              "hardware/buttons.c"
                              "app/ui.c"
                              "app/player.c"
+                             "fonts/lv_font_cn_10.c"
                        INCLUDE_DIRS "."
                        PRIV_REQUIRES esp_lcd
                                      esp_timer
@@ -21,7 +22,7 @@ idf_component_register(SRCS "main.c"
                                      lvgl
                                      bt
                                      esp-libhelix-mp3
-                       EMBED_FILES "tracks/1ezyZip.mp3"
+                       EMBED_FILES "tracks/Test.mp3"
                        )
 
 target_link_libraries(${COMPONENT_LIB} PRIVATE m)
