@@ -135,6 +135,10 @@ static const int s_setting_y[SETTING_COUNT] = {30, 50, 70};
  * components that surface discovery / connection internals). */
 static bool s_log_debug;
 
+/* Bluetooth output master switch (settings page ON/OFF). Persisted to NVS;
+ * restored at boot. Drives bt_audio_set_enabled() — the audio routing gate. */
+static bool s_bt_on;
+
 static void ui_apply_log_level(void)
 {
     esp_log_level_t lvl = s_log_debug ? ESP_LOG_DEBUG : ESP_LOG_INFO;
@@ -149,6 +153,7 @@ static void ui_apply_log_level(void)
 #define UI_NVS_NS      "ui_cfg"
 #define UI_NVS_VOLUME  "volume"
 #define UI_NVS_LOGDBG  "log_dbg"
+#define UI_NVS_BT      "bt_on"
 
 static void ui_settings_load(void)
 {
@@ -164,6 +169,11 @@ static void ui_settings_load(void)
     if (nvs_get_i32(h, UI_NVS_LOGDBG, &dbg) == ESP_OK) {
         s_log_debug = (dbg != 0);
         ui_apply_log_level();
+    }
+    int32_t bt = 0;
+    if (nvs_get_i32(h, UI_NVS_BT, &bt) == ESP_OK) {
+        s_bt_on = (bt != 0);
+        bt_audio_set_enabled(s_bt_on);
     }
     nvs_close(h);
 }
@@ -188,11 +198,22 @@ static void ui_settings_save_log(void)
     }
 }
 
+static void ui_settings_save_bt(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, UI_NVS_BT, s_bt_on ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
 /* Debounced persistence: a setting change only marks a dirty bit and arms a
  * timer; ui_settings_flush() (called every refresh) commits once the user
  * stops tweaking, folding long-press repeats into a single NVS write. */
 #define SETTINGS_DIRTY_VOLUME   (1u << 0)
 #define SETTINGS_DIRTY_LOG      (1u << 1)
+#define SETTINGS_DIRTY_BT       (1u << 2)
 
 static uint32_t s_save_pending;
 static uint32_t s_save_at_ms;
@@ -217,6 +238,9 @@ static void ui_settings_flush(void)
     if (s_save_pending & SETTINGS_DIRTY_LOG) {
         ui_settings_save_log();
     }
+    if (s_save_pending & SETTINGS_DIRTY_BT) {
+        ui_settings_save_bt();
+    }
     s_save_pending = 0;
 }
 
@@ -239,7 +263,7 @@ static int s_mp3_sel;
 static const uint32_t UI_CYAN = 0x00E0E0;
 static const uint32_t UI_GRAY = 0x808080;
 static const uint32_t UI_BG_DARK = 0x000000;
-static const uint32_t UI_TITLE = 0x49F26B; /* retro-green title */
+static const uint32_t UI_TITLE = 0xFF8000;   /* title-bar accent (orange) */
 
 /* Main-menu layout: up to 5 list rows (first UI_MENU_PAGE_COUNT are active). */
 #define UI_MENU_ROWS 5
@@ -493,7 +517,7 @@ static void ui_build_page_content(lv_obj_t *page)
 {
     char idx[10];
 
-    s_ui.title = ui_label(page, s_page_names[s_ui.page_id], 2, UI_CYAN, &lv_font_cn_10, LV_TEXT_ALIGN_LEFT);
+    s_ui.title = ui_label(page, s_page_names[s_ui.page_id], 2, UI_TITLE, &lv_font_cn_10, LV_TEXT_ALIGN_LEFT);
     /* Header number = position in the main menu. The Bluetooth sub-page
      * shows the Settings position since it is entered from there. */
     int hdr_idx = 0;
@@ -710,10 +734,18 @@ void ui_refresh(void)
                 snprintf(buf, sizeof(buf), "%u%%", (unsigned)hw_audio_get_volume());
                 break;
             case SETTING_BTOUT:
-                /* This item opens the Bluetooth screen; show whether a sink
-                 * is currently linked. */
-                snprintf(buf, sizeof(buf), "%s",
-                         bt_audio_is_connected() ? "已连接" : "进入");
+                /* Live status: fully off, on (not linked), or linked. The
+                 * persisted master switch is s_bt_on; the linked state is
+                 * read live so the row reflects reality after a connect. */
+                if (!s_bt_on) {
+                    snprintf(buf, sizeof(buf), "关");
+                }
+                else if (bt_audio_is_connected()) {
+                    snprintf(buf, sizeof(buf), "已连接");
+                }
+                else {
+                    snprintf(buf, sizeof(buf), "开");
+                }
                 break;
             case SETTING_LOG:
                 snprintf(buf, sizeof(buf), "%s", s_log_debug ? "Debug" : "Normal");
@@ -881,8 +913,16 @@ static void ui_action(void)
         }
         break;
     case UI_PAGE_SETTINGS:
-        /* The 蓝牙 item opens the Bluetooth management screen. */
+        /* The 蓝牙 item opens the Bluetooth management screen. Managing a
+         * sink needs the radio, so entering it implies BT ON — set the
+         * master switch and power the controller up lazily. This keeps the
+         * SETTING_BTOUT row (关/开/已连接) consistent with the live state. */
         if (s_setting_sel == SETTING_BTOUT) {
+            if (!s_bt_on) {
+                s_bt_on = true;
+                bt_audio_set_enabled(true);
+                ui_settings_mark_dirty(SETTINGS_DIRTY_BT);
+            }
             ui_enter_page(UI_PAGE_BT);
         }
         break;
@@ -953,6 +993,18 @@ static void ui_adjust_lr(int dir)
         ui_apply_log_level();
         ui_settings_mark_dirty(SETTINGS_DIRTY_LOG);
         set_action(s_log_debug ? "Debug" : "Normal");
+        break;
+    case SETTING_BTOUT:
+        /* Left = off, right = on. Toggling applies the routing gate and is
+         * persisted to NVS on the next flush. Switching OFF also powers the
+         * Bluetooth controller fully down (if it was up) to save power. */
+        s_bt_on = (dir > 0);
+        bt_audio_set_enabled(s_bt_on);
+        if (!s_bt_on) {
+            bt_audio_disable();
+        }
+        ui_settings_mark_dirty(SETTINGS_DIRTY_BT);
+        set_action(s_bt_on ? "蓝牙开" : "蓝牙关");
         break;
     default:
         return;

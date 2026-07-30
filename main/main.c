@@ -30,6 +30,39 @@
 
 static const char *TAG = "xiaomiao_dash";
 
+/* Remote AVRCP command from a paired headset/speaker drives local playback. */
+static void xiaomiao_avrc_cmd(bt_avrc_cmd_t cmd)
+{
+    switch (cmd) {
+    case BT_AVRC_CMD_PLAY:
+        if (player_state() == PLAYER_PAUSED) {
+            player_toggle();                   /* resume a paused track */
+        }
+        break;
+    case BT_AVRC_CMD_PAUSE:
+        if (player_state() == PLAYER_PLAYING) {
+            player_toggle();                   /* pause a playing track */
+        }
+        break;
+    case BT_AVRC_CMD_STOP:
+        player_stop();
+        break;
+    case BT_AVRC_CMD_NEXT:
+    case BT_AVRC_CMD_PREV:
+        /* The current player has no playlist navigation; ignore for now. */
+        ESP_LOGI(TAG, "AVRCP %s (no playlist navigation)",
+                 cmd == BT_AVRC_CMD_NEXT ? "NEXT" : "PREV");
+        break;
+    }
+}
+
+/* Remote absolute volume (0..127, AVRCP full scale) -> 0..100% master volume. */
+static void xiaomiao_avrc_volume(uint8_t volume_0_127)
+{
+    uint8_t pct = (uint8_t)(((uint32_t)volume_0_127 * 100u + 63) / 127u);
+    hw_audio_set_volume(pct);
+}
+
 static void lvgl_task(void *arg)
 {
     lv_group_t *group = (lv_group_t *)arg;
@@ -83,6 +116,8 @@ void app_main(void)
     hw_audio_init();
     wifi_prov_init();   /* Wi-Fi + NVS before BT (controller coex) */
     bt_audio_init();
+    bt_audio_set_avrc_cmd_cb(xiaomiao_avrc_cmd);
+    bt_audio_set_avrc_volume_cb(xiaomiao_avrc_volume);
     hw_sd_try_mount();
     player_init();
 

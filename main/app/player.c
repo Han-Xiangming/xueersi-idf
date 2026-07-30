@@ -35,8 +35,6 @@ static player_state_t s_state = PLAYER_IDLE;
 
 static char s_path[192];        /* full path: /sdcard/<name> */
 static char s_name[MP3_NAME_LEN];
-static uint32_t s_file_size;
-static int s_progress;
 static bool s_stop_req;
 static bool s_pause_req;
 static bool s_new_req;
@@ -75,15 +73,11 @@ static bool open_track(void)
             ESP_LOGE(TAG, "open %s failed", s_path);
             return false;
         }
-        fseek(s_src.fp, 0, SEEK_END);
-        s_file_size = (uint32_t)ftell(s_src.fp);
-        fseek(s_src.fp, 0, SEEK_SET);
     }
     else {
         s_src.buf = _binary_Test_mp3_start;
         s_src.buf_size = (size_t)(_binary_Test_mp3_end - _binary_Test_mp3_start);
         s_src.pos = 0;
-        s_file_size = (uint32_t)s_src.buf_size;
     }
 
     s_dec = MP3InitDecoder();
@@ -97,7 +91,6 @@ static bool open_track(void)
     }
     s_bytes_left = 0;
     s_consumed = 0;
-    s_progress = 0;
     return true;
 }
 
@@ -112,7 +105,6 @@ static void close_track(void)
         s_src.fp = NULL;
     }
     hw_audio_set_player_active(false);
-    s_progress = 0;
 }
 
 /* Read up to `want` bytes from the active source into `out`. Returns the
@@ -130,15 +122,6 @@ static int src_read(void *out, int want)
         return n;
     }
     return (int)fread(out, 1, (size_t)want, s_src.fp);
-}
-
-/* Current read position within the active source (for progress). */
-static long src_tell(void)
-{
-    if (s_src.embedded) {
-        return (long)s_src.pos;
-    }
-    return ftell(s_src.fp);
 }
 
 /* Decode a single frame and stream it. Returns false on EOF/error. */
@@ -201,9 +184,8 @@ static bool decode_frame(bool *rate_set)
 
     s_dbg_frames++;
     if (s_dbg_frames % 50 == 0) {
-        ESP_LOGD(TAG, "frame #%u consumed=%d out=%d progress=%d%%",
-                 (unsigned)s_dbg_frames, s_consumed, info.outputSamps,
-                 s_progress);
+        ESP_LOGD(TAG, "frame #%u consumed=%d out=%d",
+                 (unsigned)s_dbg_frames, s_consumed, info.outputSamps);
     }
 
     if (info.nChans == 2) {
@@ -217,13 +199,6 @@ static bool decode_frame(bool *rate_set)
         hw_audio_write_pcm(s_stereo, (size_t)info.outputSamps);
     }
 
-    if (s_file_size > 0) {
-        long pos = src_tell();
-        s_progress = (int)((pos * 100) / (long)s_file_size);
-        if (s_progress > 100) {
-            s_progress = 100;
-        }
-    }
     return true;
 }
 
@@ -246,8 +221,8 @@ static void decode_loop(void)
             return;
         }
         hw_audio_set_player_active(true);
-        ESP_LOGI(TAG, "start track '%s' embedded=%d size=%u", s_name,
-                 s_src.embedded, s_file_size);
+        ESP_LOGI(TAG, "start track '%s' embedded=%d", s_name,
+                 s_src.embedded);
 
         bool rate_set = false;
         int frame_cnt = 0;
@@ -337,11 +312,6 @@ player_state_t player_state(void)
 const char *player_current_name(void)
 {
     return s_name;
-}
-
-int player_progress(void)
-{
-    return (s_state == PLAYER_IDLE) ? -1 : s_progress;
 }
 
 void player_play(const char *name)

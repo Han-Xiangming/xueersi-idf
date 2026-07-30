@@ -31,8 +31,8 @@ player_state_t player_state(void);
 /* Basename of the track currently loaded, or "" if idle. */
 const char *player_current_name(void);
 
-/* Playback progress 0..100, or -1 if unknown. */
-int player_progress(void);
+/* (playback progress intentionally omitted: byte-offset percentage is
+ * inaccurate for VBR MP3 and is not surfaced anywhere in the UI) */
 
 /* Start/restart playback of the named file (basename under /sdcard). */
 void player_play(const char *name);

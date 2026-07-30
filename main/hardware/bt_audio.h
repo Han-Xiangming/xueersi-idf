@@ -32,6 +32,13 @@ void bt_audio_init(void);
  * advertise an A2DP source at boot. */
 void bt_audio_enable(void);
 
+/* Tear the stack back down and power off the Bluetooth controller (the
+ * reverse of bt_audio_enable). Idempotent: a no-op when already down. Call
+ * when the user switches the Bluetooth master switch OFF so the radio is
+ * truly silent instead of merely unconnected. All discovery/connection state
+ * is reset, so a later bt_audio_enable() starts clean. */
+void bt_audio_disable(void);
+
 /* True once bt_audio_enable() has brought the stack up. */
 bool bt_audio_is_initialized(void);
 
@@ -86,3 +93,30 @@ void bt_audio_write_pcm(const int16_t *stereo_frames, size_t frames);
  * stream always runs at 44.1 kHz, so any other input rate is resampled
  * internally (otherwise the sink would play fast/slow and pitch-shifted). */
 void bt_audio_set_sample_rate(uint32_t rate_hz);
+
+/* === AVRCP remote control ===================================================
+ * The device is an A2DP SOURCE, so it registers the AVRCP TARGET (TG) role and
+ * lets a paired remote (the headset/speaker's media keys) drive local playback
+ * and volume. Bluedroid auto-ACKs the passthrough / absolute-volume commands,
+ * so this module only translates them into the application callbacks below. */
+
+/* Media command delivered by a remote AVRCP controller. */
+typedef enum {
+    BT_AVRC_CMD_PLAY,   /* start / resume playback */
+    BT_AVRC_CMD_PAUSE,  /* pause playback */
+    BT_AVRC_CMD_STOP,   /* stop playback */
+    BT_AVRC_CMD_NEXT,   /* next track */
+    BT_AVRC_CMD_PREV,   /* previous track */
+} bt_avrc_cmd_t;
+
+/* Invoked when a remote media key is pressed (PLAY/PAUSE/STOP/NEXT/PREV). */
+typedef void (*bt_avrc_cmd_cb_t)(bt_avrc_cmd_t cmd);
+
+/* Invoked with the absolute volume sent by the remote, 0..127 (AVRCP full
+ * scale). Map it to a 0..100% master volume on the application side. */
+typedef void (*bt_avrc_volume_cb_t)(uint8_t volume_0_127);
+
+/* Register handlers for remote AVRCP commands. Safe to call at any time;
+ * passing NULL disables the corresponding handler. */
+void bt_audio_set_avrc_cmd_cb(bt_avrc_cmd_cb_t cb);
+void bt_audio_set_avrc_volume_cb(bt_avrc_volume_cb_t cb);

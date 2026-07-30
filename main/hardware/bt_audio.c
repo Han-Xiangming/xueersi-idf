@@ -22,6 +22,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/ringbuf.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "bt_audio";
@@ -32,12 +33,19 @@ static volatile bool s_streaming;    /* media channel started */
 static volatile bt_pair_state_t s_pair_state;
 static volatile uint32_t s_passkey;  /* SSP numeric-comparison code */
 
+/* AVRCP remote-control handlers registered by the application (see below).
+ * Kept outside the #if so bt_audio_set_avrc_*_cb() compiles even when Bluetooth
+ * is disabled in the build — the handlers are simply never invoked then. */
+static bt_avrc_cmd_cb_t s_avrc_cmd_cb;
+static bt_avrc_volume_cb_t s_avrc_vol_cb;
+
 #if defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_A2DP_ENABLE)
 
 #include "esp_bt.h"
 #include "esp_bt_main.h"
 #include "esp_gap_bt_api.h"
 #include "esp_a2dp_api.h"
+#include "esp_avrc_api.h"
 
 /* PCM ring between the decode task (producer) and the A2DP data callback
  * (consumer). With the Bluetooth route the I2S ring is bypassed, so this is
@@ -52,6 +60,11 @@ static volatile uint32_t s_passkey;  /* SSP numeric-comparison code */
 
 static bool s_initialized;
 static volatile bool s_discovering;
+/* Set while a teardown is pending across an in-flight link; the actual
+ * esp_a2d_source_deinit() runs from the disconnect-complete event, never
+ * inline, so the still-armed media watchdog alarm cannot fire into freed
+ * control blocks (would crash the BTC task). */
+static volatile bool s_disabling;
 static RingbufHandle_t s_pcm_ring;
 static uint8_t *s_ring_storage;
 static StaticRingbuffer_t s_ring_struct;
@@ -199,6 +212,12 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
     }
 }
 
+/* Forward declaration. The real teardown runs in the FreeRTOS Timer task
+ * (deferred from the BTC callback) so the esp_*_deinit() calls never execute
+ * inside the BTC task itself — doing that there would deadlock. The Timer-task
+ * context also lets Bluedroid finish disarming the media watchdog alarm first. */
+static void bt_audio_teardown(void *param1, uint32_t param2);
+
 static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
 {
     switch (event) {
@@ -206,6 +225,13 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
             s_connected = true;
             s_pair_state = BT_PAIR_OK;
+            if (s_disabling) {
+                /* bt_audio_disable() raced with the connect completing:
+                 * drop the fresh link so the disconnect-complete event can
+                 * run the deferred teardown. */
+                esp_a2d_source_disconnect(s_peer_bda);
+                break;
+            }
             ESP_LOGI(TAG, "A2DP connected, checking media readiness");
             esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
         }
@@ -220,6 +246,14 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             s_connected = false;
             s_streaming = false;
             ESP_LOGI(TAG, "A2DP disconnected");
+            if (s_disabling) {
+                /* The link is gone and Bluedroid has disarmed the media
+                 * watchdog alarm. Defer the actual deinit to the Timer task:
+                 * running esp_*_deinit() from inside this BTC callback would
+                 * post to the BTC queue and deadlock. */
+                xTimerPendFunctionCall(bt_audio_teardown,
+                                       NULL, 0, pdMS_TO_TICKS(10));
+            }
         }
         break;
     case ESP_A2D_AUDIO_STATE_EVT: {
@@ -241,6 +275,55 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         if (param->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY &&
             param->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
             esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+/* AVRCP Target callback: a connected CT (headset/speaker media keys) sends
+ * passthrough commands and absolute volume here. Bluedroid auto-ACKs those, so
+ * we only act on them. Only the PRESSED key-state is interesting (RELEASED is
+ * the auto-repeat tail and is ignored). */
+static void avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param)
+{
+    switch (event) {
+    case ESP_AVRC_TG_CONNECTION_STATE_EVT:
+        ESP_LOGI(TAG, "AVRCP %sconnected",
+                 param->conn_stat.connected ? "" : "dis");
+        break;
+    case ESP_AVRC_TG_PASSTHROUGH_CMD_EVT:
+        if (param->psth_cmd.key_state != ESP_AVRC_PT_CMD_STATE_PRESSED) {
+            break;                              /* ignore key-release events */
+        }
+        if (s_avrc_cmd_cb != NULL) {
+            switch ((esp_avrc_pt_cmd_t)param->psth_cmd.key_code) {
+            case ESP_AVRC_PT_CMD_PLAY:
+                s_avrc_cmd_cb(BT_AVRC_CMD_PLAY);
+                break;
+            case ESP_AVRC_PT_CMD_PAUSE:
+                s_avrc_cmd_cb(BT_AVRC_CMD_PAUSE);
+                break;
+            case ESP_AVRC_PT_CMD_STOP:
+                s_avrc_cmd_cb(BT_AVRC_CMD_STOP);
+                break;
+            case ESP_AVRC_PT_CMD_FORWARD:
+            case ESP_AVRC_PT_CMD_FAST_FORWARD:
+                s_avrc_cmd_cb(BT_AVRC_CMD_NEXT);
+                break;
+            case ESP_AVRC_PT_CMD_BACKWARD:
+            case ESP_AVRC_PT_CMD_REWIND:
+                s_avrc_cmd_cb(BT_AVRC_CMD_PREV);
+                break;
+            default:
+                break;
+            }
+        }
+        break;
+    case ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT:
+        if (s_avrc_vol_cb != NULL) {
+            s_avrc_vol_cb(param->set_abs_vol.volume);   /* 0..127 */
         }
         break;
     default:
@@ -312,8 +395,13 @@ void bt_audio_init(void)
 void bt_audio_enable(void)
 {
     if (s_initialized) {
+        /* Already up. Clear any teardown that bt_audio_disable() deferred
+         * while a link was dropping: the user flipped BT back ON before the
+         * deferred teardown ran, so we keep the stack and just drop the link. */
+        s_disabling = false;
         return;
     }
+    s_disabling = false;
 
     esp_err_t err;
 
@@ -347,12 +435,82 @@ void bt_audio_enable(void)
     /* Source dials out; stay non-discoverable but connectable. */
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
 
+    /* Register the AVRCP Target role so a paired headset/speaker can drive
+     * local playback and volume with its media keys. */
+    esp_avrc_tg_register_callback(avrc_tg_cb);
+    esp_avrc_tg_init();
+
     esp_a2d_register_callback(a2d_cb);
     esp_a2d_source_register_data_callback(a2d_data_cb);
     esp_a2d_source_init();
 
     s_initialized = true;
     ESP_LOGI(TAG, "A2DP source ready ('Xiaomao MP3')");
+}
+
+/* Perform the actual stack teardown and controller power-off. Runs in the
+ * FreeRTOS Timer task (see a2d_cb). MUST only be entered when no A2DP link is
+ * live: while streaming, Bluedroid arms a media watchdog alarm, and deinit()-ing
+ * the source profile before that alarm fires (or is disarmed) makes it run into
+ * freed control blocks — a NULL-deref crash in the BTC task. Re-checks
+ * s_disabling so a concurrent bt_audio_enable() can cancel a pending teardown
+ * (the user flipped BT back ON before it ran). */
+static void bt_audio_teardown(void *param1, uint32_t param2)
+{
+    (void)param1;
+    (void)param2;
+    if (!s_disabling) {
+        return;                             /* re-enabled: keep the stack up */
+    }
+    esp_a2d_source_deinit();
+    esp_avrc_tg_deinit();
+    esp_bluedroid_disable();
+    esp_bluedroid_deinit();
+    esp_bt_controller_disable();
+    esp_bt_controller_deinit();
+
+    /* Reset all state so the next bt_audio_enable() starts from scratch. */
+    s_initialized = false;
+    s_connected   = false;
+    s_streaming   = false;
+    s_enabled     = false;
+    s_discovering = false;
+    s_dev_count   = 0;
+    s_pair_state  = BT_PAIR_IDLE;
+    s_disabling   = false;
+    s_peer_name[0] = '\0';
+
+    ESP_LOGI(TAG, "BT audio disabled, controller powered off");
+}
+
+/* Tear the stack down and power off the controller — the reverse of
+ * bt_audio_enable(). Idempotent: returns immediately if already down or a
+ * teardown is already pending. The real work is deferred to the disconnect
+ * event when a link is live (see bt_audio_teardown for why). */
+void bt_audio_disable(void)
+{
+    if (!s_initialized || s_disabling) {
+        return;
+    }
+
+    if (s_connected || s_pair_state == BT_PAIR_CONNECTING) {
+        /* A live (or in-flight) link: stop the media stream and kick a
+         * disconnect, then return. The disconnect-complete event will call
+         * bt_audio_teardown() once Bluedroid has disarmed its watchdog alarm.
+         * Doing it inline here is what crashes. */
+        s_disabling = true;
+        if (s_streaming) {
+            esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_STOP);
+        }
+        esp_a2d_source_disconnect(s_peer_bda);
+        ESP_LOGI(TAG, "BT disable pending disconnect");
+        return;
+    }
+
+    /* No active link: the alarm is not armed, so teardown inline (UI task
+     * context, safe) is fine. Set s_disabling first so the re-check passes. */
+    s_disabling = true;
+    bt_audio_teardown(NULL, 0);
 }
 
 bool bt_audio_is_initialized(void)
@@ -528,6 +686,11 @@ void bt_audio_enable(void)
     /* No Bluetooth in this build: nothing to bring up. */
 }
 
+void bt_audio_disable(void)
+{
+    /* No Bluetooth in this build: nothing to tear down. */
+}
+
 bool bt_audio_is_initialized(void)
 {
     return false;
@@ -585,6 +748,19 @@ const char *bt_audio_peer_name(void)
 }
 
 #endif /* CONFIG_BT_ENABLED && CONFIG_BT_A2DP_ENABLE */
+
+/* AVRCP handler registration. Lives outside the #if because it only stores the
+ * callback pointers (defined above); the callbacks fire only when Bluetooth is
+ * actually up, so no stub is needed for the no-BT build. */
+void bt_audio_set_avrc_cmd_cb(bt_avrc_cmd_cb_t cb)
+{
+    s_avrc_cmd_cb = cb;
+}
+
+void bt_audio_set_avrc_volume_cb(bt_avrc_volume_cb_t cb)
+{
+    s_avrc_vol_cb = cb;
+}
 
 bt_pair_state_t bt_audio_pair_state(void)
 {
