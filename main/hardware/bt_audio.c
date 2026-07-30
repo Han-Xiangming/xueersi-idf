@@ -286,6 +286,35 @@ static int32_t a2d_data_cb(uint8_t *buf, int32_t len)
 
 void bt_audio_init(void)
 {
+    /* At boot we only allocate the PCM ring (cheap, no BT controller needed).
+     * The Bluetooth controller / Bluedroid stack / A2DP source are brought up
+     * lazily by bt_audio_enable() the first time the user opens the BLUETOOTH
+     * page, so the device stays silent at boot instead of advertising an A2DP
+     * source before anyone asks for Bluetooth. */
+    s_ring_storage = heap_caps_malloc(BT_PCM_RING_BYTES, MALLOC_CAP_SPIRAM);
+    if (s_ring_storage == NULL) {
+        s_ring_storage = malloc(BT_PCM_RING_BYTES);
+    }
+    if (s_ring_storage != NULL) {
+        s_pcm_ring = xRingbufferCreateStatic(BT_PCM_RING_BYTES,
+                                             RINGBUF_TYPE_BYTEBUF,
+                                             s_ring_storage, &s_ring_struct);
+    }
+    if (s_pcm_ring == NULL) {
+        ESP_LOGE(TAG, "BT PCM ring alloc failed");
+    }
+    ESP_LOGI(TAG, "BT audio ring ready (stack deferred until BLUETOOTH page)");
+}
+
+/* Bring up the Bluetooth controller, Bluedroid stack and A2DP Source role.
+ * Safe to call repeatedly (idempotent); the first call does the real work.
+ * Call when the user opens the BLUETOOTH page, not at boot. */
+void bt_audio_enable(void)
+{
+    if (s_initialized) {
+        return;
+    }
+
     esp_err_t err;
 
     /* Only BR/EDR (classic BT) is needed for A2DP; release BLE memory. */
@@ -322,20 +351,13 @@ void bt_audio_init(void)
     esp_a2d_source_register_data_callback(a2d_data_cb);
     esp_a2d_source_init();
 
-    s_ring_storage = heap_caps_malloc(BT_PCM_RING_BYTES, MALLOC_CAP_SPIRAM);
-    if (s_ring_storage == NULL) {
-        s_ring_storage = malloc(BT_PCM_RING_BYTES);
-    }
-    if (s_ring_storage != NULL) {
-        s_pcm_ring = xRingbufferCreateStatic(BT_PCM_RING_BYTES,
-                                             RINGBUF_TYPE_BYTEBUF,
-                                             s_ring_storage, &s_ring_struct);
-    }
-    if (s_pcm_ring == NULL) {
-        ESP_LOGE(TAG, "BT PCM ring alloc failed");
-    }
     s_initialized = true;
     ESP_LOGI(TAG, "A2DP source ready ('Xiaomao MP3')");
+}
+
+bool bt_audio_is_initialized(void)
+{
+    return s_initialized;
 }
 
 void bt_audio_set_enabled(bool enabled)
@@ -499,6 +521,16 @@ void bt_audio_write_pcm(const int16_t *stereo_frames, size_t frames)
 void bt_audio_init(void)
 {
     ESP_LOGW(TAG, "Bluetooth/A2DP not enabled in build (see sdkconfig)");
+}
+
+void bt_audio_enable(void)
+{
+    /* No Bluetooth in this build: nothing to bring up. */
+}
+
+bool bt_audio_is_initialized(void)
+{
+    return false;
 }
 
 void bt_audio_set_enabled(bool enabled)

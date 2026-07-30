@@ -12,6 +12,7 @@
 
 #include "board_config.h"
 #include "esp_log.h"
+#include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "hardware/buttons.h"
@@ -65,6 +66,17 @@ static void lvgl_task(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "Xiaomiao LVGL 9.5 dashboard boot");
+
+    /* NVS must be up before any Wi-Fi/BT controller init (those trigger
+     * phy_init, which loads RF calibration data from NVS). Handle the
+     * "flash needs re-format" cases by erasing and re-initialising. */
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_err);
 
     hw_buttons_init();
     hw_lcd_init();

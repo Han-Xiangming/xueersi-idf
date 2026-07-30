@@ -546,6 +546,11 @@ static void ui_enter_page(ui_page_t page)
         s_ui.page = NULL;
     }
     s_ui.page_id = page;
+    /* Bring the Bluetooth stack up only when the user actually opens the
+     * BLUETOOTH page (it is deferred from boot). Idempotent. */
+    if (page == UI_PAGE_BT) {
+        bt_audio_enable();
+    }
     s_ui.page = ui_make_page(0);
     s_ui.title = NULL;
     s_ui.value = NULL;
