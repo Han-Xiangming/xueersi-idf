@@ -2,7 +2,7 @@
  * Application layer: MP3 file player.
  * See app/player.h.
  */
-#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG   /* compile in detailed decode tracing */
+#define LOG_LOCAL_LEVEL ESP_LOG_INFO    /* keep per-50-frame decode tracing out unless explicitly set to DEBUG at runtime */
 #include "player.h"
 #include "hardware/audio.h"
 
