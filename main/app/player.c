@@ -14,6 +14,7 @@
 #include "mp3dec.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 
 /* Read buffer for MP3 stream data. */
@@ -54,10 +55,13 @@ typedef struct {
     size_t pos;
 } track_src_t;
 
-/* Decoder working buffers (owned by the decode loop). */
+/* Decoder working buffers (owned by the decode loop).
+ * s_readbuf lives in PSRAM (EXT_RAM_BSS_ATTR) to free ~4 KB of internal
+ * DRAM — the SD-card read path is not real-time critical, so PSRAM latency
+ * is harmless here. */
 static track_src_t s_src;
 static HMP3Decoder s_dec;
-static unsigned char s_readbuf[MP3_READ_CHUNK];
+static EXT_RAM_BSS_ATTR unsigned char s_readbuf[MP3_READ_CHUNK];
 static int s_bytes_left;
 static int s_consumed;
 static int16_t s_pcm[MP3_PCM_MAX];
