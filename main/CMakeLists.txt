@@ -2,7 +2,6 @@ idf_component_register(SRCS "main.c"
                              "hardware/lcd.c"
                              "hardware/audio.c"
                              "hardware/bt_audio.c"
-                             "hardware/wifi_prov.c"
                              "hardware/sd.c"
                              "hardware/buttons.c"
                              "app/ui.c"
@@ -24,11 +23,6 @@ idf_component_register(SRCS "main.c"
                                      lvgl
                                      bt
                                      esp-libhelix-mp3
-                                     esp_wifi
-                                     esp_event
-                                     esp_netif
-                                     nvs_flash
-                                     esp_http_server
                        EMBED_FILES "tracks/Test.mp3"
                        )
 

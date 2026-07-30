@@ -20,7 +20,6 @@
 #include "hardware/bt_audio.h"
 #include "hardware/lcd.h"
 #include "hardware/sd.h"
-#include "hardware/wifi_prov.h"
 #include "lvgl.h"
 #include "app/ui.h"
 #include "app/player.h"
@@ -76,13 +75,6 @@ static void lvgl_task(void *arg)
     }
     hw_lcd_display_on();
 
-    /* LCD is fully up. Defer Wi-Fi bring-up until now: the first full-screen
-     * SPI flush allocates a ~40 KB internal-DRAM priv TX buffer, and we must
-     * not let esp_wifi_start()'s ~54 KB of dynamic RX/TX buffers race it for
-     * that last chunk of internal DRAM (the priv buffer is then cached and
-     * reused for all later flushes). */
-    wifi_prov_start();
-
     while (true) {
         if (lv_tick_elaps(last_update_ms) >= UI_REFRESH_PERIOD_MS) {
             last_update_ms = lv_tick_get();
@@ -114,7 +106,6 @@ void app_main(void)
     hw_buttons_init();
     hw_lcd_init();
     hw_audio_init();
-    wifi_prov_init();   /* Wi-Fi + NVS before BT (controller coex) */
     bt_audio_init();
     bt_audio_set_avrc_cmd_cb(xiaomiao_avrc_cmd);
     bt_audio_set_avrc_volume_cb(xiaomiao_avrc_volume);

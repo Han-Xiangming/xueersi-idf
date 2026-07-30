@@ -162,15 +162,6 @@ static bool lcd_flush_ready_cb(esp_lcd_panel_io_handle_t panel_io,
     return false;
 }
 
-/* The LVGL draw buffers live in PSRAM, so esp_lcd_panel_io_tx_color() must
- * copy each transfer into an internal-DRAM "priv TX buffer" for DMA. Sending
- * the whole screen in one shot needs a ~40 KB contiguous internal-DRAM buffer
- * that is scarce on this 4 MB part (and competes with Wi-Fi/BT heap). Instead
- * we stream the area in horizontal strips: each transaction is at most
- * LCD_FLUSH_STRIP_ROWS * width * 2 bytes, so the priv buffer stays small and
- * always allocatable. CASET/RASET re-window the panel per strip. */
-#define LCD_FLUSH_STRIP_ROWS   16
-
 static void lvgl_flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t *px_map)
 {
     esp_lcd_panel_io_handle_t io_handle = lv_display_get_user_data(display);
@@ -178,28 +169,20 @@ static void lvgl_flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t 
     const int height = area->y2 - area->y1 + 1;
     const uint16_t x_start = area->x1 + LCD_X_GAP;
     const uint16_t x_end = area->x2 + LCD_X_GAP;
+    const uint16_t y_start = area->y1 + LCD_Y_GAP;
+    const uint16_t y_end = area->y2 + LCD_Y_GAP;
     const uint8_t caset[] = {
         x_start >> 8, x_start & 0xFF,
         x_end >> 8, x_end & 0xFF,
     };
+    const uint8_t raset[] = {
+        y_start >> 8, y_start & 0xFF,
+        y_end >> 8, y_end & 0xFF,
+    };
 
-    const int bytes_per_row = width * (int)sizeof(uint16_t);
-    int yoff = 0;
-    while (yoff < height) {
-        const int rows = MIN(LCD_FLUSH_STRIP_ROWS, height - yoff);
-        const uint16_t y_start = area->y1 + yoff + LCD_Y_GAP;
-        const uint16_t y_end = area->y1 + (yoff + rows - 1) + LCD_Y_GAP;
-        const uint8_t raset[] = {
-            y_start >> 8, y_start & 0xFF,
-            y_end >> 8, y_end & 0xFF,
-        };
-        ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, ST7735_CASET, caset, sizeof(caset)));
-        ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, ST7735_RASET, raset, sizeof(raset)));
-        const uint8_t *strip_px = px_map + (size_t)yoff * bytes_per_row;
-        ESP_ERROR_CHECK(esp_lcd_panel_io_tx_color(io_handle, ST7735_RAMWR, strip_px,
-                                                   rows * bytes_per_row));
-        yoff += rows;
-    }
+    ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, ST7735_CASET, caset, sizeof(caset)));
+    ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, ST7735_RASET, raset, sizeof(raset)));
+    ESP_ERROR_CHECK(esp_lcd_panel_io_tx_color(io_handle, ST7735_RAMWR, px_map, width * height * sizeof(uint16_t)));
 }
 
 void hw_lcd_init(void)
