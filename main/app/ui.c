@@ -23,6 +23,8 @@
 #include "freertos/FreeRTOS.h"
 #include "lvgl.h"
 #include "sdkconfig.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 /* Embedded CJK bitmap font (main/fonts/lv_font_cn_10.c): ~570 KB, covers
  * ASCII + ~22000 Chinese ideographs + Japanese kana/kanji + CJK symbols.
@@ -98,6 +100,9 @@ extern const lv_font_t lv_font_cn_10;
 #endif
 
 #define UI_ACTION_MSG_MS            850
+/* Delay before persisting a changed setting to NVS, so a burst of key
+ * repeats collapses into a single write. */
+#define UI_SETTINGS_SAVE_DELAY_MS   800
 
 static const char *const s_page_names[UI_PAGE_COUNT] = {
     "MP3",
@@ -137,6 +142,84 @@ static void ui_apply_log_level(void)
     esp_log_level_set("hw_audio", lvl);
     esp_log_level_set("bt_audio", lvl);
 }
+
+/* Settings persistence: volume and log level survive reboot via NVS.
+ * NVS is initialised in app_main() before ui_create(), so these helpers
+ * can open the handle at any time. */
+#define UI_NVS_NS      "ui_cfg"
+#define UI_NVS_VOLUME  "volume"
+#define UI_NVS_LOGDBG  "log_dbg"
+
+static void ui_settings_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+    int32_t v = -1;
+    if (nvs_get_i32(h, UI_NVS_VOLUME, &v) == ESP_OK && v >= 0 && v <= 100) {
+        hw_audio_set_volume((uint8_t)v);
+    }
+    int32_t dbg = 0;
+    if (nvs_get_i32(h, UI_NVS_LOGDBG, &dbg) == ESP_OK) {
+        s_log_debug = (dbg != 0);
+        ui_apply_log_level();
+    }
+    nvs_close(h);
+}
+
+static void ui_settings_save_volume(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, UI_NVS_VOLUME, (int32_t)hw_audio_get_volume());
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static void ui_settings_save_log(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, UI_NVS_LOGDBG, s_log_debug ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+/* Debounced persistence: a setting change only marks a dirty bit and arms a
+ * timer; ui_settings_flush() (called every refresh) commits once the user
+ * stops tweaking, folding long-press repeats into a single NVS write. */
+#define SETTINGS_DIRTY_VOLUME   (1u << 0)
+#define SETTINGS_DIRTY_LOG      (1u << 1)
+
+static uint32_t s_save_pending;
+static uint32_t s_save_at_ms;
+
+static void ui_settings_mark_dirty(uint32_t which)
+{
+    s_save_pending |= which;
+    s_save_at_ms = lv_tick_get() + UI_SETTINGS_SAVE_DELAY_MS;
+}
+
+static void ui_settings_flush(void)
+{
+    if (s_save_pending == 0) {
+        return;
+    }
+    if ((int32_t)(s_save_at_ms - lv_tick_get()) > 0) {
+        return;
+    }
+    if (s_save_pending & SETTINGS_DIRTY_VOLUME) {
+        ui_settings_save_volume();
+    }
+    if (s_save_pending & SETTINGS_DIRTY_LOG) {
+        ui_settings_save_log();
+    }
+    s_save_pending = 0;
+}
+
 static int s_setting_sel = 0;
 
 #define MP3_LIST_ROWS 4
@@ -180,6 +263,7 @@ typedef struct {
 
     lv_obj_t *set_cursor[SETTING_COUNT];
     lv_obj_t *set_text[SETTING_COUNT];
+    lv_obj_t *set_value[SETTING_COUNT];
 
     lv_obj_t *pl_cursor[MP3_LIST_ROWS];
     lv_obj_t *pl_text[MP3_LIST_ROWS];
@@ -318,6 +402,7 @@ static void ui_set_hint(const char *normal)
 static void ui_build_settings(lv_obj_t *page)
 {
     s_setting_sel = 0;
+    static const char *const labels[SETTING_COUNT] = {"音量", "蓝牙", "日志等级"};
 
     for (int i = 0; i < SETTING_COUNT; i++) {
         lv_obj_t *cur = lv_label_create(page);
@@ -327,12 +412,22 @@ static void ui_build_settings(lv_obj_t *page)
         lv_obj_set_style_text_color(cur, lv_color_hex(UI_GRAY), 0);
         s_ui.set_cursor[i] = cur;
 
+        /* Fixed left-aligned label; the live value lives in its own column
+         * (set_value) so items with different label lengths still line up
+         * regardless of the (non-monospaced) byte width of the UTF-8 text. */
         lv_obj_t *txt = lv_label_create(page);
-        lv_label_set_long_mode(txt, LV_LABEL_LONG_MODE_CLIP);
+        lv_label_set_text(txt, labels[i]);
         lv_obj_set_pos(txt, 18, s_setting_y[i]);
         lv_obj_set_style_text_font(txt, &lv_font_cn_10, 0);
         lv_obj_set_style_text_color(txt, lv_color_hex(UI_GRAY), 0);
         s_ui.set_text[i] = txt;
+
+        lv_obj_t *val = lv_label_create(page);
+        lv_label_set_long_mode(val, LV_LABEL_LONG_MODE_CLIP);
+        lv_obj_set_pos(val, 95, s_setting_y[i]);
+        lv_obj_set_style_text_font(val, &lv_font_cn_10, 0);
+        lv_obj_set_style_text_color(val, lv_color_hex(UI_GRAY), 0);
+        s_ui.set_value[i] = val;
     }
 
     s_ui.hint = ui_label(page, "上/下选 A进入 左/右设 B返回", 110,
@@ -565,6 +660,7 @@ static void ui_enter_page(ui_page_t page)
 
 void ui_refresh(void)
 {
+    ui_settings_flush();
     if (s_in_menu) {
         return;
     }
@@ -600,7 +696,6 @@ void ui_refresh(void)
         ui_set_bar(hw_sd_is_mounted() ? 100 : 0);
         break;
     case UI_PAGE_SETTINGS: {
-        static const char *const names[SETTING_COUNT] = {"音量", "蓝牙", "日志等级"};
         char buf[24];
         for (int i = 0; i < SETTING_COUNT; i++) {
             const int sel = (i == s_setting_sel);
@@ -608,26 +703,26 @@ void ui_refresh(void)
             lv_obj_set_style_text_color(s_ui.set_cursor[i], lv_color_hex(UI_CYAN), 0);
             lv_obj_set_style_text_color(s_ui.set_text[i],
                                         lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
+            lv_obj_set_style_text_color(s_ui.set_value[i],
+                                        lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
             switch (i) {
             case SETTING_VOLUME:
-                snprintf(buf, sizeof(buf), "%-8s %u%%",
-                         names[i], (unsigned)hw_audio_get_volume());
+                snprintf(buf, sizeof(buf), "%u%%", (unsigned)hw_audio_get_volume());
                 break;
             case SETTING_BTOUT:
-                /* Replaced the on/off toggle: this item opens the Bluetooth
-                 * screen. Show whether a sink is currently linked. */
-                snprintf(buf, sizeof(buf), "%-8s %s", names[i],
+                /* This item opens the Bluetooth screen; show whether a sink
+                 * is currently linked. */
+                snprintf(buf, sizeof(buf), "%s",
                          bt_audio_is_connected() ? "已连接" : "进入");
                 break;
             case SETTING_LOG:
-                snprintf(buf, sizeof(buf), "%-8s %s", names[i],
-                         s_log_debug ? "Debug" : "Normal");
+                snprintf(buf, sizeof(buf), "%s", s_log_debug ? "Debug" : "Normal");
                 break;
             default:
                 buf[0] = '\0';
                 break;
             }
-            lv_label_set_text(s_ui.set_text[i], buf);
+            lv_label_set_text(s_ui.set_value[i], buf);
         }
         ui_set_hint("上/下选 A进入 左/右设 B返回");
         break;
@@ -812,6 +907,7 @@ static void ui_adjust(int step)
             /* While a track plays, up/down adjusts the output volume
              * (1% steps below 10%, else 5%). */
             ui_volume_step(step, 5);
+            ui_settings_mark_dirty(SETTINGS_DIRTY_VOLUME);
             char buf[24];
             snprintf(buf, sizeof(buf), "音量 %u%%",
                      (unsigned)hw_audio_get_volume());
@@ -846,6 +942,7 @@ static void ui_adjust_lr(int dir)
     case SETTING_VOLUME: {
         /* 1% steps below 10% for fine control, else 10%. */
         ui_volume_step(dir, 10);
+        ui_settings_mark_dirty(SETTINGS_DIRTY_VOLUME);
         char buf[24];
         snprintf(buf, sizeof(buf), "VOL %u%%", (unsigned)hw_audio_get_volume());
         set_action(buf);
@@ -854,6 +951,7 @@ static void ui_adjust_lr(int dir)
     case SETTING_LOG:
         s_log_debug = (dir > 0);
         ui_apply_log_level();
+        ui_settings_mark_dirty(SETTINGS_DIRTY_LOG);
         set_action(s_log_debug ? "Debug" : "Normal");
         break;
     default:
@@ -888,6 +986,7 @@ static void ui_key_event_cb(lv_event_t *e)
 
     /* Inside a detail page. */
     if (key == LV_KEY_ESC) {
+        ui_settings_flush();   /* commit any pending change before leaving */
         if (s_ui.page_id == UI_PAGE_PLAYER) {
             player_stop();
         }
@@ -924,6 +1023,9 @@ static void ui_key_event_cb(lv_event_t *e)
 
 void ui_create(lv_group_t *group)
 {
+    /* Restore persisted settings (volume / log level) from NVS. */
+    ui_settings_load();
+
     s_ui.group = group;
     s_ui.page_id = UI_PAGE_PLAYER;
     s_in_menu = true;
