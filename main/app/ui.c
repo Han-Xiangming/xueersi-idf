@@ -36,76 +36,13 @@ extern const lv_font_t lv_font_cn_10;
  * need to mix multiple faces. */
 #define UI_FONT (&lv_font_cn_10)
 
-/* Build-info macros (read from sdkconfig). */
-#ifndef CONFIG_IDF_TARGET
-#define CONFIG_IDF_TARGET "esp32"
-#endif
-#ifndef CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ
-#define CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ 240
-#endif
-#ifndef CONFIG_ESPTOOLPY_FLASHFREQ
-#define CONFIG_ESPTOOLPY_FLASHFREQ "unknown"
-#endif
-#ifndef CONFIG_ESPTOOLPY_FLASHSIZE
-#define CONFIG_ESPTOOLPY_FLASHSIZE "unknown"
-#endif
-#ifndef CONFIG_ESPTOOLPY_FLASHMODE
-#define CONFIG_ESPTOOLPY_FLASHMODE "unknown"
-#endif
-
-#if CONFIG_ESPTOOLPY_FLASHMODE_QIO
-#define UI_FLASH_MODE "QIO"
-#elif CONFIG_ESPTOOLPY_FLASHMODE_QOUT
-#define UI_FLASH_MODE "QOUT"
-#elif CONFIG_ESPTOOLPY_FLASHMODE_DIO
-#define UI_FLASH_MODE "DIO"
-#elif CONFIG_ESPTOOLPY_FLASHMODE_DOUT
-#define UI_FLASH_MODE "DOUT"
-#else
-#define UI_FLASH_MODE CONFIG_ESPTOOLPY_FLASHMODE
-#endif
-
-#if CONFIG_ESPTOOLPY_FLASHFREQ_80M
-#define UI_FLASH_FREQ "80 MHz"
-#elif CONFIG_ESPTOOLPY_FLASHFREQ_40M
-#define UI_FLASH_FREQ "40 MHz"
-#elif CONFIG_ESPTOOLPY_FLASHFREQ_26M
-#define UI_FLASH_FREQ "26 MHz"
-#elif CONFIG_ESPTOOLPY_FLASHFREQ_20M
-#define UI_FLASH_FREQ "20 MHz"
-#else
-#define UI_FLASH_FREQ CONFIG_ESPTOOLPY_FLASHFREQ
-#endif
-
-#if CONFIG_ESPTOOLPY_FLASHSIZE_4MB
-#define UI_FLASH_SIZE "4 MB"
-#elif CONFIG_ESPTOOLPY_FLASHSIZE_2MB
-#define UI_FLASH_SIZE "2 MB"
-#elif CONFIG_ESPTOOLPY_FLASHSIZE_8MB
-#define UI_FLASH_SIZE "8 MB"
-#elif CONFIG_ESPTOOLPY_FLASHSIZE_16MB
-#define UI_FLASH_SIZE "16 MB"
-#else
-#define UI_FLASH_SIZE CONFIG_ESPTOOLPY_FLASHSIZE
-#endif
-
-#if CONFIG_IDF_TARGET_ESP32
-#define UI_TARGET_NAME "ESP32"
-#else
-#define UI_TARGET_NAME CONFIG_IDF_TARGET
-#endif
-
-#ifndef CONFIG_SPIRAM_SPEED
-#define CONFIG_SPIRAM_SPEED 0
-#endif
-
 #define UI_ACTION_MSG_MS            850
 /* Delay before persisting a changed setting to NVS, so a burst of key
  * repeats collapses into a single write. */
 #define UI_SETTINGS_SAVE_DELAY_MS   800
 
 static const char *const s_page_names[UI_PAGE_COUNT] = {
-    "MP3",
+    "MP3 Player",
     "SD卡",
     "蓝牙",
     "设置",
@@ -253,6 +190,12 @@ static const int s_pl_row_y[MP3_LIST_ROWS] = {22, 40, 58, 76};
 #define BT_LIST_ROWS 4
 static const int s_bt_row_y[BT_LIST_ROWS] = {22, 40, 58, 76};
 static int s_bt_sel;
+/* Snapshot of the BT device list so the UI does not re-format device names
+ * (incl. the MAC-address fallback) on every 16 ms tick. Refreshed only when
+ * bt_audio_device_version() advances. */
+static uint32_t s_bt_list_ver;
+static int      s_bt_list_cnt;
+static char     s_bt_list_name[BT_MAX_DEVICES][BT_DEV_NAME_LEN];
 /* 4 KB of song names is UI-only data: keep it in external PSRAM so it does
  * not compete with the Bluetooth stack for internal DRAM. */
 EXT_RAM_BSS_ATTR static char s_mp3_names[64][MP3_NAME_LEN];
@@ -278,7 +221,6 @@ typedef struct {
     lv_obj_t *bar;
     lv_obj_t *status;
     lv_obj_t *hint;
-    lv_obj_t *accent;
 
     lv_obj_t *menu_page;
     lv_obj_t *menu_cursor[UI_MENU_ROWS];
@@ -319,6 +261,22 @@ static void set_action(const char *msg)
 {
     copy_text(s_action, sizeof(s_action), msg);
     s_action_until_ms = lv_tick_get() + UI_ACTION_MSG_MS;
+}
+
+/* Set a label's text only when it actually differs from what is already
+ * shown. ui_refresh() runs every tick (~60 Hz); without this guard the same
+ * string would be pushed into LVGL (and re-formatted) over and over, churning
+ * the label's text buffer and dirty-rectangle bookkeeping for no reason. */
+static void ui_label_set(lv_obj_t *label, const char *text)
+{
+    if (label == NULL || text == NULL) {
+        return;
+    }
+    const char *cur = lv_label_get_text(label);
+    if (cur != NULL && strcmp(cur, text) == 0) {
+        return;                       /* unchanged — skip the LVGL set */
+    }
+    lv_label_set_text(label, text);
 }
 
 /* Step the master volume by `dir` (+1/-1) with fine control near silence:
@@ -415,11 +373,11 @@ static void ui_set_hint(const char *normal)
         return;
     }
     if (s_action_until_ms && (int32_t)(s_action_until_ms - lv_tick_get()) > 0) {
-        lv_label_set_text(s_ui.hint, s_action);
+        ui_label_set(s_ui.hint, s_action);
     }
     else {
         s_action_until_ms = 0;
-        lv_label_set_text(s_ui.hint, normal);
+        ui_label_set(s_ui.hint, normal);
     }
 }
 
@@ -677,7 +635,6 @@ static void ui_enter_page(ui_page_t page)
     s_ui.bar = NULL;
     s_ui.status = NULL;
     s_ui.hint = NULL;
-    s_ui.accent = NULL;
     ui_build_page_content(s_ui.page);
     ui_refresh();
 }
@@ -708,22 +665,26 @@ void ui_refresh(void)
     }
 
     switch (s_ui.page_id) {
-    case UI_PAGE_SD:
-        lv_label_set_text(s_ui.value, hw_sd_is_mounted() ? "已挂载" : "无卡");
+    case UI_PAGE_SD: {
+        char sub[64];
+        ui_label_set(s_ui.value, hw_sd_is_mounted() ? "已挂载" : "无卡");
         if (hw_sd_is_mounted()) {
-            lv_label_set_text_fmt(s_ui.sub, "%s  %luMB", hw_sd_name(), (unsigned long)hw_sd_mb());
+            snprintf(sub, sizeof(sub), "%s  %luMB",
+                     hw_sd_name(), (unsigned long)hw_sd_mb());
         }
         else {
-            lv_label_set_text_fmt(s_ui.sub, "GPIO22 CS  %s", short_err(hw_sd_last_err()));
+            snprintf(sub, sizeof(sub), "GPIO22 CS  %s", short_err(hw_sd_last_err()));
         }
+        ui_label_set(s_ui.sub, sub);
         ui_set_hint(hw_sd_is_mounted() ? "B返回" : "A重扫 B返回");
         ui_set_bar(hw_sd_is_mounted() ? 100 : 0);
         break;
+    }
     case UI_PAGE_SETTINGS: {
         char buf[24];
         for (int i = 0; i < SETTING_COUNT; i++) {
             const int sel = (i == s_setting_sel);
-            lv_label_set_text(s_ui.set_cursor[i], sel ? ">" : " ");
+            ui_label_set(s_ui.set_cursor[i], sel ? ">" : " ");
             lv_obj_set_style_text_color(s_ui.set_cursor[i], lv_color_hex(UI_CYAN), 0);
             lv_obj_set_style_text_color(s_ui.set_text[i],
                                         lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
@@ -754,7 +715,7 @@ void ui_refresh(void)
                 buf[0] = '\0';
                 break;
             }
-            lv_label_set_text(s_ui.set_value[i], buf);
+            ui_label_set(s_ui.set_value[i], buf);
         }
         ui_set_hint("上/下选 A进入 左/右设 B返回");
         break;
@@ -771,32 +732,32 @@ void ui_refresh(void)
             int idx = top + i;
             const int sel = (idx == s_mp3_sel);
             if (idx < s_mp3_count) {
-                lv_label_set_text(s_ui.pl_cursor[i], sel ? ">" : " ");
-                lv_obj_set_style_text_color(s_ui.pl_cursor[i], lv_color_hex(UI_CYAN), 0);
-                lv_obj_set_style_text_color(s_ui.pl_text[i],
-                                            lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
                 char tmp[20];
                 strncpy(tmp, s_mp3_names[idx], 19);
                 tmp[19] = '\0';
-                lv_label_set_text(s_ui.pl_text[i], tmp);
+                ui_label_set(s_ui.pl_cursor[i], sel ? ">" : " ");
+                lv_obj_set_style_text_color(s_ui.pl_cursor[i], lv_color_hex(UI_CYAN), 0);
+                lv_obj_set_style_text_color(s_ui.pl_text[i],
+                                            lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
+                ui_label_set(s_ui.pl_text[i], tmp);
             }
             else {
-                lv_label_set_text(s_ui.pl_cursor[i], " ");
-                lv_label_set_text(s_ui.pl_text[i], "");
+                ui_label_set(s_ui.pl_cursor[i], " ");
+                ui_label_set(s_ui.pl_text[i], "");
             }
         }
         player_state_t st = player_state();
-        lv_label_set_text(s_ui.status,
-                          st == PLAYER_PLAYING ? ">>" : st == PLAYER_PAUSED ? "||" : "--");
+        ui_label_set(s_ui.status,
+                     st == PLAYER_PLAYING ? ">>" : st == PLAYER_PAUSED ? "||" : "--");
         if (st == PLAYER_IDLE) {
-            lv_label_set_text(s_ui.pl_prog, s_mp3_count ? "空闲" : "无MP3文件");
+            ui_label_set(s_ui.pl_prog, s_mp3_count ? "空闲" : "无MP3文件");
         }
         else {
             /* Now-playing line: just the track name. */
             char prog[28];
             snprintf(prog, sizeof(prog), "%s", player_current_name());
             prog[27] = '\0';
-            lv_label_set_text(s_ui.pl_prog, prog);
+            ui_label_set(s_ui.pl_prog, prog);
         }
         if (st == PLAYER_PLAYING || st == PLAYER_PAUSED) {
             ui_set_hint("上/下音量 A暂停 B停止");
@@ -811,6 +772,22 @@ void ui_refresh(void)
         if (s_bt_sel >= count) {
             s_bt_sel = count > 0 ? count - 1 : 0;
         }
+
+        /* Refresh the cached device list only when bt_audio says it changed
+         * (a device added, or a nameless device's name arrived). This avoids
+         * re-formatting the MAC-address fallback string for every visible row
+         * on every 16 ms tick. */
+        uint32_t ver = bt_audio_device_version();
+        if (ver != s_bt_list_ver) {
+            s_bt_list_ver = ver;
+            s_bt_list_cnt = count;
+            for (int i = 0; i < count && i < BT_MAX_DEVICES; i++) {
+                strncpy(s_bt_list_name[i], bt_audio_device_name(i),
+                        BT_DEV_NAME_LEN - 1);
+                s_bt_list_name[i][BT_DEV_NAME_LEN - 1] = '\0';
+            }
+        }
+
         int top = s_bt_sel - 1;
         if (top < 0) {
             top = 0;
@@ -822,53 +799,64 @@ void ui_refresh(void)
             int idx = top + i;
             const int sel = (idx == s_bt_sel);
             if (idx < count) {
-                lv_label_set_text(s_ui.bt_cursor[i], sel ? ">" : " ");
+                const char *nm = (idx < s_bt_list_cnt && idx < BT_MAX_DEVICES)
+                                 ? s_bt_list_name[idx]
+                                 : bt_audio_device_name(idx);
+                ui_label_set(s_ui.bt_cursor[i], sel ? ">" : " ");
                 lv_obj_set_style_text_color(s_ui.bt_text[i],
                                             lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
-                char tmp[32];
-                const char *nm = bt_audio_device_name(idx);
-                strncpy(tmp, nm, sizeof(tmp) - 1);
-                tmp[sizeof(tmp) - 1] = '\0';
-                lv_label_set_text(s_ui.bt_text[i], tmp);
+                ui_label_set(s_ui.bt_text[i], nm);
             }
             else {
-                lv_label_set_text(s_ui.bt_cursor[i], " ");
-                lv_label_set_text(s_ui.bt_text[i], "");
+                ui_label_set(s_ui.bt_cursor[i], " ");
+                ui_label_set(s_ui.bt_text[i], "");
             }
         }
+
         if (bt_audio_is_connected()) {
             char st[28];
             snprintf(st, sizeof(st), "已连接 %s", bt_audio_peer_name());
             st[27] = '\0';
-            lv_label_set_text(s_ui.bt_status, st);
+            ui_label_set(s_ui.bt_status, st);
             ui_set_hint("A断开 B返回");
         }
         else if (bt_audio_pair_state() == BT_PAIR_PAIRING) {
             /* Show the SSP passkey so the user can verify it on the sink. */
-            lv_label_set_text_fmt(s_ui.bt_status, "配对码 %06u",
-                                  (unsigned)bt_audio_passkey());
+            char st[28];
+            snprintf(st, sizeof(st), "配对码 %06u", (unsigned)bt_audio_passkey());
+            st[27] = '\0';
+            ui_label_set(s_ui.bt_status, st);
             ui_set_hint("配对中... B返回");
         }
         else if (bt_audio_pair_state() == BT_PAIR_CONNECTING) {
             char st[28];
             snprintf(st, sizeof(st), "配对中 %s", bt_audio_peer_name());
             st[27] = '\0';
-            lv_label_set_text(s_ui.bt_status, st);
+            ui_label_set(s_ui.bt_status, st);
             ui_set_hint("连接中... B返回");
         }
         else if (bt_audio_pair_state() == BT_PAIR_FAIL) {
-            lv_label_set_text(s_ui.bt_status, "配对失败");
+            ui_label_set(s_ui.bt_status, "配对失败");
             ui_set_hint("A重试 B返回");
         }
         else if (bt_audio_is_scanning()) {
-            lv_label_set_text_fmt(s_ui.bt_status, "扫描中... %d", count);
+            char st[28];
+            snprintf(st, sizeof(st), "扫描中... %d", count);
+            st[27] = '\0';
+            ui_label_set(s_ui.bt_status, st);
             ui_set_hint("上/下选 A连接 B返回");
         }
         else {
-            lv_label_set_text_fmt(s_ui.bt_status,
-                                  count ? "%d 个设备" : "无设备", count);
-            ui_set_hint(count ? "上/下选 A连接 B返回"
-                              : "A重扫 B返回");
+            if (count) {
+                char st[28];
+                snprintf(st, sizeof(st), "%d 个设备", count);
+                st[27] = '\0';
+                ui_label_set(s_ui.bt_status, st);
+            }
+            else {
+                ui_label_set(s_ui.bt_status, "无设备");
+            }
+            ui_set_hint(count ? "上/下选 A连接 B返回" : "A重扫 B返回");
         }
         break;
     }

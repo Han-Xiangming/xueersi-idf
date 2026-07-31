@@ -14,7 +14,7 @@
  * DMA continuously. This keeps the DMA fed even when a complex MP3 frame
  * takes longer to decode, which previously caused I2S underruns / crackle.
  */
-#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG   /* compile in detailed audio tracing */
+#define LOG_LOCAL_LEVEL ESP_LOG_INFO    /* keep detailed audio tracing out unless explicitly set to DEBUG at compile time */
 #include "board_config.h"
 #include "hardware/audio.h"
 #include "hardware/bt_audio.h"

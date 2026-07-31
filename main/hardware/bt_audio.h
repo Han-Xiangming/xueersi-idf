@@ -20,6 +20,9 @@
 /* Max characters of a device name kept in the scan list (incl. NUL). */
 #define BT_DEV_NAME_LEN 32
 
+/* Max number of discovered sinks kept in the scan list. */
+#define BT_MAX_DEVICES 8
+
 /* Allocate the Bluetooth PCM ring. Cheap and does NOT touch the BT controller;
  * call once at startup (after the local audio driver is ready). The Bluetooth
  * controller / Bluedroid stack / A2DP Source role are brought up later, on
@@ -39,9 +42,6 @@ void bt_audio_enable(void);
  * is reset, so a later bt_audio_enable() starts clean. */
 void bt_audio_disable(void);
 
-/* True once bt_audio_enable() has brought the stack up. */
-bool bt_audio_is_initialized(void);
-
 /* Enable / disable routing of decoded PCM to the Bluetooth sink. */
 void bt_audio_set_enabled(bool enabled);
 bool bt_audio_is_enabled(void);
@@ -57,6 +57,13 @@ bool bt_audio_is_scanning(void);
 
 /* Snapshot of the discovered audio-sink list (grows while scanning). */
 int bt_audio_device_count(void);
+
+/* Monotonic counter bumped whenever the discovered-device list changes
+ * (a device added, or a previously nameless device's name filled in). The
+ * UI reads the list only when this advances, instead of re-formatting the
+ * device names (incl. the MAC-address fallback) on every refresh tick. */
+uint32_t bt_audio_device_version(void);
+
 const char *bt_audio_device_name(int index);
 
 /* Connect to the index-th discovered device (cancels any running scan and

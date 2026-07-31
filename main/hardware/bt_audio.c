@@ -23,6 +23,7 @@
 #include "freertos/ringbuf.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
+#include "esp_timer.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "bt_audio";
@@ -53,7 +54,6 @@ static bt_avrc_volume_cb_t s_avrc_vol_cb;
  * 44.1 kHz stereo 16-bit. Storage lives in PSRAM (no internal DRAM cost). */
 #define BT_PCM_RING_BYTES      (128 * 1024)
 #define BT_INQ_LEN             10          /* inquiry duration, 1.28s units */
-#define BT_MAX_DEVICES         8           /* scan-list capacity */
 
 /* A2DP/SBC always streams at 44.1 kHz; other input rates are resampled. */
 #define BT_STREAM_RATE         44100
@@ -90,6 +90,23 @@ typedef struct {
 
 static bt_dev_t s_devs[BT_MAX_DEVICES];
 static volatile int s_dev_count;
+/* Bumped whenever the discovered-device list changes (a device added, or a
+ * nameless device's name filled in) so consumers can cheaply detect "list
+ * changed" without re-scanning/formatting the list every tick. */
+static uint32_t s_dev_version;
+
+/* Connection auto-retry. A fresh A2DP dial-out can fail the first attempt(s)
+ * because Bluedroid opens the AVDTP L2CAP channel before the peer's feature
+ * mask has been read back (the "remote features unknown" race) — or because we
+ * dial out while the inquiry is still cancelling. Both clear up if we just try
+ * again after a short backoff, so we retry a bounded number of times instead of
+ * making the user hammer the A button. The retry runs from a FreeRTOS timer
+ * (not the BTC task), which is a safe context for esp_a2d_* calls. */
+#define BT_CONNECT_RETRY_MS   (2000)   /* backoff between auto retries */
+#define BT_CONNECT_MAX_RETRY  (4)      /* give up after this many failures */
+static TimerHandle_t s_conn_timer;
+static bool          s_conn_auto;      /* user still wants this link up */
+static uint8_t       s_conn_retries;
 
 /* Extract a human-readable device name from inquiry properties (direct BDNAME
  * or from the EIR blob). Returns false if the peer sent no name. */
@@ -145,6 +162,7 @@ static void bt_handle_disc_res(esp_bt_gap_cb_param_t *param)
         if (memcmp(s_devs[i].bda, param->disc_res.bda, sizeof(esp_bd_addr_t)) == 0) {
             if (s_devs[i].name[0] == '\0') {
                 bt_prop_get_name(param, s_devs[i].name, sizeof(s_devs[i].name));
+                s_dev_version++;          /* list contents changed */
             }
             return;
         }
@@ -159,6 +177,7 @@ static void bt_handle_disc_res(esp_bt_gap_cb_param_t *param)
         d->name[0] = '\0';                  /* UI falls back to the address */
     }
     s_dev_count++;                          /* publish after the slot is ready */
+    s_dev_version++;                        /* list changed: UI must re-read */
     ESP_LOGI(TAG, "sink %d: %02x:%02x:%02x:%02x:%02x:%02x '%s'", s_dev_count,
              d->bda[0], d->bda[1], d->bda[2], d->bda[3], d->bda[4], d->bda[5],
              d->name);
@@ -225,6 +244,8 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
             s_connected = true;
             s_pair_state = BT_PAIR_OK;
+            s_conn_auto = false;             /* link is up: stop auto-retry */
+            s_conn_retries = 0;
             if (s_disabling) {
                 /* bt_audio_disable() raced with the connect completing:
                  * drop the fresh link so the disconnect-complete event can
@@ -236,12 +257,25 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
         }
         else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
-            /* A drop while still CONNECTING means the attempt failed. */
             if (!s_connected && s_pair_state != BT_PAIR_IDLE) {
-                s_pair_state = BT_PAIR_FAIL;
+                /* The attempt never reached CONNECTED, i.e. it failed. If
+                 * auto-retry is armed and we have attempts left, schedule
+                 * another dial-out after the backoff; otherwise surface the
+                 * failure to the UI ("A重试"). */
+                if (s_conn_auto && s_conn_retries < BT_CONNECT_MAX_RETRY
+                    && s_conn_timer != NULL) {
+                    xTimerStart(s_conn_timer, 0);   /* backoff then retry */
+                }
+                else {
+                    s_conn_auto = false;
+                    s_pair_state = BT_PAIR_FAIL;
+                }
             }
             else {
+                /* A live link dropped (user or remote). Don't auto-retry a
+                 * session that was already up — let the user decide. */
                 s_pair_state = BT_PAIR_IDLE;
+                s_conn_auto = false;
             }
             s_connected = false;
             s_streaming = false;
@@ -476,8 +510,14 @@ static void bt_audio_teardown(void *param1, uint32_t param2)
     s_enabled     = false;
     s_discovering = false;
     s_dev_count   = 0;
+    s_dev_version++;                        /* list reset: UI must re-read */
     s_pair_state  = BT_PAIR_IDLE;
     s_disabling   = false;
+    s_conn_auto   = false;
+    s_conn_retries = 0;
+    if (s_conn_timer != NULL) {
+        xTimerStop(s_conn_timer, 0);
+    }
     s_peer_name[0] = '\0';
 
     ESP_LOGI(TAG, "BT audio disabled, controller powered off");
@@ -513,17 +553,19 @@ void bt_audio_disable(void)
     bt_audio_teardown(NULL, 0);
 }
 
-bool bt_audio_is_initialized(void)
-{
-    return s_initialized;
-}
-
 void bt_audio_set_enabled(bool enabled)
 {
     s_enabled = enabled;
-    if (!enabled && s_connected) {
-        esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_STOP);
-        esp_a2d_source_disconnect(s_peer_bda);
+    if (!enabled) {
+        /* BT output turned off: stop any in-flight auto-retry. */
+        s_conn_auto = false;
+        if (s_conn_timer != NULL) {
+            xTimerStop(s_conn_timer, 0);
+        }
+        if (s_connected) {
+            esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_STOP);
+            esp_a2d_source_disconnect(s_peer_bda);
+        }
     }
 }
 
@@ -535,6 +577,7 @@ void bt_audio_scan_start(void)
         return;
     }
     s_dev_count = 0;                        /* fresh list per scan */
+    s_dev_version++;                        /* force the UI to clear its cache */
     esp_err_t err = esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY,
                                                BT_INQ_LEN, 0);
     if (err == ESP_OK) {
@@ -556,6 +599,11 @@ int bt_audio_device_count(void)
     return s_dev_count;
 }
 
+uint32_t bt_audio_device_version(void)
+{
+    return s_dev_version;
+}
+
 const char *bt_audio_device_name(int index)
 {
     static char fallback[18];
@@ -572,17 +620,11 @@ const char *bt_audio_device_name(int index)
     return fallback;
 }
 
-bool bt_audio_connect_index(int index)
+/* (Re)issue the A2DP dial-out to s_peer_bda. Returns false only if the stack
+ * could not queue the request; the async result arrives via a2d_cb. Callers
+ * must be single-flight — do not call while BT_PAIR_CONNECTING. */
+static bool bt_conn_start(void)
 {
-    if (!s_initialized || index < 0 || index >= s_dev_count) {
-        return false;
-    }
-    if (s_discovering) {
-        esp_bt_gap_cancel_discovery();      /* radio can't scan and dial */
-    }
-    memcpy(s_peer_bda, s_devs[index].bda, sizeof(esp_bd_addr_t));
-    snprintf(s_peer_name, sizeof(s_peer_name), "%s", bt_audio_device_name(index));
-    s_enabled = true;                       /* connecting implies BT output on */
     s_pair_state = BT_PAIR_CONNECTING;
     esp_err_t err = esp_a2d_source_connect(s_peer_bda);
     if (err != ESP_OK) {
@@ -594,8 +636,66 @@ bool bt_audio_connect_index(int index)
     return true;
 }
 
+/* FreeRTOS timer callback: re-dial the last peer after a failed attempt,
+ * bounded by BT_CONNECT_MAX_RETRY. Runs off the BTC task, so esp_a2d_*
+ * calls here are safe. */
+static void bt_conn_retry_cb(TimerHandle_t t)
+{
+    (void)t;
+    if (!s_conn_auto || s_connected || s_disabling || !s_initialized) {
+        return;                             /* linked, disabled, or gone */
+    }
+    if (s_pair_state == BT_PAIR_CONNECTING) {
+        /* Previous attempt still in flight; nudge again after the backoff. */
+        xTimerStart(s_conn_timer, 0);
+        return;
+    }
+    if (s_conn_retries >= BT_CONNECT_MAX_RETRY) {
+        s_conn_auto = false;
+        s_pair_state = BT_PAIR_FAIL;        /* hand back to UI "A重试" */
+        return;
+    }
+    s_conn_retries++;
+    ESP_LOGI(TAG, "retrying connect (%d/%d)...",
+             s_conn_retries, BT_CONNECT_MAX_RETRY);
+    bt_conn_start();
+}
+
+bool bt_audio_connect_index(int index)
+{
+    if (!s_initialized || index < 0 || index >= s_dev_count) {
+        return false;
+    }
+    /* Single-flight: an attempt already in progress means the auto-retry (or a
+     * prior press) owns the link. Report "connecting" instead of spawning a
+     * second overlapping dial-out — overlapping attempts are exactly what makes
+     * the "remote features unknown" failure repeat. */
+    if (s_pair_state == BT_PAIR_CONNECTING) {
+        return true;
+    }
+    if (s_discovering) {
+        esp_bt_gap_cancel_discovery();      /* radio can't scan and dial */
+    }
+    memcpy(s_peer_bda, s_devs[index].bda, sizeof(esp_bd_addr_t));
+    snprintf(s_peer_name, sizeof(s_peer_name), "%s", bt_audio_device_name(index));
+    s_enabled = true;                       /* connecting implies BT output on */
+    s_conn_auto = true;                     /* keep auto-retrying until linked */
+    s_conn_retries = 0;
+    if (s_conn_timer == NULL) {
+        s_conn_timer = xTimerCreate("bt_conn",
+                                    pdMS_TO_TICKS(BT_CONNECT_RETRY_MS),
+                                    pdFALSE, NULL, bt_conn_retry_cb);
+    }
+    return bt_conn_start();
+}
+
 void bt_audio_disconnect(void)
 {
+    /* User-initiated drop: cancel any pending auto-retry. */
+    s_conn_auto = false;
+    if (s_conn_timer != NULL) {
+        xTimerStop(s_conn_timer, 0);
+    }
     if (s_connected) {
         esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_STOP);
         esp_a2d_source_disconnect(s_peer_bda);
@@ -691,11 +791,6 @@ void bt_audio_disable(void)
     /* No Bluetooth in this build: nothing to tear down. */
 }
 
-bool bt_audio_is_initialized(void)
-{
-    return false;
-}
-
 void bt_audio_set_enabled(bool enabled)
 {
     (void)enabled;                          /* stays off without BT support */
@@ -722,6 +817,11 @@ bool bt_audio_is_scanning(void)
 }
 
 int bt_audio_device_count(void)
+{
+    return 0;
+}
+
+uint32_t bt_audio_device_version(void)
 {
     return 0;
 }
