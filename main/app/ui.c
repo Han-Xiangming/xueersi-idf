@@ -249,6 +249,37 @@ static int s_menu_sel;
 static uint32_t s_action_until_ms;
 static char s_action[32];
 
+/* On-change refresh (optimization #4): ui_refresh() recomputes the current
+ * page only when this is set, then clears it. Input handlers and the engine
+ * watcher arm it, turning the 60 Hz tick into an on-change refresh. */
+static bool s_ui_dirty = true;
+
+/* Selection-highlight guard (optimization #1): restyle list rows only when the
+ * cursor actually moves. These remember the painted selection (and, for the
+ * player list, the scroll window) so a static tick skips the style churn.
+ * -1 forces a repaint right after a page is (re)built. */
+static int s_paint_set_sel  = -1;
+static int s_paint_mp3_sel  = -1;
+static int s_paint_mp3_top  = -1;
+static int s_paint_bt_sel   = -1;
+
+/* Cached async state so ui_refresh() can detect engine-side changes (Bluetooth
+ * stack / player / SD) that arrive via callbacks or hardware rather than UI
+ * input. */
+static uint32_t        s_ext_bt_ver;
+static int             s_ext_bt_count;
+static bt_pair_state_t s_ext_bt_pair  = BT_PAIR_IDLE;
+static bool            s_ext_bt_conn;
+static bool            s_ext_bt_scan;
+static bool            s_ext_sd_mounted;
+static player_state_t  s_ext_pl_state = PLAYER_IDLE;
+static char            s_ext_pl_name[MP3_NAME_LEN];
+
+static void ui_mark_dirty(void)
+{
+    s_ui_dirty = true;
+}
+
 static void copy_text(char *dst, size_t dst_size, const char *src)
 {
     if (dst_size == 0) {
@@ -261,6 +292,7 @@ static void set_action(const char *msg)
 {
     copy_text(s_action, sizeof(s_action), msg);
     s_action_until_ms = lv_tick_get() + UI_ACTION_MSG_MS;
+    s_ui_dirty = true;                 /* refresh until the toast expires */
 }
 
 /* Set a label's text only when it actually differs from what is already
@@ -473,28 +505,10 @@ static void ui_build_bt(lv_obj_t *page)
 
 static void ui_build_page_content(lv_obj_t *page)
 {
-    char idx[10];
-
     s_ui.title = ui_label(page, s_page_names[s_ui.page_id], 2, UI_TITLE, &lv_font_cn_10, LV_TEXT_ALIGN_LEFT);
-    /* Header number = position in the main menu. The Bluetooth sub-page
-     * shows the Settings position since it is entered from there. */
-    int hdr_idx = 0;
-    for (int i = 0; i < UI_MENU_PAGE_COUNT; i++) {
-        if (s_menu_pages[i] == s_ui.page_id) {
-            hdr_idx = i;
-            break;
-        }
-    }
-    if (s_ui.page_id == UI_PAGE_BT) {
-        for (int i = 0; i < UI_MENU_PAGE_COUNT; i++) {
-            if (s_menu_pages[i] == UI_PAGE_SETTINGS) {
-                hdr_idx = i;
-                break;
-            }
-        }
-    }
-    snprintf(idx, sizeof(idx), "%02u/%02u", (unsigned)hdr_idx + 1, (unsigned)UI_MENU_PAGE_COUNT);
-    s_ui.status = ui_label(page, idx, 2, UI_GRAY, &lv_font_cn_10, LV_TEXT_ALIGN_RIGHT);
+    /* Top-right status label. Secondary pages leave it empty; the Player page
+     * fills it with the playback state (>> / || / --) in ui_refresh(). */
+    s_ui.status = ui_label(page, "", 2, UI_GRAY, &lv_font_cn_10, LV_TEXT_ALIGN_RIGHT);
 
     /* Header separator, matching the main-menu style. */
     lv_obj_t *sep = lv_obj_create(page);
@@ -636,15 +650,82 @@ static void ui_enter_page(ui_page_t page)
     s_ui.status = NULL;
     s_ui.hint = NULL;
     ui_build_page_content(s_ui.page);
+    /* Force the selection highlight to repaint on the freshly built page, and
+     * mark the page dirty so the first on-change refresh actually runs. */
+    s_paint_set_sel = s_paint_mp3_sel = s_paint_bt_sel = -1;
+    s_paint_mp3_top = -1;
+    ui_mark_dirty();
     ui_refresh();
+}
+
+/* Detect engine-side state changes the UI cannot learn from its own input
+ * handlers (Bluetooth stack callbacks, player engine, SD hotplug). Returns
+ * true when the visible state may have changed since the last check, so
+ * ui_refresh() can arm itself and recompute. Cheap: a few compares/calls. */
+static bool ui_external_changed(void)
+{
+    bool changed = false;
+
+    /* Bluetooth state affects both the BLUETOOTH page and the SETTINGS
+     * "BT OUT" row, so watch it on every page. */
+    uint32_t v   = bt_audio_device_version();
+    int cnt     = bt_audio_device_count();
+    bt_pair_state_t ps = bt_audio_pair_state();
+    bool conn    = bt_audio_is_connected();
+    bool scan    = bt_audio_is_scanning();
+    if (v != s_ext_bt_ver || cnt != s_ext_bt_count || ps != s_ext_bt_pair
+        || conn != s_ext_bt_conn || scan != s_ext_bt_scan) {
+        s_ext_bt_ver   = v;
+        s_ext_bt_count = cnt;
+        s_ext_bt_pair  = ps;
+        s_ext_bt_conn  = conn;
+        s_ext_bt_scan  = scan;
+        changed = true;
+    }
+
+    /* SD mount can change without UI input (card removed / inserted). */
+    bool mnt = hw_sd_is_mounted();
+    if (mnt != s_ext_sd_mounted) {
+        s_ext_sd_mounted = mnt;
+        changed = true;
+    }
+
+    /* Player state / track affects the PLAYER page. */
+    if (s_ui.page_id == UI_PAGE_PLAYER) {
+        player_state_t st = player_state();
+        const char *nm    = player_current_name();
+        if (st != s_ext_pl_state
+            || strncmp(nm, s_ext_pl_name, MP3_NAME_LEN - 1) != 0) {
+            s_ext_pl_state = st;
+            strncpy(s_ext_pl_name, nm, MP3_NAME_LEN - 1);
+            s_ext_pl_name[MP3_NAME_LEN - 1] = '\0';
+            changed = true;
+        }
+    }
+    return changed;
 }
 
 void ui_refresh(void)
 {
     ui_settings_flush();
     if (s_in_menu) {
-        return;
+        return;                         /* menu is event-driven */
     }
+
+    /* An action toast is still counting down (s_action_until_ms set): keep
+     * refreshing until ui_set_hint() clears it on expiry, even if nothing else
+     * changed. */
+    bool toast_active = (s_action_until_ms != 0);
+
+    if (ui_external_changed()) {
+        s_ui_dirty = true;             /* Bluetooth/player/SD changed via callback */
+    }
+    if (!s_ui_dirty && !toast_active) {
+        return;                         /* idle: nothing visible changed */
+    }
+
+    /* Guards against recomputing the page before its labels are built. Leave
+     * s_ui_dirty set so we retry on the next tick. */
     if (s_ui.page_id == UI_PAGE_SETTINGS) {
         if (!s_ui.set_cursor[0] || !s_ui.hint) {
             return;
@@ -682,14 +763,17 @@ void ui_refresh(void)
     }
     case UI_PAGE_SETTINGS: {
         char buf[24];
+        const bool sel_changed = (s_setting_sel != s_paint_set_sel);
         for (int i = 0; i < SETTING_COUNT; i++) {
             const int sel = (i == s_setting_sel);
             ui_label_set(s_ui.set_cursor[i], sel ? ">" : " ");
-            lv_obj_set_style_text_color(s_ui.set_cursor[i], lv_color_hex(UI_CYAN), 0);
-            lv_obj_set_style_text_color(s_ui.set_text[i],
-                                        lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
-            lv_obj_set_style_text_color(s_ui.set_value[i],
-                                        lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
+            if (sel_changed) {
+                lv_obj_set_style_text_color(s_ui.set_cursor[i], lv_color_hex(UI_CYAN), 0);
+                lv_obj_set_style_text_color(s_ui.set_text[i],
+                                            lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
+                lv_obj_set_style_text_color(s_ui.set_value[i],
+                                            lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
+            }
             switch (i) {
             case SETTING_VOLUME:
                 snprintf(buf, sizeof(buf), "%u%%", (unsigned)hw_audio_get_volume());
@@ -717,6 +801,9 @@ void ui_refresh(void)
             }
             ui_label_set(s_ui.set_value[i], buf);
         }
+        if (sel_changed) {
+            s_paint_set_sel = s_setting_sel;
+        }
         ui_set_hint("上/下选 A进入 左/右设 B返回");
         break;
     }
@@ -728,6 +815,8 @@ void ui_refresh(void)
         if (top > s_mp3_count - MP3_LIST_ROWS) {
             top = MAX(0, s_mp3_count - MP3_LIST_ROWS);
         }
+        const bool sel_changed = (s_mp3_sel != s_paint_mp3_sel)
+                                 || (top != s_paint_mp3_top);
         for (int i = 0; i < MP3_LIST_ROWS; i++) {
             int idx = top + i;
             const int sel = (idx == s_mp3_sel);
@@ -736,15 +825,21 @@ void ui_refresh(void)
                 strncpy(tmp, s_mp3_names[idx], 19);
                 tmp[19] = '\0';
                 ui_label_set(s_ui.pl_cursor[i], sel ? ">" : " ");
-                lv_obj_set_style_text_color(s_ui.pl_cursor[i], lv_color_hex(UI_CYAN), 0);
-                lv_obj_set_style_text_color(s_ui.pl_text[i],
-                                            lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
+                if (sel_changed) {
+                    lv_obj_set_style_text_color(s_ui.pl_cursor[i], lv_color_hex(UI_CYAN), 0);
+                    lv_obj_set_style_text_color(s_ui.pl_text[i],
+                                                lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
+                }
                 ui_label_set(s_ui.pl_text[i], tmp);
             }
             else {
                 ui_label_set(s_ui.pl_cursor[i], " ");
                 ui_label_set(s_ui.pl_text[i], "");
             }
+        }
+        if (sel_changed) {
+            s_paint_mp3_sel = s_mp3_sel;
+            s_paint_mp3_top = top;
         }
         player_state_t st = player_state();
         ui_label_set(s_ui.status,
@@ -795,6 +890,7 @@ void ui_refresh(void)
         if (top > count - BT_LIST_ROWS) {
             top = MAX(0, count - BT_LIST_ROWS);
         }
+        const bool sel_changed = (s_bt_sel != s_paint_bt_sel);
         for (int i = 0; i < BT_LIST_ROWS; i++) {
             int idx = top + i;
             const int sel = (idx == s_bt_sel);
@@ -803,14 +899,19 @@ void ui_refresh(void)
                                  ? s_bt_list_name[idx]
                                  : bt_audio_device_name(idx);
                 ui_label_set(s_ui.bt_cursor[i], sel ? ">" : " ");
-                lv_obj_set_style_text_color(s_ui.bt_text[i],
-                                            lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
+                if (sel_changed) {
+                    lv_obj_set_style_text_color(s_ui.bt_text[i],
+                                                lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
+                }
                 ui_label_set(s_ui.bt_text[i], nm);
             }
             else {
                 ui_label_set(s_ui.bt_cursor[i], " ");
                 ui_label_set(s_ui.bt_text[i], "");
             }
+        }
+        if (sel_changed) {
+            s_paint_bt_sel = s_bt_sel;
         }
 
         if (bt_audio_is_connected()) {
@@ -863,10 +964,12 @@ void ui_refresh(void)
     default:
         break;
     }
+    s_ui_dirty = false;                 /* painted; wait for next change */
 }
 
 static void ui_action(void)
 {
+    ui_mark_dirty();                   /* an action may change visible state */
     switch (s_ui.page_id) {
     case UI_PAGE_SD:
         hw_sd_try_mount();
@@ -924,6 +1027,7 @@ static void ui_action(void)
 
 static void ui_adjust(int step)
 {
+    ui_mark_dirty();                   /* selection / scroll changed */
     switch (s_ui.page_id) {
     case UI_PAGE_SETTINGS:
         s_setting_sel = (s_setting_sel - step + SETTING_COUNT) % SETTING_COUNT;
@@ -963,6 +1067,7 @@ static void ui_adjust(int step)
 /* Left/right changes the value of the selected settings item. */
 static void ui_adjust_lr(int dir)
 {
+    ui_mark_dirty();                   /* selected setting value changed */
     if (s_ui.page_id != UI_PAGE_SETTINGS) {
         return;
     }

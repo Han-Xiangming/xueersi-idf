@@ -496,8 +496,11 @@ static void bt_audio_teardown(void *param1, uint32_t param2)
     if (!s_disabling) {
         return;                             /* re-enabled: keep the stack up */
     }
-    esp_a2d_source_deinit();
+    /* Bluedroid requires the AVRCP Target to be torn down *before* the A2DP
+     * source; deinit'ing A2DP first triggers a "AVRC TG should deinit in
+     * advance of A2DP" warning and can leave the AVRC profile half-freed. */
     esp_avrc_tg_deinit();
+    esp_a2d_source_deinit();
     esp_bluedroid_disable();
     esp_bluedroid_deinit();
     esp_bt_controller_disable();
