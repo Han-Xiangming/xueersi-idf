@@ -23,6 +23,8 @@ typedef enum {
     UI_PAGE_SD,
     UI_PAGE_BT,
     UI_PAGE_SETTINGS,
+    UI_PAGE_EBOOK_LIST,
+    UI_PAGE_EBOOK_READ,
     UI_PAGE_COUNT,
 } ui_page_t;
 

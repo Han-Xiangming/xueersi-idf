@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/param.h>
 
 #include "board_config.h"
@@ -15,6 +16,7 @@
 #include "hardware/sd.h"
 #include "app/ui.h"
 #include "player.h"
+#include "ebook.h"
 
 #include "esp_attr.h"
 #include "esp_err.h"
@@ -26,15 +28,15 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 
-/* Embedded CJK bitmap font (main/fonts/lv_font_cn_10.c): ~570 KB, covers
+/* Embedded CJK bitmap font (main/fonts/lv_font_cn_12.c): ~810 KB, covers
  * ASCII + ~22000 Chinese ideographs + Japanese kana/kanji + CJK symbols.
  * Generated with lv_font_conv from SourceHanSansSC. Used as the UI default
  * so both static labels and dynamic text (SD/BT names) render Chinese. */
-extern const lv_font_t lv_font_cn_10;
+extern const lv_font_t lv_font_cn_12;
 
 /* Single UI font: the CJK font includes Latin glyphs too, so there is no
  * need to mix multiple faces. */
-#define UI_FONT (&lv_font_cn_10)
+#define UI_FONT (&lv_font_cn_12)
 
 #define UI_ACTION_MSG_MS            850
 #define UI_ACTION_DELAY_MS          100
@@ -47,13 +49,15 @@ static const char *const s_page_names[UI_PAGE_COUNT] = {
     "SD卡",
     "蓝牙",
     "设置",
+    "电子书",
+    "电子书",
 };
 
 /* Main menu lists only these pages. Bluetooth was moved into Settings as a
  * sub-page (opened from the 蓝牙 settings item), so it is no longer a
  * top-level tab in the main menu. */
 static const ui_page_t s_menu_pages[] = {
-    UI_PAGE_PLAYER, UI_PAGE_SD, UI_PAGE_SETTINGS,
+    UI_PAGE_PLAYER, UI_PAGE_EBOOK_LIST, UI_PAGE_SD, UI_PAGE_SETTINGS,
 };
 #define UI_MENU_PAGE_COUNT ((int)(sizeof(s_menu_pages) / sizeof(s_menu_pages[0])))
 
@@ -203,6 +207,12 @@ EXT_RAM_BSS_ATTR static char s_mp3_names[64][MP3_NAME_LEN];
 static int s_mp3_count;
 static int s_mp3_sel;
 
+/* Ebook book-list page: same 4-row layout as the MP3 page. */
+#define EBOOK_LIST_ROWS 4
+static const int s_eb_row_y[EBOOK_LIST_ROWS] = {22, 40, 58, 76};
+static int s_eb_sel;
+static char s_eb_open_name[MP3_NAME_LEN];
+
 /* BIOS/DOS-style menu palette: dark base + cyan accent + gray monochrome text. */
 static const uint32_t UI_CYAN = 0x00E0E0;
 static const uint32_t UI_GRAY = 0x808080;
@@ -240,6 +250,13 @@ typedef struct {
     lv_obj_t *bt_text[BT_LIST_ROWS];
     lv_obj_t *bt_status;
 
+    lv_obj_t *eb_cursor[EBOOK_LIST_ROWS];
+    lv_obj_t *eb_text[EBOOK_LIST_ROWS];
+    lv_obj_t *eb_status;
+    lv_obj_t *eb_text_label;
+    lv_obj_t *eb_bar;
+    lv_obj_t *eb_pct;
+
     lv_group_t *group;
     ui_page_t page_id;
 } ui_state_t;
@@ -264,6 +281,7 @@ static int s_paint_set_sel  = -1;
 static int s_paint_mp3_sel  = -1;
 static int s_paint_mp3_top  = -1;
 static int s_paint_bt_sel   = -1;
+static int s_paint_eb_sel   = -1;
 
 /* Cached async state so ui_refresh() can detect engine-side changes (Bluetooth
  * stack / player / SD) that arrive via callbacks or hardware rather than UI
@@ -276,6 +294,8 @@ static bool            s_ext_bt_scan;
 static bool            s_ext_sd_mounted;
 static player_state_t  s_ext_pl_state = PLAYER_IDLE;
 static char            s_ext_pl_name[MP3_NAME_LEN];
+static uint32_t        s_ext_eb_scan_ver;
+static uint32_t        s_ext_eb_cnt_ver;
 
 static void ui_mark_dirty(void)
 {
@@ -422,6 +442,12 @@ static void ui_set_hint(const char *normal)
     if (s_action_until_ms && delay_done
         && (int32_t)(s_action_until_ms - now_ms) > 0) {
         ui_label_set(s_ui.hint, s_action);
+        /* Toast takes over the status row: hide the ebook bar/percentage
+         * so the centered toast text does not collide with them. */
+        if (s_ui.eb_bar && s_ui.eb_pct) {
+            lv_obj_add_flag(s_ui.eb_bar, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_ui.eb_pct, LV_OBJ_FLAG_HIDDEN);
+        }
     }
     else {
         if (delay_done) {
@@ -429,6 +455,10 @@ static void ui_set_hint(const char *normal)
             s_action_show_ms = 0;      /* arm the delay afresh for the next burst */
         }
         ui_label_set(s_ui.hint, normal);
+        if (s_ui.eb_bar && s_ui.eb_pct) {
+            lv_obj_remove_flag(s_ui.eb_bar, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(s_ui.eb_pct, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 }
 
@@ -441,7 +471,7 @@ static void ui_build_settings(lv_obj_t *page)
         lv_obj_t *cur = lv_label_create(page);
         lv_label_set_text(cur, " ");
         lv_obj_set_pos(cur, 8, s_setting_y[i]);
-        lv_obj_set_style_text_font(cur, &lv_font_cn_10, 0);
+        lv_obj_set_style_text_font(cur, &lv_font_cn_12, 0);
         lv_obj_set_style_text_color(cur, lv_color_hex(UI_GRAY), 0);
         s_ui.set_cursor[i] = cur;
 
@@ -451,20 +481,20 @@ static void ui_build_settings(lv_obj_t *page)
         lv_obj_t *txt = lv_label_create(page);
         lv_label_set_text(txt, labels[i]);
         lv_obj_set_pos(txt, 18, s_setting_y[i]);
-        lv_obj_set_style_text_font(txt, &lv_font_cn_10, 0);
+        lv_obj_set_style_text_font(txt, &lv_font_cn_12, 0);
         lv_obj_set_style_text_color(txt, lv_color_hex(UI_GRAY), 0);
         s_ui.set_text[i] = txt;
 
         lv_obj_t *val = lv_label_create(page);
         lv_label_set_long_mode(val, LV_LABEL_LONG_MODE_CLIP);
         lv_obj_set_pos(val, 95, s_setting_y[i]);
-        lv_obj_set_style_text_font(val, &lv_font_cn_10, 0);
+        lv_obj_set_style_text_font(val, &lv_font_cn_12, 0);
         lv_obj_set_style_text_color(val, lv_color_hex(UI_GRAY), 0);
         s_ui.set_value[i] = val;
     }
 
     s_ui.hint = ui_label(page, "上/下选 A进入 左/右设 B返回", 110,
-                         UI_GRAY, &lv_font_cn_10, LV_TEXT_ALIGN_CENTER);
+                         UI_GRAY, &lv_font_cn_12, LV_TEXT_ALIGN_CENTER);
 }
 
 static void ui_build_player(lv_obj_t *page)
@@ -477,20 +507,20 @@ static void ui_build_player(lv_obj_t *page)
         lv_obj_t *cur = lv_label_create(page);
         lv_label_set_text(cur, " ");
         lv_obj_set_pos(cur, 6, s_pl_row_y[i]);
-        lv_obj_set_style_text_font(cur, &lv_font_cn_10, 0);
+        lv_obj_set_style_text_font(cur, &lv_font_cn_12, 0);
         lv_obj_set_style_text_color(cur, lv_color_hex(UI_CYAN), 0);
         s_ui.pl_cursor[i] = cur;
 
         lv_obj_t *txt = lv_label_create(page);
         lv_label_set_long_mode(txt, LV_LABEL_LONG_MODE_CLIP);
         lv_obj_set_pos(txt, 16, s_pl_row_y[i]);
-        lv_obj_set_style_text_font(txt, &lv_font_cn_10, 0);
+        lv_obj_set_style_text_font(txt, &lv_font_cn_12, 0);
         lv_obj_set_style_text_color(txt, lv_color_hex(UI_GRAY), 0);
         s_ui.pl_text[i] = txt;
     }
 
-    s_ui.pl_prog = ui_label(page, "空闲", 92, UI_GRAY, &lv_font_cn_10, LV_TEXT_ALIGN_CENTER);
-    s_ui.hint = ui_label(page, "上/下选择 A播放 B返回", 110, UI_GRAY, &lv_font_cn_10, LV_TEXT_ALIGN_CENTER);
+    s_ui.pl_prog = ui_label(page, "空闲", 92, UI_GRAY, &lv_font_cn_12, LV_TEXT_ALIGN_CENTER);
+    s_ui.hint = ui_label(page, "上/下选择 A播放 B返回", 110, UI_GRAY, &lv_font_cn_12, LV_TEXT_ALIGN_CENTER);
 }
 
 /* Bluetooth page: entering it kicks off a scan; the list fills live. */
@@ -502,32 +532,111 @@ static void ui_build_bt(lv_obj_t *page)
         lv_obj_t *cur = lv_label_create(page);
         lv_label_set_text(cur, " ");
         lv_obj_set_pos(cur, 6, s_bt_row_y[i]);
-        lv_obj_set_style_text_font(cur, &lv_font_cn_10, 0);
+        lv_obj_set_style_text_font(cur, &lv_font_cn_12, 0);
         lv_obj_set_style_text_color(cur, lv_color_hex(UI_CYAN), 0);
         s_ui.bt_cursor[i] = cur;
 
         lv_obj_t *txt = lv_label_create(page);
         lv_label_set_long_mode(txt, LV_LABEL_LONG_MODE_CLIP);
         lv_obj_set_pos(txt, 16, s_bt_row_y[i]);
-        lv_obj_set_style_text_font(txt, &lv_font_cn_10, 0);
+        lv_obj_set_style_text_font(txt, &lv_font_cn_12, 0);
         lv_obj_set_style_text_color(txt, lv_color_hex(UI_GRAY), 0);
         s_ui.bt_text[i] = txt;
     }
 
     s_ui.bt_status = ui_label(page, "扫描中...", 92, UI_GRAY,
-                              &lv_font_cn_10, LV_TEXT_ALIGN_CENTER);
+                              &lv_font_cn_12, LV_TEXT_ALIGN_CENTER);
     s_ui.hint = ui_label(page, "上/下选 A连接 B返回", 110, UI_GRAY,
-                         &lv_font_cn_10, LV_TEXT_ALIGN_CENTER);
+                         &lv_font_cn_12, LV_TEXT_ALIGN_CENTER);
 
     bt_audio_scan_start();
 }
 
+/* Book display name: drop the trailing ".txt" extension. */
+static void strip_txt_ext(char *dst, size_t dst_size, const char *src)
+{
+    snprintf(dst, dst_size, "%s", src ? src : "");
+    size_t l = strlen(dst);
+    if (l > 4 && strcasecmp(dst + l - 4, ".txt") == 0) {
+        dst[l - 4] = '\0';
+    }
+}
+
+static void ui_build_ebook_list(lv_obj_t *page)
+{
+    s_eb_sel = 0;
+
+    for (int i = 0; i < EBOOK_LIST_ROWS; i++) {
+        lv_obj_t *cur = lv_label_create(page);
+        lv_label_set_text(cur, " ");
+        lv_obj_set_pos(cur, 6, s_eb_row_y[i]);
+        lv_obj_set_style_text_font(cur, &lv_font_cn_12, 0);
+        lv_obj_set_style_text_color(cur, lv_color_hex(UI_CYAN), 0);
+        s_ui.eb_cursor[i] = cur;
+
+        lv_obj_t *txt = lv_label_create(page);
+        lv_label_set_long_mode(txt, LV_LABEL_LONG_MODE_CLIP);
+        lv_obj_set_pos(txt, 16, s_eb_row_y[i]);
+        lv_obj_set_style_text_font(txt, &lv_font_cn_12, 0);
+        lv_obj_set_style_text_color(txt, lv_color_hex(UI_GRAY), 0);
+        s_ui.eb_text[i] = txt;
+    }
+
+    s_ui.eb_status = ui_label(page, "扫描中...", 92, UI_GRAY,
+                              &lv_font_cn_12, LV_TEXT_ALIGN_CENTER);
+    s_ui.hint = ui_label(page, "上/下选 A打开 B返回", 110, UI_GRAY,
+                         &lv_font_cn_12, LV_TEXT_ALIGN_CENTER);
+
+    ebook_scan_start();
+}
+
+static void ui_build_ebook_read(lv_obj_t *page)
+{
+    /* Single body label: the reader engine joins exactly 5 lines with '\n'
+     * and measures with the same font, so the layout matches exactly. Line
+     * space -7 compresses the font's 23 px line height to 16 px rows. The
+     * widget must be 4*16 + 23 = 87 px tall (y=22..109), otherwise the last
+     * line's 7 px below-baseline box (descenders) is clipped. */
+    lv_obj_t *txt = lv_label_create(page);
+    lv_label_set_long_mode(txt, LV_LABEL_LONG_MODE_CLIP);
+    lv_obj_set_pos(txt, 8, 22);
+    lv_obj_set_size(txt, 152, 87);
+    lv_obj_set_style_text_font(txt, &lv_font_cn_12, 0);
+    lv_obj_set_style_text_line_space(txt, -7, 0);
+    lv_obj_set_style_text_color(txt, lv_color_hex(UI_GRAY), 0);
+    s_ui.eb_text_label = txt;
+
+    /* Status row: wide text progress bar at the left (15 cells, ~110 px) and
+     * the percentage right-aligned to the 152 px right edge. The centered
+     * hint label below is used only by toasts (see ui_set_hint). */
+    lv_obj_t *bar = lv_label_create(page);
+    lv_label_set_text(bar, "[---------------]");
+    lv_label_set_long_mode(bar, LV_LABEL_LONG_MODE_CLIP);
+    lv_obj_set_pos(bar, 8, 111);
+    lv_obj_set_style_text_font(bar, &lv_font_cn_12, 0);
+    lv_obj_set_style_text_color(bar, lv_color_hex(UI_GRAY), 0);
+    s_ui.eb_bar = bar;
+
+    lv_obj_t *pct = lv_label_create(page);
+    lv_label_set_text(pct, "0%");
+    lv_label_set_long_mode(pct, LV_LABEL_LONG_MODE_CLIP);
+    lv_obj_set_pos(pct, 120, 111);
+    lv_obj_set_size(pct, 32, LV_SIZE_CONTENT);
+    lv_obj_set_style_text_font(pct, &lv_font_cn_12, 0);
+    lv_obj_set_style_text_color(pct, lv_color_hex(UI_GRAY), 0);
+    lv_obj_set_style_text_align(pct, LV_TEXT_ALIGN_RIGHT, 0);
+    s_ui.eb_pct = pct;
+
+    s_ui.hint = ui_label(page, "", 111, UI_GRAY, &lv_font_cn_12,
+                         LV_TEXT_ALIGN_CENTER);
+}
+
 static void ui_build_page_content(lv_obj_t *page)
 {
-    s_ui.title = ui_label(page, s_page_names[s_ui.page_id], 2, UI_TITLE, &lv_font_cn_10, LV_TEXT_ALIGN_LEFT);
+    s_ui.title = ui_label(page, s_page_names[s_ui.page_id], 2, UI_TITLE, &lv_font_cn_12, LV_TEXT_ALIGN_LEFT);
     /* Top-right status label. Secondary pages leave it empty; the Player page
      * fills it with the playback state (>> / || / --) in ui_refresh(). */
-    s_ui.status = ui_label(page, "", 2, UI_GRAY, &lv_font_cn_10, LV_TEXT_ALIGN_RIGHT);
+    s_ui.status = ui_label(page, "", 2, UI_GRAY, &lv_font_cn_12, LV_TEXT_ALIGN_RIGHT);
 
     /* Header separator, matching the main-menu style. */
     lv_obj_t *sep = lv_obj_create(page);
@@ -549,12 +658,23 @@ static void ui_build_page_content(lv_obj_t *page)
         ui_build_bt(page);
         return;
     }
+    if (s_ui.page_id == UI_PAGE_EBOOK_LIST) {
+        ui_build_ebook_list(page);
+        return;
+    }
+    if (s_ui.page_id == UI_PAGE_EBOOK_READ) {
+        /* Clip the book title before it collides with the page-number
+         * status label in the top-right corner. */
+        lv_obj_set_width(s_ui.title, 96);
+        ui_build_ebook_read(page);
+        return;
+    }
 
     /* Generic value/bar page (used by the SD CARD page). */
-    s_ui.value = ui_label(page, "--", 38, UI_CYAN, &lv_font_cn_10, LV_TEXT_ALIGN_CENTER);
-    s_ui.sub = ui_label(page, "--", 63, UI_GRAY, &lv_font_cn_10, LV_TEXT_ALIGN_CENTER);
+    s_ui.value = ui_label(page, "--", 38, UI_CYAN, &lv_font_cn_12, LV_TEXT_ALIGN_CENTER);
+    s_ui.sub = ui_label(page, "--", 63, UI_GRAY, &lv_font_cn_12, LV_TEXT_ALIGN_CENTER);
     s_ui.bar = ui_bar(page, 0);
-    s_ui.hint = ui_label(page, "A重扫 B返回", 106, UI_GRAY, &lv_font_cn_10, LV_TEXT_ALIGN_CENTER);
+    s_ui.hint = ui_label(page, "A重扫 B返回", 106, UI_GRAY, &lv_font_cn_12, LV_TEXT_ALIGN_CENTER);
 }
 
 /* Menu uses show/hide transitions instead of LVGL swipe animations. */
@@ -592,7 +712,7 @@ static void ui_build_menu(void)
     lv_obj_t *title = lv_label_create(mp);
     lv_label_set_text(title, "=^_^=");
     lv_obj_set_pos(title, 4, 2);
-    lv_obj_set_style_text_font(title, &lv_font_cn_10, 0);
+    lv_obj_set_style_text_font(title, &lv_font_cn_12, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(UI_TITLE), 0);
 
     /* Separator line spanning the full width, clear of the title. */
@@ -608,7 +728,7 @@ static void ui_build_menu(void)
         lv_obj_t *cur = lv_label_create(mp);
         lv_label_set_text(cur, " ");
         lv_obj_set_pos(cur, 8, s_menu_y[i]);
-        lv_obj_set_style_text_font(cur, &lv_font_cn_10, 0);
+        lv_obj_set_style_text_font(cur, &lv_font_cn_12, 0);
         lv_obj_set_style_text_color(cur, lv_color_hex(UI_GRAY), 0);
         s_ui.menu_cursor[i] = cur;
 
@@ -616,7 +736,7 @@ static void ui_build_menu(void)
         lv_label_set_long_mode(txt, LV_LABEL_LONG_MODE_CLIP);
         lv_label_set_text(txt, i < UI_MENU_PAGE_COUNT ? s_page_names[s_menu_pages[i]] : "");
         lv_obj_set_pos(txt, 18, s_menu_y[i]);
-        lv_obj_set_style_text_font(txt, &lv_font_cn_10, 0);
+        lv_obj_set_style_text_font(txt, &lv_font_cn_12, 0);
         lv_obj_set_style_text_color(txt, lv_color_hex(UI_GRAY), 0);
         s_ui.menu_text[i] = txt;
     }
@@ -627,13 +747,13 @@ static void ui_build_menu(void)
     s_ui.menu_status = lv_label_create(mp);
     lv_label_set_text(s_ui.menu_status, mbuf);
     lv_obj_set_pos(s_ui.menu_status, 4, 110);
-    lv_obj_set_style_text_font(s_ui.menu_status, &lv_font_cn_10, 0);
+    lv_obj_set_style_text_font(s_ui.menu_status, &lv_font_cn_12, 0);
     lv_obj_set_style_text_color(s_ui.menu_status, lv_color_hex(UI_GRAY), 0);
 
     lv_obj_t *hint = lv_label_create(mp);
     lv_label_set_text(hint, "A:OK B:BK");
     lv_obj_set_pos(hint, 104, 110);
-    lv_obj_set_style_text_font(hint, &lv_font_cn_10, 0);
+    lv_obj_set_style_text_font(hint, &lv_font_cn_12, 0);
     lv_obj_set_style_text_color(hint, lv_color_hex(UI_GRAY), 0);
 }
 
@@ -668,11 +788,14 @@ static void ui_enter_page(ui_page_t page)
     s_ui.bar = NULL;
     s_ui.status = NULL;
     s_ui.hint = NULL;
+    s_ui.eb_bar = NULL;
+    s_ui.eb_pct = NULL;
     ui_build_page_content(s_ui.page);
     /* Force the selection highlight to repaint on the freshly built page, and
      * mark the page dirty so the first on-change refresh actually runs. */
     s_paint_set_sel = s_paint_mp3_sel = s_paint_bt_sel = -1;
     s_paint_mp3_top = -1;
+    s_paint_eb_sel = -1;
     ui_mark_dirty();
     ui_refresh();
 }
@@ -721,6 +844,22 @@ static bool ui_external_changed(void)
             changed = true;
         }
     }
+
+    /* Ebook: the scan list and the background page count land asynchronously. */
+    if (s_ui.page_id == UI_PAGE_EBOOK_LIST) {
+        uint32_t sv = ebook_scan_version();
+        if (sv != s_ext_eb_scan_ver) {
+            s_ext_eb_scan_ver = sv;
+            changed = true;
+        }
+    }
+    else if (s_ui.page_id == UI_PAGE_EBOOK_READ) {
+        uint32_t cv = ebook_count_version();
+        if (cv != s_ext_eb_cnt_ver) {
+            s_ext_eb_cnt_ver = cv;
+            changed = true;
+        }
+    }
     return changed;
 }
 
@@ -757,6 +896,16 @@ void ui_refresh(void)
     }
     else if (s_ui.page_id == UI_PAGE_BT) {
         if (!s_ui.bt_cursor[0] || !s_ui.hint) {
+            return;
+        }
+    }
+    else if (s_ui.page_id == UI_PAGE_EBOOK_LIST) {
+        if (!s_ui.eb_cursor[0] || !s_ui.hint) {
+            return;
+        }
+    }
+    else if (s_ui.page_id == UI_PAGE_EBOOK_READ) {
+        if (!s_ui.eb_text_label || !s_ui.hint) {
             return;
         }
     }
@@ -980,6 +1129,87 @@ void ui_refresh(void)
         }
         break;
     }
+    case UI_PAGE_EBOOK_LIST: {
+        int count = ebook_scan_count();
+        if (s_eb_sel >= count && count > 0) {
+            s_eb_sel = count - 1;
+        }
+        int top = s_eb_sel - 1;
+        if (top < 0) {
+            top = 0;
+        }
+        if (top > count - EBOOK_LIST_ROWS) {
+            top = MAX(0, count - EBOOK_LIST_ROWS);
+        }
+        const bool sel_changed = (s_eb_sel != s_paint_eb_sel);
+        for (int i = 0; i < EBOOK_LIST_ROWS; i++) {
+            int idx = top + i;
+            const int sel = (idx == s_eb_sel);
+            if (idx < count) {
+                char tmp[64];
+                strip_txt_ext(tmp, sizeof(tmp), ebook_scan_name(idx));
+                ui_label_set(s_ui.eb_cursor[i], sel ? ">" : " ");
+                if (sel_changed) {
+                    lv_obj_set_style_text_color(s_ui.eb_cursor[i],
+                                                lv_color_hex(UI_CYAN), 0);
+                    lv_obj_set_style_text_color(s_ui.eb_text[i],
+                                                lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
+                }
+                ui_label_set(s_ui.eb_text[i], tmp);
+            }
+            else {
+                ui_label_set(s_ui.eb_cursor[i], " ");
+                ui_label_set(s_ui.eb_text[i], "");
+            }
+        }
+        if (sel_changed) {
+            s_paint_eb_sel = s_eb_sel;
+        }
+        if (ebook_scan_busy()) {
+            ui_label_set(s_ui.eb_status, "扫描中...");
+        }
+        else if (count == 0) {
+            ui_label_set(s_ui.eb_status, "无TXT文件");
+        }
+        else {
+            char buf[24];
+            snprintf(buf, sizeof(buf), "%d 本", count);
+            ui_label_set(s_ui.eb_status, buf);
+        }
+        ui_set_hint("上/下选 A打开 B返回");
+        break;
+    }
+    case UI_PAGE_EBOOK_READ: {
+        ui_label_set(s_ui.title, s_eb_open_name);
+        char buf[16];
+        int total = ebook_page_count();
+        if (total > 0) {
+            snprintf(buf, sizeof(buf), "%d/%d", ebook_page(), total);
+        }
+        else {
+            /* Total page count still computing: show just the current page. */
+            snprintf(buf, sizeof(buf), "%d", ebook_page());
+        }
+        ui_label_set(s_ui.status, buf);
+        ui_label_set(s_ui.eb_text_label, ebook_page_text());
+
+        /* Status row: 15-cell text progress bar (left) + percentage (right). */
+        int pct = ebook_percent();
+        char prog[20];
+        prog[0] = '[';
+        int done = (pct * 15 + 50) / 100;   /* rounded to the nearest cell */
+        for (int i = 0; i < 15; i++) {
+            prog[1 + i] = (i < done) ? '=' : '-';
+        }
+        prog[16] = ']';
+        prog[17] = '\0';
+        ui_label_set(s_ui.eb_bar, prog);
+        char pbuf[8];
+        snprintf(pbuf, sizeof(pbuf), "%d%%", pct);
+        ui_label_set(s_ui.eb_pct, pbuf);
+        ui_set_hint("");
+        break;
+    }
     default:
         break;
     }
@@ -1036,6 +1266,28 @@ static void ui_action(void)
             ui_enter_page(UI_PAGE_BT);
         }
         break;
+    case UI_PAGE_EBOOK_LIST:
+        if (ebook_scan_count() == 0) {
+            set_action("无TXT文件");
+            break;
+        }
+        if (!ebook_open(s_eb_sel)) {
+            set_action("打开失败");
+            break;
+        }
+        strip_txt_ext(s_eb_open_name, sizeof(s_eb_open_name),
+                      ebook_scan_name(s_eb_sel));
+        ui_enter_page(UI_PAGE_EBOOK_READ);
+        break;
+    case UI_PAGE_EBOOK_READ:
+        if (ebook_at_end()) {
+            set_action("最后一页");
+        }
+        else {
+            ebook_page_flip(1);
+            set_action("下一页");
+        }
+        break;
     default:
         break;
     }
@@ -1077,16 +1329,47 @@ static void ui_adjust(int step)
         }
         break;
     }
+    case UI_PAGE_EBOOK_LIST: {
+        int count = ebook_scan_count();
+        if (count > 0) {
+            s_eb_sel = (s_eb_sel - step + count) % count;
+            set_action("选择");
+        }
+        break;
+    }
     default:
         return;
     }
     ui_refresh();
 }
 
-/* Left/right changes the value of the selected settings item. */
+/* Left/right changes the value of the selected settings item (or flips the
+ * ebook reading page). */
 static void ui_adjust_lr(int dir)
 {
     ui_mark_dirty();                   /* selected setting value changed */
+    if (s_ui.page_id == UI_PAGE_EBOOK_READ) {
+        if (dir > 0) {
+            if (ebook_at_end()) {
+                set_action("最后一页");
+            }
+            else {
+                ebook_page_flip(1);
+                set_action("下一页");
+            }
+        }
+        else {
+            if (ebook_at_start()) {
+                set_action("第一页");
+            }
+            else {
+                ebook_page_flip(-1);
+                set_action("上一页");
+            }
+        }
+        ui_refresh();
+        return;
+    }
     if (s_ui.page_id != UI_PAGE_SETTINGS) {
         return;
     }
@@ -1162,6 +1445,10 @@ static void ui_key_event_cb(lv_event_t *e)
         if (s_ui.page_id == UI_PAGE_BT) {
             /* Return to Settings, the screen this sub-page was opened from. */
             ui_enter_page(UI_PAGE_SETTINGS);
+        }
+        else if (s_ui.page_id == UI_PAGE_EBOOK_READ) {
+            /* Back to the book list; the book stays open in the engine. */
+            ui_enter_page(UI_PAGE_EBOOK_LIST);
         }
         else {
             ui_show_menu();

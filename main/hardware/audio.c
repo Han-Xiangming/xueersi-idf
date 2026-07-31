@@ -106,7 +106,19 @@ static void audio_hpf_reset(void)
 }
 
 static uint8_t s_volume = 80;            /* master output volume, percent */
-static int32_t s_vol_gain;               /* Q15 linear gain for s_volume */
+static int32_t s_vol_gain;               /* Q15 linear gain actually applied */
+static int32_t s_vol_target;             /* Q15 linear gain we are ramping to */
+
+/* Volume smoothing: when the user changes the level mid-playback, jumping the
+ * per-sample gain produces a sudden step in the waveform — an audible "pop /
+ * click" (the gain itself is constant, so pitch/timbre are unchanged). We
+ * instead ramp `s_vol_gain` linearly toward `s_vol_target` over a short window
+ * so the gain change is continuous. RAMP_MS is the total transition time; the
+ * per-sample increment is recomputed each write_pcm call from the current gap
+ * and the number of samples being processed (so it always finishes within the
+ * call, even for short bursts). */
+#define VOL_RAMP_MS        15
+static int32_t s_vol_step;               /* Q15 gain delta applied per sample */
 
 /* Perceptual volume taper (built once at init into s_vol_tab).
  *
@@ -158,7 +170,17 @@ static void audio_update_vol_gain(void)
     else if (v > 100) {
         v = 100;
     }
-    s_vol_gain = s_vol_tab[v];
+    /* Sets the target only; s_vol_gain is ramped toward it sample-by-sample in
+     * hw_audio_write_pcm() to avoid step-noise. Initialize both at startup. */
+    s_vol_target = s_vol_tab[v];
+}
+
+/* Snap the applied gain straight to the target (no ramp): used at init and on
+ * route/track changes where a smooth transition is neither needed nor wanted. */
+static void audio_vol_gain_snap(void)
+{
+    s_vol_gain = s_vol_target;
+    s_vol_step = 0;
 }
 
 /* Apply a sample-rate change. Must only be called from the feed task so it is
@@ -280,6 +302,7 @@ void hw_audio_init(void)
     audio_set_hpf_coeff(s_rate);      /* default-rate HPF coefficient */
     audio_build_vol_table();          /* precompute the dB-taper gain table */
     audio_update_vol_gain();
+    audio_vol_gain_snap();             /* start at the configured level, no ramp */
     xTaskCreate(audio_feed_task, "audio_feed", 4 * 1024, NULL, 6, &s_feed_task);
 }
 
@@ -356,11 +379,37 @@ void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
     if (bt_out != s_prev_bt_out) {
         s_prev_bt_out = bt_out;
         audio_hpf_reset();         /* fresh filter history on route switch */
+        audio_vol_gain_snap();     /* no ramp across a route change */
         ESP_LOGI(TAG, "audio route -> %s", bt_out ? "bluetooth" : "speaker");
     }
 
-    const int32_t g = s_vol_gain;            /* Q15 logarithmic gain */
     size_t n = frames * 2;
+
+    /* Prepare the volume ramp: if the applied gain differs from the target,
+     * compute a per-sample increment so the gain (and thus `s_vol_gain`) moves
+     * from its current value to `s_vol_target` across these `n` samples.
+     * VOL_RAMP_MS worth of samples is used as the reference, but the step is
+     * clamped so a partial buffer still completes the transition within the
+     * call — keeping the change click-free without ever leaving a stale gain. */
+    int32_t g = s_vol_gain;
+    if (g != s_vol_target) {
+        int32_t ramp_samples = (int32_t)((uint64_t)s_rate * VOL_RAMP_MS / 1000u);
+        if (ramp_samples < 1) {
+            ramp_samples = 1;
+        }
+        int32_t remaining = (int32_t)n;
+        if (remaining > ramp_samples) {
+            remaining = ramp_samples;       /* cap ramp length to VOL_RAMP_MS */
+        }
+        s_vol_step = (s_vol_target - g) / remaining;
+        if (s_vol_step == 0) {
+            /* gap smaller than 1 LSB over the ramp: jump on the last sample */
+            s_vol_step = (s_vol_target > g) ? 1 : -1;
+        }
+    }
+    else {
+        s_vol_step = 0;
+    }
 
     if (bt_out) {
         /* Bluetooth route: volume only, full band. The blocking send inside
@@ -368,7 +417,15 @@ void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
          * speaker stays silent because its ring simply runs empty). */
         for (size_t i = 0; i < n; i++) {
             stereo_frames[i] = (int16_t)(((int32_t)stereo_frames[i] * g) >> 15);
+            if (s_vol_step != 0 && g != s_vol_target) {
+                g += s_vol_step;
+                if ((s_vol_step > 0 && g >= s_vol_target) ||
+                    (s_vol_step < 0 && g <= s_vol_target)) {
+                    g = s_vol_target;
+                }
+            }
         }
+        s_vol_gain = g;
         bt_audio_write_pcm(stereo_frames, frames);
         return;
     }
@@ -387,9 +444,17 @@ void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
             else if (y < -32768) {
                 y = -32768;
             }
-            y = (y * g) >> 15;               /* apply logarithmic volume */
+            y = (y * g) >> 15;               /* apply (ramped) logarithmic volume */
             stereo_frames[i] = (int16_t)y;
+            if (s_vol_step != 0 && g != s_vol_target) {
+                g += s_vol_step;
+                if ((s_vol_step > 0 && g >= s_vol_target) ||
+                    (s_vol_step < 0 && g <= s_vol_target)) {
+                    g = s_vol_target;
+                }
+            }
         }
+        s_vol_gain = g;
     }
 
     size_t bytes = frames * 4;

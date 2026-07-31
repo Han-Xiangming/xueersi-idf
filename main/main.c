@@ -23,6 +23,7 @@
 #include "lvgl.h"
 #include "app/ui.h"
 #include "app/player.h"
+#include "app/ebook.h"
 
 /* LVGL UI refresh cadence in the main loop (milliseconds). */
 #define UI_REFRESH_PERIOD_MS        16
@@ -117,6 +118,7 @@ void app_main(void)
     bt_audio_set_avrc_volume_cb(xiaomiao_avrc_volume);
     hw_sd_try_mount();
     player_init();
+    ebook_init();
 
     lv_init();
     lv_display_t *display = hw_lcd_create_display();
