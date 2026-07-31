@@ -511,6 +511,19 @@ void bt_audio_enable(void)
  * freed control blocks 鈥?a NULL-deref crash in the BTC task. Re-checks
  * s_disabling so a concurrent bt_audio_enable() can cancel a pending teardown
  * (the user flipped BT back ON before it ran). */
+/* True while the stack has link-layer activity that makes a profile deinit
+ * unsafe: a live A2DP link, an active inquiry, or a connect/pair attempt
+ * still being resolved by the BTC task (dial-out in flight, SSP handshake
+ * running, or authentication done but the A2DP connect not yet completed). */
+static bool bt_link_busy(void)
+{
+    return s_connected
+        || s_discovering
+        || s_pair_state == BT_PAIR_CONNECTING
+        || s_pair_state == BT_PAIR_PAIRING
+        || s_pair_state == BT_PAIR_OK;
+}
+
 static void bt_audio_teardown(void *param1, uint32_t param2)
 {
     (void)param1;
@@ -526,16 +539,22 @@ static void bt_audio_teardown(void *param1, uint32_t param2)
         esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
         esp_a2d_source_disconnect(s_peer_bda);
     }
-    /* Wait (bounded) for the link to actually drop so deinit never runs
-     * while Bluedroid still has an armed media watchdog alarm. The bounded
-     * retry budget means a stuck link cannot hold the teardown forever. */
+    /* Wait (bounded) for the link to drop AND any in-flight connect/pair
+     * attempt or inquiry to resolve (see bt_link_busy), so deinit never runs
+     * while Bluedroid still has an armed media watchdog alarm or is
+     * mid-connect. The bounded retry budget means a stuck link cannot hold
+     * the teardown forever. Re-check s_disabling afterwards so a concurrent
+     * bt_audio_enable() can cancel the teardown even mid-wait. */
     int waited = 0;
-    while (s_connected && waited < BT_TD_MAX_RECHECK) {
+    while (bt_link_busy() && waited < BT_TD_MAX_RECHECK) {
         vTaskDelay(pdMS_TO_TICKS(BT_TD_RECHECK_MS));
         waited++;
     }
-    if (s_connected) {
-        ESP_LOGW(TAG, "link still up after %d ms of teardown polling, "
+    if (!s_disabling) {
+        return;                         /* re-enabled: keep the stack up */
+    }
+    if (bt_link_busy()) {
+        ESP_LOGW(TAG, "link still busy after %d ms of teardown polling, "
                       "tearing down anyway", waited * BT_TD_RECHECK_MS);
     }
     /* Bluedroid requires the AVRCP Target to be torn down *before* the A2DP
@@ -579,7 +598,7 @@ void bt_audio_disable(void)
         return;
     }
 
-    if (s_connected || s_pair_state == BT_PAIR_CONNECTING) {
+    if (s_connected || s_discovering || s_pair_state != BT_PAIR_IDLE) {
         /* A live (or in-flight) link: stop the media stream and kick a
          * disconnect, then defer the teardown to the Timer task 鈥?it re-checks
          * the link with a bounded retry budget (see bt_audio_teardown) instead
@@ -590,6 +609,13 @@ void bt_audio_disable(void)
          * inline here is what crashes. */
         s_disabling = true;
         s_tx_stopped = true;
+        s_conn_auto = false;             /* no auto-retry while tearing down */
+        if (s_conn_timer != NULL) {
+            xTimerStop(s_conn_timer, 0);
+        }
+        if (s_discovering) {
+            esp_bt_gap_cancel_discovery();   /* radio can't scan and drop */
+        }
         if (s_streaming) {
             esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
         }
@@ -627,7 +653,7 @@ void bt_audio_scan_start(void)
 {
     /* Never scan while linked: inquiry steals RF bandwidth from the A2DP
      * stream and makes playback stutter. */
-    if (!s_initialized || s_discovering || s_connected) {
+    if (!s_initialized || s_disabling || s_discovering || s_connected) {
         return;
     }
     s_dev_count = 0;                        /* fresh list per scan */
@@ -717,7 +743,7 @@ static void bt_conn_retry_cb(TimerHandle_t t)
 
 bool bt_audio_connect_index(int index)
 {
-    if (!s_initialized || index < 0 || index >= s_dev_count) {
+    if (!s_initialized || s_disabling || index < 0 || index >= s_dev_count) {
         return false;
     }
     /* Single-flight: an attempt already in progress means the auto-retry (or a
