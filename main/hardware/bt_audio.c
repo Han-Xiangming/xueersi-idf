@@ -55,6 +55,17 @@ static bt_avrc_volume_cb_t s_avrc_vol_cb;
 #define BT_PCM_RING_BYTES      (128 * 1024)
 #define BT_INQ_LEN             10          /* inquiry duration, 1.28s units */
 
+/* Teardown safety. bt_audio_disable() defers the real stack deinit to the
+ * FreeRTOS Timer task (bt_audio_teardown): deinit'ing A2DP while Bluedroid
+ * still has an armed media watchdog alarm (or while the link is still up)
+ * crashes the BTC task. The teardown first asks the link to drop, then polls
+ * s_connected with a bounded retry budget; the safety window covers a lost
+ * disconnect-complete event so a stuck link cannot leave the stack half
+ * disabled forever. */
+#define BT_TD_RECHECK_MS       (50)         /* polling interval */
+#define BT_TD_MAX_RECHECK      (20)         /* 1 s of polling for the link */
+#define BT_TD_SAFETY_MS        (4000)       /* force teardown fallback */
+
 /* A2DP/SBC always streams at 44.1 kHz; other input rates are resampled. */
 #define BT_STREAM_RATE         44100
 
@@ -65,6 +76,10 @@ static volatile bool s_discovering;
  * inline, so the still-armed media watchdog alarm cannot fire into freed
  * control blocks (would crash the BTC task). */
 static volatile bool s_disabling;
+/* Frozen while a teardown is in progress: the A2DP data callback must not
+ * pull more PCM (and the decode side must not push more) once the profiles
+ * start going away — feeding SBC during A2DP deinit can crash the BTC task. */
+static volatile bool s_tx_stopped;
 static RingbufHandle_t s_pcm_ring;
 static uint8_t *s_ring_storage;
 static StaticRingbuffer_t s_ring_struct;
@@ -370,6 +385,12 @@ static void avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *par
  * ring; pad with silence on underrun so the stream never stalls. */
 static int32_t a2d_data_cb(uint8_t *buf, int32_t len)
 {
+    if (s_tx_stopped) {
+        /* Teardown in progress: refuse to feed the encoder. Returning 0 lets
+         * Bluedroid run its own silence-fill path, which is safe; feeding it
+         * from our ring while the stack is half-freed is not. */
+        return 0;
+    }
     if (buf == NULL || len <= 0) {
         /* len == -1 asks us to flush any queued data. */
         if (len < 0 && s_pcm_ring != NULL) {
@@ -433,6 +454,7 @@ void bt_audio_enable(void)
          * while a link was dropping: the user flipped BT back ON before the
          * deferred teardown ran, so we keep the stack and just drop the link. */
         s_disabling = false;
+        s_tx_stopped = false;
         return;
     }
     s_disabling = false;
@@ -496,6 +518,26 @@ static void bt_audio_teardown(void *param1, uint32_t param2)
     if (!s_disabling) {
         return;                             /* re-enabled: keep the stack up */
     }
+    /* Freeze the PCM feed first: while the link is going away the stack may
+     * still pull data, and feeding SBC during profile teardown can crash the
+     * BTC task. */
+    s_tx_stopped = true;
+    if (s_connected) {
+        esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_STOP);
+        esp_a2d_source_disconnect(s_peer_bda);
+    }
+    /* Wait (bounded) for the link to actually drop so deinit never runs
+     * while Bluedroid still has an armed media watchdog alarm. The bounded
+     * retry budget means a stuck link cannot hold the teardown forever. */
+    int waited = 0;
+    while (s_connected && waited < BT_TD_MAX_RECHECK) {
+        vTaskDelay(pdMS_TO_TICKS(BT_TD_RECHECK_MS));
+        waited++;
+    }
+    if (s_connected) {
+        ESP_LOGW(TAG, "link still up after %d ms of teardown polling, "
+                      "tearing down anyway", waited * BT_TD_RECHECK_MS);
+    }
     /* Bluedroid requires the AVRCP Target to be torn down *before* the A2DP
      * source; deinit'ing A2DP first triggers a "AVRC TG should deinit in
      * advance of A2DP" warning and can leave the AVRC profile half-freed. */
@@ -516,6 +558,7 @@ static void bt_audio_teardown(void *param1, uint32_t param2)
     s_dev_version++;                        /* list reset: UI must re-read */
     s_pair_state  = BT_PAIR_IDLE;
     s_disabling   = false;
+    s_tx_stopped  = false;
     s_conn_auto   = false;
     s_conn_retries = 0;
     if (s_conn_timer != NULL) {
@@ -538,14 +581,22 @@ void bt_audio_disable(void)
 
     if (s_connected || s_pair_state == BT_PAIR_CONNECTING) {
         /* A live (or in-flight) link: stop the media stream and kick a
-         * disconnect, then return. The disconnect-complete event will call
-         * bt_audio_teardown() once Bluedroid has disarmed its watchdog alarm.
-         * Doing it inline here is what crashes. */
+         * disconnect, then defer the teardown to the Timer task — it re-checks
+         * the link with a bounded retry budget (see bt_audio_teardown) instead
+         * of relying on the disconnect-complete event alone. The second
+         * pending call is the safety net: if that event is lost, the teardown
+         * still runs after BT_TD_SAFETY_MS, polls for the link to drop, and
+         * proceeds — the stack cannot stay half-disabled forever. Doing it
+         * inline here is what crashes. */
         s_disabling = true;
+        s_tx_stopped = true;
         if (s_streaming) {
             esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_STOP);
         }
         esp_a2d_source_disconnect(s_peer_bda);
+        xTimerPendFunctionCall(bt_audio_teardown, NULL, 0, 0);
+        xTimerPendFunctionCall(bt_audio_teardown, NULL, 0,
+                               pdMS_TO_TICKS(BT_TD_SAFETY_MS));
         ESP_LOGI(TAG, "BT disable pending disconnect");
         return;
     }
@@ -717,7 +768,7 @@ static void bt_ring_send(const void *data, size_t bytes)
 {
     while (xRingbufferSend(s_pcm_ring, data, bytes,
                            pdMS_TO_TICKS(50)) != pdPASS) {
-        if (!s_streaming || !s_enabled) {
+        if (!s_streaming || !s_enabled || s_tx_stopped) {
             return;
         }
     }
