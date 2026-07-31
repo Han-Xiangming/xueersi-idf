@@ -92,6 +92,12 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "Xiaomiao LVGL 9.5 dashboard boot");
 
+    /* Bluedroid L2CAP floods "is_cong_cback_context" errors while the sink
+     * is congested (known stack issue, espressif/esp-idf#7923, still present
+     * in 5.5.4): every send attempt during the congestion callback logs one
+     * ERROR. The flood is benign noise — drop the tag below ERROR. */
+    esp_log_level_set("BT_L2CAP", ESP_LOG_WARN);
+
     /* NVS must be up before any Wi-Fi/BT controller init (those trigger
      * phy_init, which loads RF calibration data from NVS). Handle the
      * "flash needs re-format" cases by erasing and re-initialising. */

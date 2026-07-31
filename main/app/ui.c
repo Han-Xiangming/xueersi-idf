@@ -37,6 +37,7 @@ extern const lv_font_t lv_font_cn_10;
 #define UI_FONT (&lv_font_cn_10)
 
 #define UI_ACTION_MSG_MS            850
+#define UI_ACTION_DELAY_MS          100
 /* Delay before persisting a changed setting to NVS, so a burst of key
  * repeats collapses into a single write. */
 #define UI_SETTINGS_SAVE_DELAY_MS   800
@@ -247,6 +248,7 @@ static ui_state_t s_ui;
 static bool s_in_menu;
 static int s_menu_sel;
 static uint32_t s_action_until_ms;
+static uint32_t s_action_show_ms;
 static char s_action[32];
 
 /* On-change refresh (optimization #4): ui_refresh() recomputes the current
@@ -291,6 +293,13 @@ static void copy_text(char *dst, size_t dst_size, const char *src)
 static void set_action(const char *msg)
 {
     copy_text(s_action, sizeof(s_action), msg);
+    /* The toast appears UI_ACTION_DELAY_MS after the first action of a burst
+     * and stays up for UI_ACTION_MSG_MS. Rapid repeats (key auto-repeat) only
+     * update the text and extend the expiry: the show delay is armed once, so
+     * a fast burst shows live values instead of re-delaying forever. */
+    if (!s_action_show_ms) {
+        s_action_show_ms = lv_tick_get() + UI_ACTION_DELAY_MS;
+    }
     s_action_until_ms = lv_tick_get() + UI_ACTION_MSG_MS;
     s_ui_dirty = true;                 /* refresh until the toast expires */
 }
@@ -404,11 +413,21 @@ static void ui_set_hint(const char *normal)
     if (!s_ui.hint) {
         return;
     }
-    if (s_action_until_ms && (int32_t)(s_action_until_ms - lv_tick_get()) > 0) {
+    const uint32_t now_ms = lv_tick_get();
+    /* Only start clearing once the show delay has elapsed: during the delay
+     * the toast is pending, not expired, so s_action_until_ms must survive
+     * to keep ui_refresh() alive until it appears. */
+    const bool delay_done = (s_action_show_ms != 0)
+                            && (int32_t)(now_ms - s_action_show_ms) >= 0;
+    if (s_action_until_ms && delay_done
+        && (int32_t)(s_action_until_ms - now_ms) > 0) {
         ui_label_set(s_ui.hint, s_action);
     }
     else {
-        s_action_until_ms = 0;
+        if (delay_done) {
+            s_action_until_ms = 0;
+            s_action_show_ms = 0;      /* arm the delay afresh for the next burst */
+        }
         ui_label_set(s_ui.hint, normal);
     }
 }
@@ -1133,7 +1152,12 @@ static void ui_key_event_cb(lv_event_t *e)
     if (key == LV_KEY_ESC) {
         ui_settings_flush();   /* commit any pending change before leaving */
         if (s_ui.page_id == UI_PAGE_PLAYER) {
-            player_stop();
+            /* B while playing = stop but stay on the page; while idle it
+             * falls through to leave back to the menu. */
+            if (player_state() != PLAYER_IDLE) {
+                player_stop();
+                return;
+            }
         }
         if (s_ui.page_id == UI_PAGE_BT) {
             /* Return to Settings, the screen this sub-page was opened from. */
