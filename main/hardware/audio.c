@@ -13,6 +13,9 @@
  * dropped), and a dedicated high-priority feed task streams them to the I2S
  * DMA continuously. This keeps the DMA fed even when a complex MP3 frame
  * takes longer to decode, which previously caused I2S underruns / crackle.
+ * The feed task also parks the I2S channel (stops BCLK/LRC) whenever nothing
+ * is being played or the audio is routed to Bluetooth, so the MAX98357
+ * powers down instead of drawing current on an idle clock.
  */
 #define LOG_LOCAL_LEVEL ESP_LOG_INFO    /* keep detailed audio tracing out unless explicitly set to DEBUG at compile time */
 #include "board_config.h"
@@ -53,6 +56,13 @@ static i2s_chan_handle_t s_tx;
 static bool s_ready;
 static uint32_t s_rate = AUDIO_DEFAULT_RATE;
 static bool s_player_active;             /* MP3 player owns the I2S bus */
+
+/* Tracks whether the I2S channel is currently enabled (generating BCLK/LRC).
+ * The feed task parks the channel (i2s_channel_disable) whenever nothing is
+ * being played, so the MAX98357 drops into its power-down state — it shuts
+ * down ~64k BCLK cycles after the clock stops. Only touched from the feed
+ * task (and once at init), so no locking is needed. */
+static bool s_i2s_enabled;
 
 /* PCM ring buffer + feed task. */
 static uint8_t *s_ring_storage;
@@ -98,15 +108,11 @@ static void audio_set_hpf_coeff(uint32_t rate)
              (unsigned)rate, SPEAKER_HPF_FC_HZ, (int)s_hpf_lambda);
 }
 
-/* Clear the high-pass history (call when a track starts). */
-static void audio_hpf_reset(void)
-{
-    s_hpf_x1[0] = s_hpf_x1[1] = 0;
-    s_hpf_y1[0] = s_hpf_y1[1] = 0;
-}
-
-static uint8_t s_volume = 80;            /* master output volume, percent */
-static int32_t s_vol_gain;               /* Q15 linear gain for s_volume */
+static uint8_t s_vol_speaker = 80;       /* per-route volume, percent */
+static uint8_t s_vol_bt      = 80;
+static uint8_t s_volume = 80;            /* active route volume (UI view) */
+static int32_t s_vol_gain;               /* target Q15 linear gain */
+static int32_t s_vol_gain_sm;            /* smoothed gain actually applied */
 
 /* Perceptual volume taper (built once at init into s_vol_tab).
  *
@@ -122,31 +128,87 @@ static int32_t s_vol_gain;               /* Q15 linear gain for s_volume */
  *
  *   vol   gain(Q15)  level(dB)   5% step (dB)
  *   100   32767        0.0        ~2.0 each (constant & obvious)
- *    70    8192      -12.0
- *    50    3261      -20.0
- *    30     818      -32.0
- *    10      82      -44.0
- *     0       0      -∞          mute
- */
+ *    70    8231      -12.0
+ *    50    3277      -20.0
+ *    30    1304      -28.0
+ *    10     519      -36.0
+ *     0       0        -∞          mute
+ *
+ * The table is built at 0.1 dB resolution (not per-percent) so the AVRCP
+ * remote scale (0..127) also resolves to uniform ~0.32 dB steps. Mapping it
+ * through the coarse percent grid instead made consecutive remote presses
+ * alternate "no change / one step" and feel uneven. */
 #define VOL_MAX_ATTEN_DB 40   /* total attenuation at v=1 (silence ≈ -40 dB);
                                * every 5% press ≈ 2 dB — clearly audible */
-static int32_t s_vol_tab[101];
+#define VOL_TAB_STEP_DB  0.1f /* table resolution: 0.1 dB per entry */
+#define VOL_TAB_ENTRIES  ((VOL_MAX_ATTEN_DB * 10) + 1)  /* 40 dB / 0.1 dB + 0 dB */
+static int32_t s_vol_tab[VOL_TAB_ENTRIES];
+
+/* First-order gain smoothing (anti-zipper): s_vol_gain_sm chases s_vol_gain
+ * with a ~5 ms time constant, so a volume change ramps between levels instead
+ * of stepping — a mid-waveform gain jump lands as an audible click/pop. */
+#define VOL_SMOOTH_A_Q15 148 /* alpha = 1 - e^(-1/(5 ms * 44.1 kHz)) in Q15 */
+
+/* First-frame fade-in: when a track starts (or the route switches) the gain
+ * ramps from 0 with a slower ~50 ms constant, so the DAC is not hit with a
+ * full-amplitude waveform the instant the stream begins. */
+#define VOL_FADE_IN_A_Q15   14   /* alpha ~50 ms @ 44.1 kHz */
+#define VOL_FADE_IN_SAMPLES 2205 /* 50 ms at the default 44.1 kHz */
+static uint32_t s_fade_in_rem;   /* samples of fade-in still pending */
+
+/* Loudness-compensation state (see the shelf section below). Declared before
+ * audio_update_vol_gain(), which recomputes the boost target on volume
+ * changes. */
+#define LOUDNESS_MAX_DB        9.0f  /* boost at minimum volume */
+static int32_t s_lp_coeff;            /* Q15 one-pole LP coefficient */
+static int32_t s_lp_state[2];         /* per-channel LP history */
+static int32_t s_loud_boost;          /* target boost, Q15 */
+static int32_t s_loud_boost_sm;       /* smoothed boost, Q15 */
+
+static int vol_tab_index(float dB)
+{
+    if (dB <= -(float)VOL_MAX_ATTEN_DB) {
+        return 0;
+    }
+    if (dB >= 0.0f) {
+        return VOL_TAB_ENTRIES - 1;
+    }
+    return (int)((dB + (float)VOL_MAX_ATTEN_DB) / VOL_TAB_STEP_DB + 0.5f);
+}
 
 static void audio_build_vol_table(void)
 {
-    for (int v = 0; v <= 100; v++) {
-        if (v <= 0) {
-            s_vol_tab[v] = 0;            /* hard mute */
-            continue;
-        }
-        float dB = ((float)v / 100.0f - 1.0f) * (float)VOL_MAX_ATTEN_DB;
+    for (int i = 0; i < VOL_TAB_ENTRIES; i++) {
+        float dB = -(float)VOL_MAX_ATTEN_DB + i * VOL_TAB_STEP_DB;
         float g = powf(10.0f, dB / 20.0f);
         int32_t val = (int32_t)(g * 32767.0f + 0.5f);
         if (val > 32767) {
             val = 32767;
         }
-        s_vol_tab[v] = val;
+        s_vol_tab[i] = val;
     }
+}
+
+/* Recompute the loudness bass-boost target from the current volume:
+ * 0 dB at v=100, +LOUDNESS_MAX_DB at v=0 (see the shelf section below). */
+static void audio_update_loudness_boost(void)
+{
+    int v = (int)s_volume;
+    if (v < 0) {
+        v = 0;
+    }
+    else if (v > 100) {
+        v = 100;
+    }
+    float ldB = (1.0f - (float)v / 100.0f) * LOUDNESS_MAX_DB;
+    s_loud_boost = (int32_t)((powf(10.0f, ldB / 20.0f) - 1.0f) * 32768.0f);
+}
+
+/* True while the active audio route is Bluetooth (sink linked and BT output
+ * enabled) — mirrors the routing decision in hw_audio_write_pcm(). */
+static bool audio_route_is_bt(void)
+{
+    return bt_audio_is_enabled() && bt_audio_is_connected();
 }
 
 static void audio_update_vol_gain(void)
@@ -158,26 +220,106 @@ static void audio_update_vol_gain(void)
     else if (v > 100) {
         v = 100;
     }
-    s_vol_gain = s_vol_tab[v];
+    if (v == 0) {
+        s_vol_gain = 0;                  /* hard mute */
+        return;
+    }
+    float dB = ((float)v / 100.0f - 1.0f) * (float)VOL_MAX_ATTEN_DB;
+    s_vol_gain = s_vol_tab[vol_tab_index(dB)];
+    audio_update_loudness_boost();
+}
+
+/* Switch the active volume to the current route's slot. Called on route
+ * changes (see hw_audio_write_pcm) so the gain follows the new route;
+ * the write-side fade-in masks the transition. */
+static void audio_select_route(void)
+{
+    s_volume = audio_route_is_bt() ? s_vol_bt : s_vol_speaker;
+    audio_update_vol_gain();
+}
+
+/* --- Loudness compensation (volume-dependent bass shelf) ----------------
+ * At low output levels the ear is far less sensitive to low frequencies, so
+ * quiet playback sounds thin. A one-pole low-pass is run in parallel with the
+ * main path and added back with a boost that grows as the volume falls:
+ *
+ *     y = x + boost(v) * lp(x),   boost(v) = 10^(dB/20) - 1
+ *     dB = (1 - v/100) * LOUDNESS_MAX_DB      (0 dB at v=100, +9 dB at v=0)
+ *
+ * At full volume the boost is 0 dB, so the shelf only adds level where the
+ * master gain is small; the soft limiter below still bounds the peaks. */
+#define SPEAKER_LOUDNESS_FC_HZ 250   /* shelf low-pass corner (Hz) */
+
+static void audio_set_loudness_coeff(uint32_t rate)
+{
+    if (rate == 0) {
+        return;
+    }
+    float alpha = 1.0f - expf(-AUDIO_2PI * (float)SPEAKER_LOUDNESS_FC_HZ
+                              / (float)rate);
+    s_lp_coeff = (int32_t)(alpha * 32768.0f);
+    if (s_lp_coeff < 1) {
+        s_lp_coeff = 1;                /* keep strictly stable */
+    }
+    else if (s_lp_coeff > 32767) {
+        s_lp_coeff = 32767;
+    }
+}
+
+/* --- Soft limiter (anti-clipping) ---------------------------------------
+ * A hot track at v=100 passes 0 dB straight to the DAC and clips. A peak
+ * envelope (instant attack, ~100 ms release) drives a gain that drops fast
+ * (~0.5 ms) above the threshold and recovers slowly, so transients are tamed
+ * without pumping. The gain curve is piecewise-linear, so no division runs
+ * per sample: below the threshold the limiter is flat 0 dB, above it the
+ * gain falls linearly to ~0.9 at full scale. */
+#define LOUD_LIMIT_THRESH     30000  /* peaks above this get tamed (FS=32767) */
+#define LOUD_LIMIT_SLOPE_Q15  38807  /* gain(env=32767) = 0.9 (-0.9 dB) */
+#define LOUD_LIMIT_MIN_Q15    24576  /* gain floor (0.75), unreachable here */
+#define LIM_ATT_Q15           1453   /* gain drop, ~0.5 ms @ 44.1 kHz */
+#define LIM_REL_Q15           32753  /* envelope & gain release, ~100 ms */
+static int32_t s_lim_env;             /* peak envelope */
+static int32_t s_lim_gain;            /* smoothed limiter gain, Q15 */
+
+/* Clear all per-track DSP history (call when a track starts or the route
+ * switches). The limiter resets to flat gain so the first samples of a new
+ * track are never ducked by the previous track's peak envelope. */
+static void audio_dsp_reset(void)
+{
+    s_hpf_x1[0] = s_hpf_x1[1] = 0;
+    s_hpf_y1[0] = s_hpf_y1[1] = 0;
+    s_lp_state[0] = s_lp_state[1] = 0;
+    s_lim_env = 0;
+    s_lim_gain = 32768;
 }
 
 /* Apply a sample-rate change. Must only be called from the feed task so it is
- * serialized with the I2S writes (reconfig disables the channel). */
+ * serialized with the I2S writes (reconfig disables the channel). When the
+ * channel is parked (idle / BT route) the reconfig runs straight on the
+ * disabled channel and it is re-enabled by the speaker path of the feed task. */
 static void apply_rate(uint32_t rate)
 {
     if (!s_ready || rate == s_rate) {
         return;
     }
     ESP_LOGI(TAG, "reconfig I2S rate %u -> %u", (unsigned)s_rate, (unsigned)rate);
-    i2s_channel_disable(s_tx);
+    if (s_i2s_enabled) {
+        i2s_channel_disable(s_tx);
+        s_i2s_enabled = false;
+    }
     i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(rate);
     i2s_channel_reconfig_std_clock(s_tx, &clk);
     esp_err_t err = i2s_channel_enable(s_tx);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "reconfig enable failed: %s", esp_err_to_name(err));
+        s_i2s_enabled = false;
+    }
+    else {
+        s_i2s_enabled = true;
     }
     s_rate = rate;
     audio_set_hpf_coeff(s_rate);
+    audio_set_loudness_coeff(s_rate);
 }
 
 static void audio_feed_task(void *arg)
@@ -187,11 +329,40 @@ static void audio_feed_task(void *arg)
     size_t item_size;
 
     for (;;) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);   /* wait for play start */
+        /* Wait for play start. The while() also covers the case where a new
+         * play notification was consumed during the park grace window below. */
+        while (!s_feeding) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        }
         while (s_feeding) {
+            /* Bluetooth route: decoded audio goes to the sink, the I2S ring is
+             * never fed. Park the channel so the amp does not burn power on an
+             * idle BCLK while the headphones play. */
+            if (audio_route_is_bt()) {
+                if (s_ready && s_i2s_enabled) {
+                    i2s_channel_disable(s_tx);
+                    s_i2s_enabled = false;
+                }
+                item = (uint8_t *)xRingbufferReceive(s_pcm_ring, &item_size,
+                                                     pdMS_TO_TICKS(50));
+                if (item != NULL) {
+                    vRingbufferReturnItem(s_pcm_ring, item);
+                }
+                continue;
+            }
             if (s_pending_rate != 0) {
                 apply_rate(s_pending_rate);
                 s_pending_rate = 0;
+            }
+            /* Speaker route: bring the channel back up if it is parked. */
+            if (s_ready && !s_i2s_enabled) {
+                esp_err_t e = i2s_channel_enable(s_tx);
+                if (e != ESP_OK) {
+                    ESP_LOGW(TAG, "I2S enable failed: %s", esp_err_to_name(e));
+                }
+                else {
+                    s_i2s_enabled = true;
+                }
             }
             item = (uint8_t *)xRingbufferReceive(s_pcm_ring, &item_size,
                                                  pdMS_TO_TICKS(50));
@@ -215,6 +386,19 @@ static void audio_feed_task(void *arg)
          * instantaneous rather than playing out the remaining ~1.5 s buffer. */
         while ((item = (uint8_t *)xRingbufferReceive(s_pcm_ring, &item_size, 0)) != NULL) {
             vRingbufferReturnItem(s_pcm_ring, item);
+        }
+        /* 3 s park grace window: keep BCLK running so a quick re-play
+         * (next/prev track, pause-resume) does not power-cycle the MAX98357
+         * (which clicks) and does not restart the I2S clock. A play within
+         * the window consumes the notification and re-enters the feed loop
+         * with the channel still enabled; only after the window expires the
+         * channel is parked and the amp drops to its idle off state. */
+        while (s_ready && s_i2s_enabled && !s_feeding) {
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(3000));
+        }
+        if (s_ready && s_i2s_enabled && !s_feeding) {
+            i2s_channel_disable(s_tx);
+            s_i2s_enabled = false;
         }
     }
 }
@@ -256,6 +440,11 @@ void hw_audio_init(void)
         ESP_LOGW(TAG, "I2S channel enable failed: %s", esp_err_to_name(err));
         return;
     }
+    /* Park the channel right after init: the feed task re-enables it when a
+     * track actually starts, so no BCLK is generated while the device idles
+     * at the menu (the MAX98357 powers down when its clock stops). */
+    i2s_channel_disable(s_tx);
+    s_i2s_enabled = false;
     s_ready = true;
     /* Debug tracing is compiled in (LOG_LOCAL_LEVEL) but off by default;
      * the settings page LOG option enables it at runtime. */
@@ -278,8 +467,12 @@ void hw_audio_init(void)
     s_feeding = false;
     s_pending_rate = 0;
     audio_set_hpf_coeff(s_rate);      /* default-rate HPF coefficient */
-    audio_build_vol_table();          /* precompute the dB-taper gain table */
+    audio_set_loudness_coeff(s_rate); /* default-rate loudness shelf coeff */
+    audio_build_vol_table();          /* precompute the 0.1 dB gain table */
     audio_update_vol_gain();
+    s_vol_gain_sm = s_vol_gain;       /* start settled: no fade-in from zero */
+    s_loud_boost_sm = s_loud_boost;   /* shelf boost settled too */
+    s_lim_gain = 32768;               /* limiter flat until audio starts */
     xTaskCreate(audio_feed_task, "audio_feed", 4 * 1024, NULL, 6, &s_feed_task);
 }
 
@@ -293,6 +486,12 @@ void hw_audio_set_volume(uint8_t volume_pct)
     if (volume_pct > 100) {
         volume_pct = 100;
     }
+    if (audio_route_is_bt()) {
+        s_vol_bt = volume_pct;
+    }
+    else {
+        s_vol_speaker = volume_pct;
+    }
     s_volume = volume_pct;
     audio_update_vol_gain();
 }
@@ -300,6 +499,62 @@ void hw_audio_set_volume(uint8_t volume_pct)
 uint8_t hw_audio_get_volume(void)
 {
     return s_volume;
+}
+
+void hw_audio_set_speaker_volume(uint8_t volume_pct)
+{
+    if (volume_pct > 100) {
+        volume_pct = 100;
+    }
+    s_vol_speaker = volume_pct;
+    if (!audio_route_is_bt()) {
+        s_volume = volume_pct;
+        audio_update_vol_gain();
+    }
+}
+
+uint8_t hw_audio_get_speaker_volume(void)
+{
+    return s_vol_speaker;
+}
+
+void hw_audio_set_bt_volume(uint8_t volume_pct)
+{
+    if (volume_pct > 100) {
+        volume_pct = 100;
+    }
+    s_vol_bt = volume_pct;
+    if (audio_route_is_bt()) {
+        s_volume = volume_pct;
+        audio_update_vol_gain();
+    }
+}
+
+uint8_t hw_audio_get_bt_volume(void)
+{
+    return s_vol_bt;
+}
+
+/* AVRCP absolute volume (0..127, full remote scale): each remote step is an
+ * equal ~0.32 dB (40/127) change, resolved through the same 0.1 dB gain table
+ * as the local percent volume, so the remote and the buttons share one
+ * consistent taper. Writes the BT route's slot (the remote is a Bluetooth
+ * peer) and updates the percent view (UI/NVS). */
+void hw_audio_set_avrc_volume(uint8_t volume_0_127)
+{
+    if (volume_0_127 > 127) {
+        volume_0_127 = 127;
+    }
+    s_vol_bt = (uint8_t)(((uint32_t)volume_0_127 * 100u + 63) / 127u);
+    s_volume = s_vol_bt;
+    if (volume_0_127 == 0) {
+        s_vol_gain = 0;                /* hard mute */
+        audio_update_loudness_boost();
+        return;
+    }
+    float dB = ((float)volume_0_127 / 127.0f - 1.0f) * (float)VOL_MAX_ATTEN_DB;
+    s_vol_gain = s_vol_tab[vol_tab_index(dB)];
+    audio_update_loudness_boost();
 }
 
 /* Request an I2S sample-rate change; the feed task applies it (serialized).
@@ -318,9 +573,12 @@ void hw_audio_set_player_active(bool active)
     if (active) {
         s_feeding = true;
         s_pending_rate = 0;           /* set by the first decoded frame */
-        audio_hpf_reset();            /* fresh filter history per track */
+        audio_dsp_reset();            /* fresh filter history per track */
+        s_vol_gain_sm = 0;            /* fade in from silence */
+        s_fade_in_rem = VOL_FADE_IN_SAMPLES;
         audio_set_hpf_coeff(s_rate);  /* default-rate coeff until 1st frame */
-        ESP_LOGD(TAG, "player active: HPF reset, rate=%u", (unsigned)s_rate);
+        audio_set_loudness_coeff(s_rate);
+        ESP_LOGD(TAG, "player active: DSP reset, rate=%u", (unsigned)s_rate);
         if (s_feed_task != NULL) {
             xTaskNotifyGive(s_feed_task);
         }
@@ -342,9 +600,10 @@ void hw_audio_set_player_active(bool active)
  * once would tie the decoder to two independent clocks; any drift between
  * them periodically drains one of the rings and causes dropouts.
  *
- * Without Bluetooth, the speaker path applies the protection high-pass plus
- * master volume as before. Back-pressure blocks until there is room (PCM is
- * never dropped); if playback stops meanwhile we abandon the rest. */
+ * Without Bluetooth, the speaker path applies the protection high-pass,
+ * the loudness bass shelf, the master volume and the soft limiter.
+ * Back-pressure blocks until there is room (PCM is never dropped); if
+ * playback stops meanwhile we abandon the rest. */
 void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
 {
     if (!s_ready || s_pcm_ring == NULL || !s_player_active || frames == 0) {
@@ -355,11 +614,16 @@ void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
     static bool s_prev_bt_out;
     if (bt_out != s_prev_bt_out) {
         s_prev_bt_out = bt_out;
-        audio_hpf_reset();         /* fresh filter history on route switch */
-        ESP_LOGI(TAG, "audio route -> %s", bt_out ? "bluetooth" : "speaker");
+        audio_select_route();      /* switch to the new route's volume */
+        audio_dsp_reset();         /* fresh filter history on route switch */
+        s_vol_gain_sm = 0;         /* fade in the newly active route */
+        s_fade_in_rem = VOL_FADE_IN_SAMPLES;
+        ESP_LOGI(TAG, "audio route -> %s (vol %u%%)",
+                 bt_out ? "bluetooth" : "speaker", (unsigned)s_volume);
     }
 
-    const int32_t g = s_vol_gain;            /* Q15 logarithmic gain */
+    const int32_t g_target = s_vol_gain;    /* Q15 target logarithmic gain */
+    int32_t g = s_vol_gain_sm;              /* smoothed gain to apply */
     size_t n = frames * 2;
 
     if (bt_out) {
@@ -367,17 +631,26 @@ void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
          * bt_audio_write_pcm() paces the decoder; nothing goes to I2S (the
          * speaker stays silent because its ring simply runs empty). */
         for (size_t i = 0; i < n; i++) {
+            int32_t a = VOL_SMOOTH_A_Q15;
+            if (s_fade_in_rem > 0) {
+                s_fade_in_rem--;
+                a = VOL_FADE_IN_A_Q15;      /* slow ramp right after start */
+            }
+            g += ((g_target - g) * a) >> 15;
             stereo_frames[i] = (int16_t)(((int32_t)stereo_frames[i] * g) >> 15);
         }
+        s_vol_gain_sm = g;
         bt_audio_write_pcm(stereo_frames, frames);
         return;
     }
     else {
-        /* Speaker route: 1st-order high-pass per channel (L = even index,
-         * R = odd index), then the master volume. */
+        /* Speaker route: high-pass -> loudness bass shelf -> master volume
+         * -> soft limiter, all per sample (L = even index, R = odd index). */
         for (size_t i = 0; i < n; i++) {
             int ch = (int)(i & 1);
             int32_t x = stereo_frames[i];
+
+            /* Speaker-protection high-pass */
             int32_t y = (x - s_hpf_x1[ch]) + ((s_hpf_lambda * s_hpf_y1[ch]) >> 15);
             s_hpf_x1[ch] = x;
             s_hpf_y1[ch] = y;
@@ -387,10 +660,50 @@ void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
             else if (y < -32768) {
                 y = -32768;
             }
+
+            /* Loudness: add back the volume-dependent bass shelf */
+            int32_t lp = s_lp_state[ch]
+                         + (((y - s_lp_state[ch]) * s_lp_coeff) >> 15);
+            s_lp_state[ch] = lp;
+            s_loud_boost_sm += ((s_loud_boost - s_loud_boost_sm) * VOL_SMOOTH_A_Q15) >> 15;
+            y = y + ((s_loud_boost_sm * lp) >> 15);
+            if (y > 32767) {
+                y = 32767;
+            }
+            else if (y < -32768) {
+                y = -32768;
+            }
+
+            g += ((g_target - g) * (s_fade_in_rem-- > 0 ? VOL_FADE_IN_A_Q15
+                                                         : VOL_SMOOTH_A_Q15)) >> 15;
             y = (y * g) >> 15;               /* apply logarithmic volume */
+
+            /* Soft limiter: tame peaks above the threshold */
+            int32_t a = (y < 0) ? -y : y;
+            if (a > s_lim_env) {
+                s_lim_env = a;               /* instant peak attack */
+            }
+            else {
+                s_lim_env = (s_lim_env * LIM_REL_Q15) >> 15;   /* slow release */
+            }
+            int32_t tg = 32768;              /* flat 0 dB below threshold */
+            if (s_lim_env > LOUD_LIMIT_THRESH) {
+                tg = 32768 - (((s_lim_env - LOUD_LIMIT_THRESH) * LOUD_LIMIT_SLOPE_Q15) >> 15);
+                if (tg < LOUD_LIMIT_MIN_Q15) {
+                    tg = LOUD_LIMIT_MIN_Q15;
+                }
+            }
+            if (tg < s_lim_gain) {
+                s_lim_gain += ((tg - s_lim_gain) * LIM_ATT_Q15) >> 15;
+            }
+            else {
+                s_lim_gain += ((tg - s_lim_gain) * LIM_REL_Q15) >> 15;
+            }
+            y = (y * s_lim_gain) >> 15;
             stereo_frames[i] = (int16_t)y;
         }
     }
+    s_vol_gain_sm = g;
 
     size_t bytes = frames * 4;
     int waits = 0;

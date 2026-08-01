@@ -18,12 +18,32 @@ typedef enum {
     PLAYER_PAUSED,
 } player_state_t;
 
-/* Create the player task. Call once at startup. */
+/* Create the player task and the background scan task. Call once at startup. */
 void player_init(void);
 
-/* Scan /sdcard for .mp3 files. Fills up to `max` names (each MP3_NAME_LEN
- * bytes, NUL-terminated, no path) and sets *count. Returns 0 on success. */
-int player_scan(char (*names)[MP3_NAME_LEN], int max, int *count);
+/* --- Track list (background scan) -------------------------------------
+ * Walking the FATFS directory is slow (tens of ms on SDSPI), so the list is
+ * built on a dedicated task and never blocks the UI: request a scan with
+ * player_scan_start() and poll player_scan_version() / player_scan_busy() to
+ * learn when the cached list refreshes. The built-in ROM track is appended
+ * to the list automatically. */
+#define PLAYER_SCAN_MAX 64
+
+/* Kick off a background scan of /sdcard for .mp3 files. Requests arriving
+ * while one is running coalesce into a single follow-up scan. */
+void player_scan_start(void);
+
+/* True while a scan is running or queued. */
+bool player_scan_busy(void);
+
+/* Bumped on every completed scan; poll to detect a fresh list. */
+uint32_t player_scan_version(void);
+
+/* Number of tracks in the last completed scan. */
+int player_scan_count(void);
+
+/* Name of track `i` from the last completed scan ("" if out of range). */
+const char *player_scan_name(int i);
 
 /* Current playback state. */
 player_state_t player_state(void);

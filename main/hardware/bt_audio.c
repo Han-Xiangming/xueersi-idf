@@ -69,6 +69,30 @@ static bt_avrc_volume_cb_t s_avrc_vol_cb;
 /* A2DP/SBC always streams at 44.1 kHz; other input rates are resampled. */
 #define BT_STREAM_RATE         44100
 
+/* SBC bitpool cap for the A2DP source, back to the stack default 53
+ * (~328 kbps at 44.1 kHz joint stereo). Lowering it (45 ~= 279 kbps,
+ * 37 ~= 229 kbps) helps weak/slow sinks stop flooding
+ * "l2cab is_cong_cback_context", at the cost of codec quality. */
+#define BT_SBC_MAX_BITPOOL     53
+
+/* Preferred SBC capability advertised to sinks: same shape as the stack
+ * default config, but with max_bitpool capped (see BT_SBC_MAX_BITPOOL).
+ * The CIE bitfields pack exactly like the A2DP SBC capability octets:
+ *   octet0 = ch_mode (b3..b0) | samp_freq (b7..b4)
+ *   octet1 = alloc_mthd (b1..b0) | num_subbands (b3..b2) | block_len (b7..b4) */
+static const esp_a2d_mcc_t s_sbc_mcc = {
+    .type = ESP_A2D_MCT_SBC,
+    .cie.sbc_info = {
+        .ch_mode      = 0x3,   /* joint stereo */
+        .samp_freq    = 0x2,   /* 44.1 kHz */
+        .alloc_mthd   = 0x0,   /* loudness */
+        .num_subbands = 0x1,   /* 8 subbands */
+        .block_len    = 0x3,   /* 16 blocks */
+        .min_bitpool  = 2,
+        .max_bitpool  = BT_SBC_MAX_BITPOOL,
+    },
+};
+
 static bool s_initialized;
 static volatile bool s_discovering;
 /* Set while a teardown is pending across an in-flight link; the actual
@@ -498,7 +522,20 @@ void bt_audio_enable(void)
 
     esp_a2d_register_callback(a2d_cb);
     esp_a2d_source_register_data_callback(a2d_data_cb);
-    esp_a2d_source_init();
+    err = esp_a2d_source_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "A2DP source init: %s", esp_err_to_name(err));
+        return;
+    }
+    /* Re-register SEP 0 with the capped SBC bitpool (overwrites the default
+     * bitpool-53 endpoint the init registered; must happen before connect). */
+    err = esp_a2d_source_register_stream_endpoint(0, &s_sbc_mcc);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "SBC bitpool cap not applied: %s", esp_err_to_name(err));
+    }
+    else {
+        ESP_LOGI(TAG, "SBC stream capped at bitpool %d", BT_SBC_MAX_BITPOOL);
+    }
 
     s_initialized = true;
     ESP_LOGI(TAG, "A2DP source ready ('Xiaomao MP3')");
