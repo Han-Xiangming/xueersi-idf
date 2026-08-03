@@ -12,7 +12,6 @@
 #include "esp_err.h"
 
 void hw_sd_try_mount(void);
-void hw_sd_unmount(void);
 
 bool hw_sd_is_mounted(void);
 const char *hw_sd_name(void);

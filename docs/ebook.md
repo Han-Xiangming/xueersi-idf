@@ -57,10 +57,10 @@ Main Menu
 
 | 文件 | 操作 | 内容 |
 | ---- | ---- | ---- |
-| `main/app/ebook.h` / `ebook.c` | 新增 | 读者核心：扫描、分页、翻页 |
-| `main/app/ui.h` | 修改 | 增加 `UI_PAGE_EBOOK_LIST`、`UI_PAGE_EBOOK_READ` |
-| `main/app/ui.c` | 修改 | 主菜单加"电子书"项；新增两个页面构建/刷新/按键分支 |
-| `main/text/Test.txt` | 新增 | EMBED_FILES 内置测试书（`EMBED_FILES "text/Test.txt"`），无 SD 也可读 |
+| `components/app/ebook.h` / `ebook.c` | 新增 | 读者核心：扫描、分页、翻页 |
+| `components/app/ui.h` | 修改 | 增加 `UI_PAGE_EBOOK_LIST`、`UI_PAGE_EBOOK_READ` |
+| `components/app/ui.c` | 修改 | 主菜单加"电子书"项；新增两个页面构建/刷新/按键分支 |
+| `components/app/Test.txt` | 新增 | EMBED_FILES 内置测试书（`EMBED_FILES "Test.txt"`），无 SD 也可读 |
 
 ***
 
@@ -139,8 +139,8 @@ const char *ebook_page_text(void);         /* 本页文本（行间 '\n'），�
 
 ```text
 =^_^=  ─────────────
-> MP3 Player
-  电子书        ← 新增（s_menu_pages 中插在 MP3 Player 之后、SD卡 之前）
+> Music Player
+  电子书        ← 新增（s_menu_pages 中插在 Music Player 之后、SD卡 之前）
   SD卡
   设置
   [1/4]   A:OK B:BK

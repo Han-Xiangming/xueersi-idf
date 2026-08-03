@@ -6,7 +6,7 @@
 #include <sys/param.h>
 
 #include "board_config.h"
-#include "hardware/lcd.h"
+#include "lcd.h"
 
 #include "driver/spi_master.h"
 #include "esp_heap_caps.h"

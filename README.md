@@ -25,7 +25,7 @@ esptool.py --chip esp32 -b 460800 write_flash 0x0 xiaomiao-merged.bin
 
 ## 原理图与鸣谢
 
-原理图文件已整理为 [`xueersi-xiaomiao-schematic.pdf`](xueersi-xiaomiao-schematic.pdf)。
+原理图文件已整理为 [`docs/xueersi-xiaomiao-schematic.pdf`](docs/xueersi-xiaomiao-schematic.pdf)。
 
 感谢 ID「我为电波狂」对硬件进行测量并制作原理图，这部分资料对后续移植和维护非常关键。
 

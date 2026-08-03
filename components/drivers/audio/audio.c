@@ -19,8 +19,8 @@
  */
 #define LOG_LOCAL_LEVEL ESP_LOG_INFO    /* keep detailed audio tracing out unless explicitly set to DEBUG at compile time */
 #include "board_config.h"
-#include "hardware/audio.h"
-#include "hardware/bt_audio.h"
+#include "audio.h"
+#include "bt_audio.h"
 
 #include <math.h>
 #include <string.h>
@@ -148,13 +148,6 @@ static int32_t s_vol_tab[VOL_TAB_ENTRIES];
  * with a ~5 ms time constant, so a volume change ramps between levels instead
  * of stepping — a mid-waveform gain jump lands as an audible click/pop. */
 #define VOL_SMOOTH_A_Q15 148 /* alpha = 1 - e^(-1/(5 ms * 44.1 kHz)) in Q15 */
-
-/* First-frame fade-in: when a track starts (or the route switches) the gain
- * ramps from 0 with a slower ~50 ms constant, so the DAC is not hit with a
- * full-amplitude waveform the instant the stream begins. */
-#define VOL_FADE_IN_A_Q15   14   /* alpha ~50 ms @ 44.1 kHz */
-#define VOL_FADE_IN_SAMPLES 2205 /* 50 ms at the default 44.1 kHz */
-static uint32_t s_fade_in_rem;   /* samples of fade-in still pending */
 
 /* Loudness-compensation state (see the shelf section below). Declared before
  * audio_update_vol_gain(), which recomputes the boost target on volume
@@ -476,11 +469,6 @@ void hw_audio_init(void)
     xTaskCreate(audio_feed_task, "audio_feed", 4 * 1024, NULL, 6, &s_feed_task);
 }
 
-bool hw_audio_ready(void)
-{
-    return s_ready;
-}
-
 void hw_audio_set_volume(uint8_t volume_pct)
 {
     if (volume_pct > 100) {
@@ -574,8 +562,7 @@ void hw_audio_set_player_active(bool active)
         s_feeding = true;
         s_pending_rate = 0;           /* set by the first decoded frame */
         audio_dsp_reset();            /* fresh filter history per track */
-        s_vol_gain_sm = 0;            /* fade in from silence */
-        s_fade_in_rem = VOL_FADE_IN_SAMPLES;
+        s_vol_gain_sm = s_vol_gain;   /* start at full gain: no fade-in */
         audio_set_hpf_coeff(s_rate);  /* default-rate coeff until 1st frame */
         audio_set_loudness_coeff(s_rate);
         ESP_LOGD(TAG, "player active: DSP reset, rate=%u", (unsigned)s_rate);
@@ -616,8 +603,7 @@ void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
         s_prev_bt_out = bt_out;
         audio_select_route();      /* switch to the new route's volume */
         audio_dsp_reset();         /* fresh filter history on route switch */
-        s_vol_gain_sm = 0;         /* fade in the newly active route */
-        s_fade_in_rem = VOL_FADE_IN_SAMPLES;
+        s_vol_gain_sm = s_vol_gain;  /* no fade-in on route switch */
         ESP_LOGI(TAG, "audio route -> %s (vol %u%%)",
                  bt_out ? "bluetooth" : "speaker", (unsigned)s_volume);
     }
@@ -631,12 +617,7 @@ void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
          * bt_audio_write_pcm() paces the decoder; nothing goes to I2S (the
          * speaker stays silent because its ring simply runs empty). */
         for (size_t i = 0; i < n; i++) {
-            int32_t a = VOL_SMOOTH_A_Q15;
-            if (s_fade_in_rem > 0) {
-                s_fade_in_rem--;
-                a = VOL_FADE_IN_A_Q15;      /* slow ramp right after start */
-            }
-            g += ((g_target - g) * a) >> 15;
+            g += ((g_target - g) * VOL_SMOOTH_A_Q15) >> 15;
             stereo_frames[i] = (int16_t)(((int32_t)stereo_frames[i] * g) >> 15);
         }
         s_vol_gain_sm = g;
@@ -674,8 +655,7 @@ void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
                 y = -32768;
             }
 
-            g += ((g_target - g) * (s_fade_in_rem-- > 0 ? VOL_FADE_IN_A_Q15
-                                                         : VOL_SMOOTH_A_Q15)) >> 15;
+            g += ((g_target - g) * VOL_SMOOTH_A_Q15) >> 15;
             y = (y * g) >> 15;               /* apply logarithmic volume */
 
             /* Soft limiter: tame peaks above the threshold */

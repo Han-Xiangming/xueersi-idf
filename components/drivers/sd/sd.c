@@ -5,7 +5,7 @@
 #include <string.h>
 
 #include "board_config.h"
-#include "hardware/sd.h"
+#include "sd.h"
 
 #include "driver/sdspi_host.h"
 #include "driver/spi_master.h"
@@ -23,16 +23,6 @@ static bool s_mounted;
 static char s_name[24];
 static uint32_t s_mb;
 static esp_err_t s_last_err = ESP_ERR_NOT_FOUND;
-
-static void set_unmounted_state(void)
-{
-    s_mounted = false;
-    s_sd_card = NULL;
-    memset(s_name, 0, sizeof(s_name));
-    memcpy(s_name, "NO CARD", sizeof("NO CARD"));
-    s_mb = 0;
-    s_last_err = ESP_ERR_NOT_FOUND;
-}
 
 void hw_sd_try_mount(void)
 {
@@ -75,18 +65,6 @@ void hw_sd_try_mount(void)
         s_mb = 0;
         ESP_LOGE(TAG, "SD mount failed: %s", esp_err_to_name(s_last_err));
     }
-}
-
-void hw_sd_unmount(void)
-{
-    if (s_mounted && s_sd_card) {
-        esp_err_t err = esp_vfs_fat_sdcard_unmount("/sdcard", s_sd_card);
-        if (err != ESP_OK) {
-            s_last_err = err;
-            return;
-        }
-    }
-    set_unmounted_state();
 }
 
 bool hw_sd_is_mounted(void)

@@ -10,11 +10,11 @@
 #include <sys/param.h>
 
 #include "board_config.h"
-#include "hardware/buttons.h"
-#include "hardware/audio.h"
-#include "hardware/bt_audio.h"
-#include "hardware/sd.h"
-#include "app/ui.h"
+#include "buttons.h"
+#include "audio.h"
+#include "bt_audio.h"
+#include "sd.h"
+#include "ui.h"
 #include "player.h"
 #include "ebook.h"
 
@@ -44,7 +44,7 @@ extern const lv_font_t lv_font_cn_12;
 #define UI_SETTINGS_SAVE_DELAY_MS   800
 
 static const char *const s_page_names[UI_PAGE_COUNT] = {
-    "MP3 Player",
+    "Music Player",
     "SD卡",
     "蓝牙",
     "设置",

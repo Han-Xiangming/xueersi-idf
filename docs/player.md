@@ -21,8 +21,7 @@ player.c
 | ---- | ---- |
 | `player_scan(names, max, &count)` | 同步扫描 `/sdcard` 的 `.mp3`（忽略大小写），最多 `max` 首，返回 0 |
 
-- 由 UI 在进入播放器页时调用一次，结果存 UI 侧 PSRAM（`s_mp3_names`）。
-- 内置 ROM 曲目（`EMBED_FILES "tracks/Test.mp3"`，符号按**文件名**生成 `_binary_Test_mp3_*`）自动追加为列表末尾 `(ROM) Test.mp3`，无 SD 卡也可播。
+- 由 UI 在进入播放器页时调用一次，结果存 UI 侧 PSRAM（`s_mp3_names`）。曲目全部来自 SD 卡（内置 ROM 曲目已随固件瘦身移除）。
 
 ## 3. 播放控制
 
@@ -31,7 +30,7 @@ player.c
 | `player_init()` | 创建解码任务（app_main 启动时一次） |
 | `player_state()` | 当前状态（IDLE / PLAYING / PAUSED） |
 | `player_current_name()` | 当前载入曲目名（空闲为 ""） |
-| `player_play(name)` | 播放 `/sdcard/<name>` 或 `(ROM)` 内置曲目；运行中调用则切换曲目 |
+| `player_play(name)` | 播放 `/sdcard/<name>`；运行中调用则切换曲目 |
 | `player_toggle()` | 播放 ⇄ 暂停 |
 | `player_stop()` | 停止；先释放 I2S 归属（`hw_audio_set_player_active(false)`）使解码背压立即退出，再通知任务 |
 

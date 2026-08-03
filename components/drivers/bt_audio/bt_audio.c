@@ -12,7 +12,7 @@
  *   the user picks one in the BLUETOOTH UI page -> esp_a2d_source_connect() ->
  *   CONNECTED -> CHECK_SRC_RDY -> MEDIA START -> data callback pulls PCM.
  */
-#include "hardware/bt_audio.h"
+#include "bt_audio.h"
 
 #include <stdio.h>
 #include <string.h>

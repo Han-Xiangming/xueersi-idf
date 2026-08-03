@@ -25,8 +25,7 @@ void player_init(void);
  * Walking the FATFS directory is slow (tens of ms on SDSPI), so the list is
  * built on a dedicated task and never blocks the UI: request a scan with
  * player_scan_start() and poll player_scan_version() / player_scan_busy() to
- * learn when the cached list refreshes. The built-in ROM track is appended
- * to the list automatically. */
+ * learn when the cached list refreshes. */
 #define PLAYER_SCAN_MAX 64
 
 /* Kick off a background scan of /sdcard for .mp3 files. Requests arriving

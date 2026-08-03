@@ -13,9 +13,6 @@
 /* Initialize the I2S peripheral and the MAX98357 DAC. */
 void hw_audio_init(void);
 
-/* True once the I2S channel is up and ready to stream. */
-bool hw_audio_ready(void);
-
 /* Volume (0..100 %) of the ACTIVE route: while a Bluetooth sink is linked
  * and BT output is on, the BT volume is adjusted; otherwise the speaker
  * volume. The two routes keep independent settings (see the route-specific

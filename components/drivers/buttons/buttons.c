@@ -3,7 +3,7 @@
  * See hardware/buttons.h.
  */
 #include "board_config.h"
-#include "hardware/buttons.h"
+#include "buttons.h"
 
 #include "driver/gpio.h"
 #include "lvgl.h"

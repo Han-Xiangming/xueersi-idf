@@ -27,7 +27,7 @@ app/ui.c（页面控制器，不依赖具体硬件）
 | 蓝牙 | `UI_PAGE_BT` | A2DP 设备扫描/配对/连接 | `ui_build_bt` |
 | 设置 | `UI_PAGE_SETTINGS` | 音量/蓝牙/日志等级 | `ui_build_settings` |
 
-- 主菜单只列出 4 项：`MP3 Player`、`电子书`、`SD卡`、`设置`（蓝牙已并入设置页子页，见 §7）。
+- 主菜单只列出 4 项：`Music Player`、`电子书`、`SD卡`、`设置`（蓝牙已并入设置页子页，见 §7）。
 - 电子书引擎在 `app/ebook.c`，UI 通过 `ebook.h` 公开 API 交互（见 `docs/ebook.md`）。
 
 ## 3. 版面参数
@@ -43,7 +43,7 @@ app/ui.c（页面控制器，不依赖具体硬件）
 状态行：  y = 92（列表页状态）/ 106（SD、阅读页进度）；hint 一般 y=110
 ```
 
-- 全局字体 `lv_font_cn_12`（12px 全字库 CJK，`main/fonts/lv_font_cn_12.c`，行高 23）；阅读页文本区用 `line_space=-7` 压缩为 16px 行距。
+- 全局字体 `lv_font_cn_12`（12px 全字库 CJK，`components/fonts/lv_font_cn_12.c`，行高 23）；阅读页文本区用 `line_space=-7` 压缩为 16px 行距。
 - 所有文本 label 默认 144px 宽（`LCD_H_RES-16`）、`LV_LABEL_LONG_MODE_CLIP` 截断。
 
 ## 4. 按键映射
@@ -70,7 +70,7 @@ app/ui.c（页面控制器，不依赖具体硬件）
 ## 6. 播放器页布局
 
 ```text
-y=2    标题 "MP3 Player"（橙）        右上 ">> / || / --"（播放状态）
+y=2    标题 "Music Player"（橙）        右上 ">> / || / --"（播放状态）
 y=22..76  曲目列表 4 行（选中青色）
 y=92   "空闲" / "无MP3文件" / 当前曲目名
 y=110  "上/下选择 A播放 B返回" / "上/下音量 A暂停 B停止"
