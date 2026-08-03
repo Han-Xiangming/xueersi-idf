@@ -7,11 +7,13 @@
 #include "hardware/audio.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <dirent.h>
 
 #include "mp3dec.h"
+#include "esp_attr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -60,6 +62,108 @@ static int s_bytes_left;
 static int s_consumed;
 static int16_t s_pcm[MP3_PCM_MAX];
 static int16_t s_stereo[MP3_PCM_MAX];
+
+/* --- Background SD scan -------------------------------------------------
+ * opendir/readdir over SDSPI is slow (tens of ms), so the track list is built
+ * on its own task. The result is published as a snapshot: the work buffer is
+ * filled, then copied into the live array and the version counter bumped.
+ * The UI polls the version at its 16 ms cadence, so it never blocks on the
+ * scan. EXT_RAM_BSS keeps the two 4 KB lists out of internal DRAM. */
+#define PLAYER_SCAN_MAX 64
+
+EXT_RAM_BSS_ATTR static char s_scan_work[PLAYER_SCAN_MAX][MP3_NAME_LEN];
+EXT_RAM_BSS_ATTR static char s_scan_names[PLAYER_SCAN_MAX][MP3_NAME_LEN];
+static int s_scan_count;
+static uint32_t s_scan_version;
+static bool s_scan_busy;
+static bool s_scan_pending;
+static TaskHandle_t s_scan_task;
+
+static int scan_name_cmp(const void *a, const void *b)
+{
+    return strcasecmp((const char *)a, (const char *)b);
+}
+
+/* One directory walk; fills s_scan_work and publishes the snapshot. */
+static void scan_do(void)
+{
+    int n = 0;
+    DIR *d = opendir("/sdcard");
+    if (d != NULL) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL && n < PLAYER_SCAN_MAX - 1) {
+            const char *fn = e->d_name;
+            int len = (int)strlen(fn);
+            if (len > 4 && strcasecmp(fn + len - 4, ".mp3") == 0) {
+                strncpy(s_scan_work[n], fn, MP3_NAME_LEN - 1);
+                s_scan_work[n][MP3_NAME_LEN - 1] = '\0';
+                n++;
+            }
+        }
+        closedir(d);
+    }
+    /* readdir order is arbitrary; sort so the list is stable across scans. */
+    if (n > 1) {
+        qsort(s_scan_work, (size_t)n, MP3_NAME_LEN, scan_name_cmp);
+    }
+    /* The built-in ROM test track is always available, even without an SD
+     * card; keep it last so it never displaces real files. */
+    if (n < PLAYER_SCAN_MAX) {
+        strncpy(s_scan_work[n], EMBEDDED_PREFIX " Test.mp3", MP3_NAME_LEN - 1);
+        s_scan_work[n][MP3_NAME_LEN - 1] = '\0';
+        n++;
+    }
+    /* Publish: names first, then count, then version (the UI fetches count
+     * before indexing, so it either sees the old list or the new one). */
+    memcpy(s_scan_names, s_scan_work, (size_t)n * MP3_NAME_LEN);
+    s_scan_count = n;
+    s_scan_version++;
+}
+
+static void scan_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        s_scan_busy = true;
+        do {
+            s_scan_pending = false;
+            scan_do();
+        } while (s_scan_pending);   /* a request landed mid-scan: redo */
+        s_scan_busy = false;
+    }
+}
+
+void player_scan_start(void)
+{
+    s_scan_pending = true;
+    if (s_scan_task != NULL) {
+        xTaskNotifyGive(s_scan_task);
+    }
+}
+
+bool player_scan_busy(void)
+{
+    return s_scan_busy || s_scan_pending;
+}
+
+uint32_t player_scan_version(void)
+{
+    return s_scan_version;
+}
+
+int player_scan_count(void)
+{
+    return s_scan_count;
+}
+
+const char *player_scan_name(int i)
+{
+    if (i < 0 || i >= s_scan_count) {
+        return "";
+    }
+    return s_scan_names[i];
+}
 
 static bool open_track(void)
 {
@@ -272,32 +376,10 @@ void player_init(void)
     /* Debug tracing is compiled in (LOG_LOCAL_LEVEL) but off by default;
      * the settings page LOG option enables it at runtime. */
     xTaskCreate(player_task, "mp3_player", 16 * 1024, NULL, 5, &s_task);
-}
-
-int player_scan(char (*names)[MP3_NAME_LEN], int max, int *count)
-{
-    *count = 0;
-    DIR *d = opendir("/sdcard");
-    if (d != NULL) {
-        struct dirent *e;
-        while ((e = readdir(d)) != NULL && *count < max) {
-            const char *fn = e->d_name;
-            int len = (int)strlen(fn);
-            if (len > 4 && strcasecmp(fn + len - 4, ".mp3") == 0) {
-                strncpy(names[*count], fn, MP3_NAME_LEN - 1);
-                names[*count][MP3_NAME_LEN - 1] = '\0';
-                (*count)++;
-            }
-        }
-        closedir(d);
-    }
-    /* The built-in ROM test track is always available, even without an SD card. */
-    if (*count < max) {
-        strncpy(names[*count], EMBEDDED_PREFIX " Test.mp3", MP3_NAME_LEN - 1);
-        names[*count][MP3_NAME_LEN - 1] = '\0';
-        (*count)++;
-    }
-    return 0;
+    xTaskCreate(scan_task, "mp3_scan", 4 * 1024, NULL, 4, &s_scan_task);
+    /* Pre-warm the list (SD is mounted by app_main before player_init). The
+     * UI re-requests scans on page entry / SD hotplug. */
+    player_scan_start();
 }
 
 player_state_t player_state(void)

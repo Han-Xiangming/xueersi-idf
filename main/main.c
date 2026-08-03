@@ -56,11 +56,11 @@ static void xiaomiao_avrc_cmd(bt_avrc_cmd_t cmd)
     }
 }
 
-/* Remote absolute volume (0..127, AVRCP full scale) -> 0..100% master volume. */
+/* Remote absolute volume (0..127, AVRCP full scale). Mapped to equal dB
+ * steps inside the audio layer (see hw_audio_set_avrc_volume). */
 static void xiaomiao_avrc_volume(uint8_t volume_0_127)
 {
-    uint8_t pct = (uint8_t)(((uint32_t)volume_0_127 * 100u + 63) / 127u);
-    hw_audio_set_volume(pct);
+    hw_audio_set_avrc_volume(volume_0_127);
 }
 
 static void lvgl_task(void *arg)

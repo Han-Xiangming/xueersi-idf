@@ -39,7 +39,6 @@ extern const lv_font_t lv_font_cn_12;
 #define UI_FONT (&lv_font_cn_12)
 
 #define UI_ACTION_MSG_MS            850
-#define UI_ACTION_DELAY_MS          100
 /* Delay before persisting a changed setting to NVS, so a burst of key
  * repeats collapses into a single write. */
 #define UI_SETTINGS_SAVE_DELAY_MS   800
@@ -94,6 +93,7 @@ static void ui_apply_log_level(void)
  * can open the handle at any time. */
 #define UI_NVS_NS      "ui_cfg"
 #define UI_NVS_VOLUME  "volume"
+#define UI_NVS_VOLBT   "vol_bt"
 #define UI_NVS_LOGDBG  "log_dbg"
 #define UI_NVS_BT      "bt_on"
 
@@ -105,7 +105,11 @@ static void ui_settings_load(void)
     }
     int32_t v = -1;
     if (nvs_get_i32(h, UI_NVS_VOLUME, &v) == ESP_OK && v >= 0 && v <= 100) {
-        hw_audio_set_volume((uint8_t)v);
+        hw_audio_set_speaker_volume((uint8_t)v);
+    }
+    v = -1;
+    if (nvs_get_i32(h, UI_NVS_VOLBT, &v) == ESP_OK && v >= 0 && v <= 100) {
+        hw_audio_set_bt_volume((uint8_t)v);
     }
     int32_t dbg = 0;
     if (nvs_get_i32(h, UI_NVS_LOGDBG, &dbg) == ESP_OK) {
@@ -124,7 +128,8 @@ static void ui_settings_save_volume(void)
 {
     nvs_handle_t h;
     if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_i32(h, UI_NVS_VOLUME, (int32_t)hw_audio_get_volume());
+        nvs_set_i32(h, UI_NVS_VOLUME, (int32_t)hw_audio_get_speaker_volume());
+        nvs_set_i32(h, UI_NVS_VOLBT, (int32_t)hw_audio_get_bt_volume());
         nvs_commit(h);
         nvs_close(h);
     }
@@ -203,7 +208,6 @@ static int      s_bt_list_cnt;
 static char     s_bt_list_name[BT_MAX_DEVICES][BT_DEV_NAME_LEN];
 /* 4 KB of song names is UI-only data: keep it in external PSRAM so it does
  * not compete with the Bluetooth stack for internal DRAM. */
-EXT_RAM_BSS_ATTR static char s_mp3_names[64][MP3_NAME_LEN];
 static int s_mp3_count;
 static int s_mp3_sel;
 
@@ -265,7 +269,6 @@ static ui_state_t s_ui;
 static bool s_in_menu;
 static int s_menu_sel;
 static uint32_t s_action_until_ms;
-static uint32_t s_action_show_ms;
 static char s_action[32];
 
 /* On-change refresh (optimization #4): ui_refresh() recomputes the current
@@ -292,6 +295,7 @@ static bt_pair_state_t s_ext_bt_pair  = BT_PAIR_IDLE;
 static bool            s_ext_bt_conn;
 static bool            s_ext_bt_scan;
 static bool            s_ext_sd_mounted;
+static uint32_t        s_ext_scan_ver;    /* player's MP3 list refresh */
 static player_state_t  s_ext_pl_state = PLAYER_IDLE;
 static char            s_ext_pl_name[MP3_NAME_LEN];
 static uint32_t        s_ext_eb_scan_ver;
@@ -313,13 +317,9 @@ static void copy_text(char *dst, size_t dst_size, const char *src)
 static void set_action(const char *msg)
 {
     copy_text(s_action, sizeof(s_action), msg);
-    /* The toast appears UI_ACTION_DELAY_MS after the first action of a burst
-     * and stays up for UI_ACTION_MSG_MS. Rapid repeats (key auto-repeat) only
-     * update the text and extend the expiry: the show delay is armed once, so
-     * a fast burst shows live values instead of re-delaying forever. */
-    if (!s_action_show_ms) {
-        s_action_show_ms = lv_tick_get() + UI_ACTION_DELAY_MS;
-    }
+    /* The toast shows immediately on the next refresh and stays up for
+     * UI_ACTION_MSG_MS. Rapid repeats (key auto-repeat) only update the text
+     * and extend the expiry. */
     s_action_until_ms = lv_tick_get() + UI_ACTION_MSG_MS;
     s_ui_dirty = true;                 /* refresh until the toast expires */
 }
@@ -434,13 +434,7 @@ static void ui_set_hint(const char *normal)
         return;
     }
     const uint32_t now_ms = lv_tick_get();
-    /* Only start clearing once the show delay has elapsed: during the delay
-     * the toast is pending, not expired, so s_action_until_ms must survive
-     * to keep ui_refresh() alive until it appears. */
-    const bool delay_done = (s_action_show_ms != 0)
-                            && (int32_t)(now_ms - s_action_show_ms) >= 0;
-    if (s_action_until_ms && delay_done
-        && (int32_t)(s_action_until_ms - now_ms) > 0) {
+    if (s_action_until_ms && (int32_t)(s_action_until_ms - now_ms) > 0) {
         ui_label_set(s_ui.hint, s_action);
         /* Toast takes over the status row: hide the ebook bar/percentage
          * so the centered toast text does not collide with them. */
@@ -450,10 +444,7 @@ static void ui_set_hint(const char *normal)
         }
     }
     else {
-        if (delay_done) {
-            s_action_until_ms = 0;
-            s_action_show_ms = 0;      /* arm the delay afresh for the next burst */
-        }
+        s_action_until_ms = 0;         /* toast expired: arm the next one afresh */
         ui_label_set(s_ui.hint, normal);
         if (s_ui.eb_bar && s_ui.eb_pct) {
             lv_obj_remove_flag(s_ui.eb_bar, LV_OBJ_FLAG_HIDDEN);
@@ -500,8 +491,8 @@ static void ui_build_settings(lv_obj_t *page)
 static void ui_build_player(lv_obj_t *page)
 {
     s_mp3_sel = 0;
-    s_mp3_count = 0;
-    player_scan(s_mp3_names, (int)(sizeof(s_mp3_names) / sizeof(s_mp3_names[0])), &s_mp3_count);
+    s_mp3_count = player_scan_count();
+    player_scan_start();   /* refresh the list in the background */
 
     for (int i = 0; i < MP3_LIST_ROWS; i++) {
         lv_obj_t *cur = lv_label_create(page);
@@ -829,6 +820,14 @@ static bool ui_external_changed(void)
     bool mnt = hw_sd_is_mounted();
     if (mnt != s_ext_sd_mounted) {
         s_ext_sd_mounted = mnt;
+        player_scan_start();   /* list may have appeared / disappeared */
+        changed = true;
+    }
+
+    /* Background MP3 list scan completed: repaint the player list. */
+    uint32_t sv = player_scan_version();
+    if (sv != s_ext_scan_ver) {
+        s_ext_scan_ver = sv;
         changed = true;
     }
 
@@ -976,6 +975,12 @@ void ui_refresh(void)
         break;
     }
     case UI_PAGE_PLAYER: {
+        /* The list is published by the background scan; re-fetch each pass so
+         * a completed scan shows up without a page rebuild. */
+        s_mp3_count = player_scan_count();
+        if (s_mp3_sel >= s_mp3_count) {
+            s_mp3_sel = s_mp3_count > 0 ? s_mp3_count - 1 : 0;
+        }
         int top = s_mp3_sel - 1;
         if (top < 0) {
             top = 0;
@@ -990,7 +995,7 @@ void ui_refresh(void)
             const int sel = (idx == s_mp3_sel);
             if (idx < s_mp3_count) {
                 char tmp[20];
-                strncpy(tmp, s_mp3_names[idx], 19);
+                strncpy(tmp, player_scan_name(idx), 19);
                 tmp[19] = '\0';
                 ui_label_set(s_ui.pl_cursor[i], sel ? ">" : " ");
                 if (sel_changed) {
@@ -1013,7 +1018,12 @@ void ui_refresh(void)
         ui_label_set(s_ui.status,
                      st == PLAYER_PLAYING ? ">>" : st == PLAYER_PAUSED ? "||" : "--");
         if (st == PLAYER_IDLE) {
-            ui_label_set(s_ui.pl_prog, s_mp3_count ? "空闲" : "无MP3文件");
+            if (player_scan_busy()) {
+                ui_label_set(s_ui.pl_prog, "扫描中...");
+            }
+            else {
+                ui_label_set(s_ui.pl_prog, s_mp3_count ? "空闲" : "无MP3文件");
+            }
         }
         else {
             /* Now-playing line: just the track name. */
@@ -1022,8 +1032,11 @@ void ui_refresh(void)
             prog[27] = '\0';
             ui_label_set(s_ui.pl_prog, prog);
         }
-        if (st == PLAYER_PLAYING || st == PLAYER_PAUSED) {
+        if (st == PLAYER_PLAYING) {
             ui_set_hint("上/下音量 A暂停 B停止");
+        }
+        else if (st == PLAYER_PAUSED) {
+            ui_set_hint("上/下音量 A继续 B停止");
         }
         else {
             ui_set_hint("上/下选择 A播放 B返回");
@@ -1221,35 +1234,45 @@ static void ui_action(void)
     ui_mark_dirty();                   /* an action may change visible state */
     switch (s_ui.page_id) {
     case UI_PAGE_SD:
+        /* The mount blocks the UI task for tens to hundreds of ms on SDSPI,
+         * so render the pending toast before it — the user sees feedback
+         * immediately instead of a frozen screen. */
+        set_action("重扫中...");
+        lv_refr_now(NULL);
         hw_sd_try_mount();
+        player_scan_start();   /* card may have been inserted / replaced */
         set_action(hw_sd_is_mounted() ? "SD已挂载" : "无SD卡");
         break;
     case UI_PAGE_PLAYER:
         if (s_mp3_count == 0) {
-            set_action("无MP3文件");
+            set_action(player_scan_busy() ? "扫描中..." : "无MP3文件");
             break;
         }
         if (player_state() == PLAYER_PLAYING || player_state() == PLAYER_PAUSED) {
+            /* Feedback first, then the toggle: the message anticipates the
+             * flipped state (toggle always flips). */
+            set_action(player_state() == PLAYER_PLAYING ? "已暂停" : "播放中");
             player_toggle();
-            set_action(player_state() == PLAYER_PAUSED ? "已暂停" : "播放中");
         }
         else {
-            player_play(s_mp3_names[s_mp3_sel]);
             set_action("播放中");
+            player_play(player_scan_name(s_mp3_sel));
         }
         break;
     case UI_PAGE_BT:
         if (bt_audio_is_connected()) {
-            bt_audio_disconnect();
             set_action("断开中");
+            bt_audio_disconnect();
         }
         else if (bt_audio_device_count() > 0) {
-            set_action(bt_audio_connect_index(s_bt_sel) ? "连接中"
-                                                        : "连接失败");
+            set_action("连接中");
+            if (!bt_audio_connect_index(s_bt_sel)) {
+                set_action("连接失败");
+            }
         }
         else {
-            bt_audio_scan_start();
             set_action("扫描中");
+            bt_audio_scan_start();
         }
         break;
     case UI_PAGE_SETTINGS:

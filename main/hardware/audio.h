@@ -16,9 +16,23 @@ void hw_audio_init(void);
 /* True once the I2S channel is up and ready to stream. */
 bool hw_audio_ready(void);
 
-/* Set/get output volume (0..100 %). */
+/* Volume (0..100 %) of the ACTIVE route: while a Bluetooth sink is linked
+ * and BT output is on, the BT volume is adjusted; otherwise the speaker
+ * volume. The two routes keep independent settings (see the route-specific
+ * accessors below). */
 void hw_audio_set_volume(uint8_t volume_pct);
 uint8_t hw_audio_get_volume(void);
+
+/* Route-specific volumes (0..100 %), for NVS persistence / restore. */
+void hw_audio_set_speaker_volume(uint8_t volume_pct);
+uint8_t hw_audio_get_speaker_volume(void);
+void hw_audio_set_bt_volume(uint8_t volume_pct);
+uint8_t hw_audio_get_bt_volume(void);
+
+/* AVRCP absolute volume (0..127, full remote scale) with equal ~0.32 dB
+ * steps, sharing the same gain table as set_volume; always writes the BT
+ * route (the remote is a Bluetooth peer) and updates the percent view. */
+void hw_audio_set_avrc_volume(uint8_t volume_0_127);
 
 /* Reconfigure the I2S sample rate (e.g. to match an MP3 file's rate). */
 void hw_audio_set_sample_rate(uint32_t sample_rate_hz);
