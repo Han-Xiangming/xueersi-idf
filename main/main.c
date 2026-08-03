@@ -15,15 +15,15 @@
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "hardware/buttons.h"
-#include "hardware/audio.h"
-#include "hardware/bt_audio.h"
-#include "hardware/lcd.h"
-#include "hardware/sd.h"
+#include "buttons.h"
+#include "audio.h"
+#include "bt_audio.h"
+#include "lcd.h"
+#include "sd.h"
 #include "lvgl.h"
-#include "app/ui.h"
-#include "app/player.h"
-#include "app/ebook.h"
+#include "ui.h"
+#include "player.h"
+#include "ebook.h"
 
 /* LVGL UI refresh cadence in the main loop (milliseconds). */
 #define UI_REFRESH_PERIOD_MS        16

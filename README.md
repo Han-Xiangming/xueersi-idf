@@ -16,16 +16,16 @@ esptool.py --chip esp32 -b 460800 write_flash 0x0 xiaomiao-merged.bin
 
 ## 当前状态
 
-- ESP32 侧固件已经移植到 ESP-IDF，使用 LVGL 9.x 驱动 ST7735 SPI 屏幕，并提供硬件状态分页 UI。
-- 最佳的性能优化，240mhz频率，高速SPI，PSRAM，FLASH频率，三重缓冲，稳定60fps UI
+- ESP32 侧固件已经移植到 ESP-IDF，使用 LVGL 9.x 驱动 ST7735 SPI 屏幕，并提供分页 UI（播放器 / 电子书 / SD 卡 / 蓝牙 / 设置）。
+- 性能优化：240MHz 主频，高速 SPI，PSRAM，部分刷新双 DMA 缓冲，稳定 60fps UI。
 - 由于屏幕的TE引脚没有连接到MCU，无法做垂直同步。抗撕裂。由于背光引脚直连cc，无法调节背光亮度。
-- 光照、热敏、蜂鸣器、按键、MicroSD、I2C 设备探测等功能已经接入 ESP32 侧固件。
+- 按键、MicroSD、I2S 音频（MAX98357）、蓝牙 A2DP 音频、MP3 播放、TXT 电子书阅读等功能已接入 ESP32 侧固件，详见 `docs/` 下各模块文档。
 - GD32 固件仍在开发中，目前公开的 GD32 工程主要完成了 USB 转串口功能。
 - GD32 侧与 ESP32 间的 LED、电机等控制协议仍在斟酌当中，正在考虑是否兼容原有协议。欢迎大家测试或在 Issues 里提出建议。
 
 ## 原理图与鸣谢
 
-原理图文件已整理为 [`xueersi-xiaomiao-schematic.pdf`](xueersi-xiaomiao-schematic.pdf)。
+原理图文件已整理为 [`docs/xueersi-xiaomiao-schematic.pdf`](docs/xueersi-xiaomiao-schematic.pdf)。
 
 感谢 ID「我为电波狂」对硬件进行测量并制作原理图，这部分资料对后续移植和维护非常关键。
 

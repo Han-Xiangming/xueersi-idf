@@ -1,6 +1,6 @@
 # 小喵掌机 硬件层与板级配置说明
 
-> 本文档为**实现现状说明**（随代码更新）：`board_config.h` 与 `hardware/` 各驱动的职责、引脚与时序。
+> 本文档为**实现现状说明**（随代码更新）：`components/board/board_config.h` 与 `components/drivers/` 各驱动的职责、引脚与时序。
 
 ## 1. 板级总览
 
@@ -13,7 +13,7 @@ ESP32（WROVER-B，PSRAM 8MB）@ 240MHz
   └─ 蓝牙（BT Classic，A2DP Source / AVRCP TG）
 ```
 
-## 2. 引脚分配（board_config.h）
+## 2. 引脚分配（components/board/board_config.h）
 
 | 功能 | 引脚 | 说明 |
 | ---- | ---- | ---- |
@@ -29,51 +29,53 @@ ESP32（WROVER-B，PSRAM 8MB）@ 240MHz
 | 上 / 下 / 左 / 右 | 2 / 13 / 27 / 35 | 低有效 |
 | A / B | 34 / 12 | 低有效（34/35 外部上拉） |
 
-## 3. 显示驱动（hardware/lcd.c）
+## 3. 显示驱动（components/drivers/lcd/lcd.c）
 
 - ST7735 初始化采用 MicroPython `init(2)` 兼容序列（SWRESET → SLPOUT → FRMCTR/PWCTR/GMCTR 全套寄存器 → NORON）。
 - 旋转 90°（MADCTL `MX|MV`），显示区 = 原生 128×160 → 160×128，无偏移（X/Y gap = 0）。
-- **三重整屏 DMA 缓冲**（`LCD_DRAW_BUF_COUNT=3`）：前两块走 `heap_caps_malloc(SPIRAM|DMA)`，第三块走 `lv_display_set_3rd_draw_buffer`，均整屏 160×128；SPI 事务由 esp_lcd panel_io 驱动（`trans_queue_depth=10`）。
+- **部分刷新双 DMA 缓冲**（`LCD_DRAW_BUF_COUNT=2`）：`LCD_DRAW_BUF_LINES=40`（约 1/3 屏高），前一块在 SPI 刷出时 LVGL 渲染下一块；缓冲优先 PSRAM（`MALLOC_CAP_SPIRAM|DMA`），失败退回内部 DMA 池；LVGL 只渲染并刷新脏区域，SPI 事务由 esp_lcd panel_io 驱动（`trans_queue_depth=10`）。
 - 首帧 flush 完成后 `hw_lcd_display_on()` 点亮背光（避免开机黑屏/白屏闪烁）。
-- 刷新模式 `LV_DISPLAY_RENDER_MODE_FULL`，颜色 `LV_COLOR_FORMAT_RGB565_SWAPPED`，DPI 60。
+- 刷新模式 `LV_DISPLAY_RENDER_MODE_PARTIAL`，颜色 `LV_COLOR_FORMAT_RGB565_SWAPPED`，DPI 60。
 
-## 4. 按键驱动（hardware/buttons.c）
+## 4. 按键驱动（components/drivers/buttons/buttons.c）
 
 - 6 键低有效，硬件消抖 25ms（`BUTTON_DEBOUNCE_MS`）。
 - 上升沿采样 + 稳定窗口判定：`raw_changed_ms` 记变化时刻，稳定 25ms 后才进入已按状态。
 - 映射为 LVGL key：上=LV_KEY_UP、下=DOWN、左=LEFT、右=RIGHT、A=ENTER、B=ESC，经 keypad 输入设备回调 `hw_buttons_read()` 喂给 LVGL。
 
-## 5. SD 卡（hardware/sd.c）
+## 5. SD 卡（components/drivers/sd/sd.c）
 
 - SDSPI 复用 SPI2（SCLK/MOSI/MISO 与 LCD 共用），CS=22，上限 10MHz（`SD_SPI_MAX_FREQ_KHZ=10000`）。
 - `hw_sd_try_mount()` 启动时尝试挂载；挂载配置 `max_files=3`、`format_if_mount_failed=false`；失败/卸载后名称显示 "NO CARD"。
 - 暴露 `hw_sd_is_mounted()` / `hw_sd_name()` / `hw_sd_mb()` / `hw_sd_last_err()`，软件层不触碰卡内部。
 - 挂载点 `/sdcard`：播放器扫 `/sdcard/*.mp3`，电子书扫 `/sdcard/*.txt`。
 
-## 6. 音频输出（hardware/audio.c）
+## 6. 音频输出（components/drivers/audio/audio.c）
 
 - I2S 输出到 MAX98357（BCLK=25/LRC=32/DIN=33，无 MCLK；MAX98357 由 BCLK 自行派生主时钟）。
 - **解耦管线**：MP3 解码写入 256KB PCM 环形缓冲（优先 PSRAM，>1s @44.1kHz），`audio_feed` 任务（4KB 栈，优先级 6）负责从环形缓冲灌 I2S DMA——防爆音与欠载。
-- 输出前对 PCM 做 700Hz 喇叭保护高通（Q15 定点，就地滤波）。
-- 音量：初始化时预计算 101 项 Q15 对数锥度表（0~-40dB），`hw_audio_set_volume()` 即时生效，15ms 平滑渐变；`hw_audio_set_sample_rate()` 延迟到 feed 任务应用。
+- **DSP 链（喇叭路由，逐样本定点）**：700Hz 保护高通 → 250Hz 响度低音架（boost 0→+9dB 随音量下降）→ 主音量（~5ms 平滑）→ 软限幅（防削波）。蓝牙路由只加音量、全频段。
+- 音量：初始化预计算 **401 项** Q15 对数锥度表（0.1dB 步进，0~-40dB），喇叭与蓝牙各一独立槽位，`hw_audio_set_volume()` 即时生效并平滑渐变；`hw_audio_set_sample_rate()` 延迟到 feed 任务应用。
+- **通道驻车**：空闲或蓝牙路由时 feed 任务禁用 I2S 通道（MAX98357 掉电省流），快速续播有 3s 宽限窗口不重启时钟。
 - 路由互斥：蓝牙开启且已连接 → 仅走 BT（I2S 不喂数据，喇叭静音）；否则走喇叭；播放器经 `hw_audio_set_player_active()` 声明总线归属。
 - 详见 `docs/audio.md`。
 
-## 7. 蓝牙（hardware/bt_audio.c）
+## 7. 蓝牙（components/drivers/bt_audio/bt_audio.c）
 
 - BT Classic + Bluedroid，A2DP Source + AVRCP Target，懒启动（进蓝牙页才拉栈），见 `docs/bluetooth.md`。
 
-## 8. 启动顺序（main.c）
+## 8. 启动顺序（main/main.c）
 
 ```text
-nvs_flash_init
-  → hw_buttons_init()        GPIO + 消抖任务
+esp_log_level_set("BT_L2CAP", WARN)     降噪（BT 拥塞回调日志泛滥，见 main.c 注释）
+  → nvs_flash_init
+  → hw_buttons_init()        GPIO + 消抖
   → hw_lcd_init()            SPI/panel/ST7735 初始化
   → hw_audio_init()          I2S + MAX98357 + 环形缓冲 + feed 任务
   → bt_audio_init()          环形缓冲（不碰蓝牙控制器）
   → 注册 AVRCP 回调（cmd / volume）
   → hw_sd_try_mount()        SD 挂载（可失败）
-  → player_init() / ebook_init()   后台任务
+  → player_init() / ebook_init()   后台扫描/解码任务
   → lv_init → hw_lcd_create_display → ui_input_init → ui_start_tick_timer
   → xTaskCreate(lvgl_task, "lvgl", 10KB, 优先级 5)
 ```

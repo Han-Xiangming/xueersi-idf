@@ -6,7 +6,7 @@
 #include <sys/param.h>
 
 #include "board_config.h"
-#include "hardware/lcd.h"
+#include "lcd.h"
 
 #include "driver/spi_master.h"
 #include "esp_heap_caps.h"
@@ -50,7 +50,6 @@ static const char *TAG = "hw_lcd";
 static esp_lcd_panel_io_handle_t s_lcd_io_handle;
 static bool s_lcd_display_on;
 static volatile bool s_lcd_first_flush_done;
-static lv_draw_buf_t s_draw_buf3;
 
 static void st7735_tx_param(esp_lcd_panel_io_handle_t io_handle, int cmd, const void *param, size_t param_size)
 {
@@ -218,8 +217,9 @@ void hw_lcd_init(void)
     st7735_init_black_tab_rot90(io_handle);
 }
 
-/* Full-screen LVGL draw buffer. Prefer external PSRAM (DMA-capable); fall back
- * to the internal DMA pool if PSRAM is not present. */
+/* Partial-refresh draw buffers sized for LCD_DRAW_BUF_LINES lines. Prefer
+ * external PSRAM (DMA-capable); fall back to the internal DMA pool if PSRAM
+ * is not present. */
 static void *alloc_draw_buf(size_t sz)
 {
     void *p = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
@@ -231,42 +231,25 @@ static void *alloc_draw_buf(size_t sz)
 
 lv_display_t *hw_lcd_create_display(void)
 {
-#if LCD_DRAW_BUF_LINES != LCD_V_RES
-#error "Triple/full refresh mode requires LCD_DRAW_BUF_LINES to equal LCD_V_RES"
-#endif
-#if LCD_DRAW_BUF_COUNT != 3
-#error "This build is configured for full-screen triple buffering"
-#endif
-
     lv_display_t *display = lv_display_create(LCD_H_RES, LCD_V_RES);
     assert(display);
 
     const lv_color_format_t color_format = LV_COLOR_FORMAT_RGB565_SWAPPED;
     const uint32_t stride = lv_draw_buf_width_to_stride(LCD_H_RES, color_format);
     const size_t draw_buffer_sz = stride * LCD_DRAW_BUF_LINES;
-    /* Allocate the full-screen draw buffers from external PSRAM (DMA-capable)
-     * first; fall back to the internal DMA pool if PSRAM is unavailable.
-     * Using only spi_bus_dma_memory_alloc() draws from the very small internal
-     * DMA pool and the 3rd triple-buffer allocation fails on boot. */
+    /* Partial rendering: the draw buffers cover only LCD_DRAW_BUF_LINES lines,
+     * so LVGL refreshes just the dirty area of the panel. Allocate from
+     * external PSRAM (DMA-capable) first; fall back to the internal DMA pool
+     * if PSRAM is unavailable. Using only spi_bus_dma_memory_alloc() draws
+     * from the very small internal DMA pool and allocations fail on boot. */
     void *buf1 = alloc_draw_buf(draw_buffer_sz);
     void *buf2 = alloc_draw_buf(draw_buffer_sz);
-    void *buf3 = alloc_draw_buf(draw_buffer_sz);
     assert(buf1);
     assert(buf2);
-    assert(buf3);
 
     lv_display_set_color_format(display, color_format);
     lv_display_set_dpi(display, LCD_DPI);
-    lv_display_set_buffers(display, buf1, buf2, draw_buffer_sz, LV_DISPLAY_RENDER_MODE_FULL);
-    lv_result_t res = lv_draw_buf_init(&s_draw_buf3,
-                                       LCD_H_RES,
-                                       LCD_DRAW_BUF_LINES,
-                                       color_format,
-                                       stride,
-                                       buf3,
-                                       draw_buffer_sz);
-    assert(res == LV_RESULT_OK);
-    lv_display_set_3rd_draw_buffer(display, &s_draw_buf3);
+    lv_display_set_buffers(display, buf1, buf2, draw_buffer_sz, LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_set_user_data(display, s_lcd_io_handle);
     lv_display_set_flush_cb(display, lvgl_flush_cb);
 
@@ -276,11 +259,12 @@ lv_display_t *hw_lcd_create_display(void)
     ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(s_lcd_io_handle, &callbacks, display));
 
     ESP_LOGI(TAG,
-             "LVGL display: %dx%d, dpi=%d, %d full-screen DMA buffers, SPI=%d MHz",
+             "LVGL display: %dx%d, dpi=%d, %d partial-refresh DMA buffers of %d lines, SPI=%d MHz",
              LCD_H_RES,
              LCD_V_RES,
              LCD_DPI,
              LCD_DRAW_BUF_COUNT,
+             LCD_DRAW_BUF_LINES,
              LCD_PIXEL_CLOCK_HZ / 1000000);
 
     return display;

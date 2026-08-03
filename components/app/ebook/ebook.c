@@ -750,11 +750,6 @@ bool ebook_open(int idx)
     return true;
 }
 
-bool ebook_is_open(void)
-{
-    return s_is_open;
-}
-
 int ebook_page(void)
 {
     return s_page;

@@ -5,7 +5,7 @@
 ## 1. 总体结构
 
 ```text
-app/ui.c（页面控制器，不依赖具体硬件）
+app/ui/ui.c（页面控制器，不依赖具体硬件）
   ├─ 主菜单（BIOS 风格，仅列出部分页面）
   ├─ 页面容器（ui_make_page，整屏 160×128，深底）
   └─ hint 状态行（页面底部，toast 提示临时占用）
@@ -27,8 +27,8 @@ app/ui.c（页面控制器，不依赖具体硬件）
 | 蓝牙 | `UI_PAGE_BT` | A2DP 设备扫描/配对/连接 | `ui_build_bt` |
 | 设置 | `UI_PAGE_SETTINGS` | 音量/蓝牙/日志等级 | `ui_build_settings` |
 
-- 主菜单只列出 4 项：`MP3 Player`、`电子书`、`SD卡`、`设置`（蓝牙已并入设置页子页，见 §7）。
-- 电子书引擎在 `app/ebook.c`，UI 通过 `ebook.h` 公开 API 交互（见 `docs/ebook.md`）。
+- 主菜单只列出 4 项：`Music Player`、`电子书`、`SD卡`、`设置`（蓝牙已并入设置页子页，见 §7）。
+- 电子书引擎在 `app/ebook/ebook.c`，UI 通过 `ebook.h` 公开 API 交互（见 `docs/ebook.md`）。
 
 ## 3. 版面参数
 
@@ -43,7 +43,7 @@ app/ui.c（页面控制器，不依赖具体硬件）
 状态行：  y = 92（列表页状态）/ 106（SD、阅读页进度）；hint 一般 y=110
 ```
 
-- 全局字体 `lv_font_cn_12`（12px 全字库 CJK，`main/fonts/lv_font_cn_12.c`，行高 23）；阅读页文本区用 `line_space=-7` 压缩为 16px 行距。
+- 全局字体 `lv_font_cn_12`（12px 全字库 CJK，`components/fonts/lv_font_cn_12.c`，行高 23）；阅读页文本区用 `line_space=-7` 压缩为 16px 行距。
 - 所有文本 label 默认 144px 宽（`LCD_H_RES-16`）、`LV_LABEL_LONG_MODE_CLIP` 截断。
 
 ## 4. 按键映射
@@ -63,20 +63,20 @@ app/ui.c（页面控制器，不依赖具体硬件）
 
 ## 5. toast 与按键反馈
 
-- `set_action(msg)`：toast 延迟 `UI_ACTION_DELAY_MS=100ms` 出现、显示 `UI_ACTION_MSG_MS=850ms`；快速连按只更新文字并顺延，不反复延迟。toast 期间 `s_ui_dirty` 保持置位，保证过期后刷新回正常文本。
+- `set_action(msg)`：toast 在下一次刷新立即可见，显示 `UI_ACTION_MSG_MS=850ms`；快速连按只更新文字并顺延过期时间，不反复延迟。toast 期间 `s_ui_dirty` 保持置位，保证过期后刷新回正常文本。
 - toast 与普通状态行共用 `s_ui.hint`：`ui_set_hint(normal)` 在 toast 激活期显示 toast，否则显示 normal。
 - 阅读页 toast（下一页/上一页/第一页/最后一页）临时替换进度行，遮挡 SD 读取延迟。
 
 ## 6. 播放器页布局
 
 ```text
-y=2    标题 "MP3 Player"（橙）        右上 ">> / || / --"（播放状态）
+y=2    标题 "Music Player"（橙）        右上 ">> / || / --"（播放状态）
 y=22..76  曲目列表 4 行（选中青色）
 y=92   "空闲" / "无MP3文件" / 当前曲目名
 y=110  "上/下选择 A播放 B返回" / "上/下音量 A暂停 B停止"
 ```
 
-- 曲目列表来自 `player_scan()`（同步扫描，最多 64 首，末尾恒含 `(ROM) Test.mp3`，见 `docs/player.md`）。
+- 曲目列表由后台扫描任务发布（`player_scan_*`，最多 64 首，全部来自 SD 卡；UI 进页/检测到 SD 变化时请求重扫，见 `docs/player.md`）。
 - 无播放进度条：VBR MP3 字节偏移百分比不准确，UI 刻意不展示。
 
 ## 7. 设置页布局
@@ -88,7 +88,8 @@ y=70  "日志等级"  "Normal / Debug"
 y=110 "上/下选 A进入 左/右设 B返回"
 ```
 
-- 音量/蓝牙/日志等级持久化到 NVS（命名空间 `ui_cfg`：`volume` / `bt_on` / `log_dbg`）；变更置脏位，800ms 无操作后一次写入（`ui_settings_flush`）。
+- 音量/蓝牙/日志等级持久化到 NVS（命名空间 `ui_cfg`：`volume` / `vol_bt`（蓝牙音量槽位）/ `bt_on` / `log_dbg`）；变更置脏位，800ms 无操作后一次写入（`ui_settings_flush`）。
+- 音量行显示**当前生效路由**的音量（蓝牙已连时为蓝牙槽位，否则喇叭槽位）。
 - 选中"蓝牙"按 A 进入蓝牙页（自动把 BT 主开关置开、懒启动蓝牙栈）。
 - 日志等级控制 `player` / `hw_audio` / `bt_audio` 三个 tag 的运行时日志级别。
 
@@ -98,11 +99,13 @@ y=110 "上/下选 A进入 左/右设 B返回"
 y=2    标题 "蓝牙"                      右上（空）
 y=22..76  设备列表 4 行（扫描期间实时增长）
 y=92   "扫描中... N" / "N 个设备" / "无设备" / "已连接 <名>" / "配对码 NNNNNN"
+        / "配对中 <名>" / "配对失败"
 y=110  上下文提示（连接/断开/重试/扫描）
 ```
 
 - 进入页面即 `bt_audio_scan_start()`；设备列表只在 `bt_audio_device_version()` 递增时重格式化（MAC 回退名不反复拼接）。
 - 配对状态机：CONNECTING → PAIRING（SSP，显示 6 位配对码）→ OK/FAIL；失败 A 重试。
+- 连接自动重试（2s 退避，最多 4 次）期间仍显示"连接中..."，由 `bt_audio` 内部处理（见 `docs/bluetooth.md`）。
 
 ## 9. 阅读页布局
 

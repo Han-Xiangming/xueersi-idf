@@ -19,8 +19,12 @@
 #define LCD_H_RES               160
 #define LCD_V_RES               128
 
-#define LCD_DRAW_BUF_LINES      LCD_V_RES
-#define LCD_DRAW_BUF_COUNT      3
+/* Partial-refresh draw buffers: ~1/3 of the screen height (40 of 128 lines)
+ * so LVGL renders and flushes only dirty regions instead of the whole panel.
+ * Two buffers let LVGL render the next chunk while the previous one is being
+ * flushed over SPI. */
+#define LCD_DRAW_BUF_LINES      40
+#define LCD_DRAW_BUF_COUNT      2
 #define LCD_DPI                 60
 #define LCD_CMD_BITS            8
 #define LCD_PARAM_BITS          8

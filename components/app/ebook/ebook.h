@@ -24,7 +24,6 @@ const char *ebook_scan_name(int idx);  /* NUL-terminated, no path */
 
 bool ebook_open(int idx);              /* open book idx, position at page 1 */
 void ebook_close(void);
-bool ebook_is_open(void);
 
 int  ebook_page(void);                 /* current page, 1-based */
 int  ebook_page_count(void);           /* total pages; 0 until counted */

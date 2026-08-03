@@ -44,7 +44,7 @@ Main Menu
        └─ [阅读页]   UI_PAGE_EBOOK_READ    ← 单 Label 渲染，翻页式阅读
               │
               ▼
-        app/ebook.c  （读者核心，不依赖 LVGL）
+        app/ebook/ebook.c  （读者核心，不依赖 LVGL）
           ├─ SD 文件扫描（后台任务）+ 内置 ROM 测试书（EMBED_FILES）
           ├─ 流式窗口读者（4KB 块）+ UTF-8 解码 + 行排布 + 分页（确定性算法）
           ├─ 页起始偏移历史环（32 项）→ 向后翻页零重复布局
@@ -57,10 +57,10 @@ Main Menu
 
 | 文件 | 操作 | 内容 |
 | ---- | ---- | ---- |
-| `main/app/ebook.h` / `ebook.c` | 新增 | 读者核心：扫描、分页、翻页 |
-| `main/app/ui.h` | 修改 | 增加 `UI_PAGE_EBOOK_LIST`、`UI_PAGE_EBOOK_READ` |
-| `main/app/ui.c` | 修改 | 主菜单加"电子书"项；新增两个页面构建/刷新/按键分支 |
-| `main/text/Test.txt` | 新增 | EMBED_FILES 内置测试书（`EMBED_FILES "text/Test.txt"`），无 SD 也可读 |
+| `components/app/ebook/ebook.h` / `ebook.c` | 新增 | 读者核心：扫描、分页、翻页 |
+| `components/app/ui/ui.h` | 修改 | 增加 `UI_PAGE_EBOOK_LIST`、`UI_PAGE_EBOOK_READ` |
+| `components/app/ui/ui.c` | 修改 | 主菜单加"电子书"项；新增两个页面构建/刷新/按键分支 |
+| `components/app/ebook/Test.txt` | 新增 | EMBED_FILES 内置测试书（`EMBED_FILES "Test.txt"`），无 SD 也可读 |
 
 ***
 
@@ -78,7 +78,6 @@ const char *ebook_scan_name(int idx);
 
 bool ebook_open(int idx);                  /* 打开第 idx 本书，定位第 1 页 */
 void ebook_close(void);
-bool ebook_is_open(void);
 
 int  ebook_page(void);                     /* 当前页，1 起 */
 int  ebook_page_count(void);               /* 总页数；未算完为 0（后台算） */
@@ -139,8 +138,8 @@ const char *ebook_page_text(void);         /* 本页文本（行间 '\n'），�
 
 ```text
 =^_^=  ─────────────
-> MP3 Player
-  电子书        ← 新增（s_menu_pages 中插在 MP3 Player 之后、SD卡 之前）
+> Music Player
+  电子书        ← 新增（s_menu_pages 中插在 Music Player 之后、SD卡 之前）
   SD卡
   设置
   [1/4]   A:OK B:BK
@@ -204,7 +203,7 @@ const char *ebook_page_text(void);         /* 本页文本（行间 '\n'），�
 | 扫描 / 计数任务栈 | 4KB × 2 | — |
 | 翻页耗时 | 读 ~1KB + 布局 5 行 | 典型 < 20ms（历史环命中时零重复布局） |
 
-> 新增 DRAM 占用 < 5KB，对现有 60fps 三重缓冲无影响；SD 读发生在翻页瞬间，toast 遮挡期间完成。
+> 新增 DRAM 占用 < 5KB，对现有 60fps 部分刷新双缓冲无影响；SD 读发生在翻页瞬间，toast 遮挡期间完成。
 
 ***
 

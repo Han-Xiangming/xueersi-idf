@@ -12,7 +12,7 @@
  *   the user picks one in the BLUETOOTH UI page -> esp_a2d_source_connect() ->
  *   CONNECTED -> CHECK_SRC_RDY -> MEDIA START -> data callback pulls PCM.
  */
-#include "hardware/bt_audio.h"
+#include "bt_audio.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -69,11 +69,13 @@ static bt_avrc_volume_cb_t s_avrc_vol_cb;
 /* A2DP/SBC always streams at 44.1 kHz; other input rates are resampled. */
 #define BT_STREAM_RATE         44100
 
-/* SBC bitpool cap for the A2DP source, back to the stack default 53
- * (~328 kbps at 44.1 kHz joint stereo). Lowering it (45 ~= 279 kbps,
- * 37 ~= 229 kbps) helps weak/slow sinks stop flooding
- * "l2cab is_cong_cback_context", at the cost of codec quality. */
-#define BT_SBC_MAX_BITPOOL     53
+/* SBC bitpool cap for the A2DP source: raised to the A2DP maximum of 64
+ * (~385 kbps at 44.1 kHz joint stereo) for the best codec quality, instead
+ * of the stack default 53 (~328 kbps). The encoder still steps down to the
+ * sink's max_bitpool if it advertises a lower one. If a weak/slow sink
+ * floods "l2cab is_cong_cback_context", lower this to 53/45/37 to trade
+ * quality for a steadier stream. */
+#define BT_SBC_MAX_BITPOOL     64
 
 /* Preferred SBC capability advertised to sinks: same shape as the stack
  * default config, but with max_bitpool capped (see BT_SBC_MAX_BITPOOL).
