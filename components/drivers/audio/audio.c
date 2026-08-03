@@ -108,27 +108,11 @@ static void audio_set_hpf_coeff(uint32_t rate)
              (unsigned)rate, SPEAKER_HPF_FC_HZ, (int)s_hpf_lambda);
 }
 
-/* Clear the high-pass history (call when a track starts). */
-static void audio_hpf_reset(void)
-{
-    s_hpf_x1[0] = s_hpf_x1[1] = 0;
-    s_hpf_y1[0] = s_hpf_y1[1] = 0;
-}
-
-static uint8_t s_volume = 80;            /* master output volume, percent */
-static int32_t s_vol_gain;               /* Q15 linear gain actually applied */
-static int32_t s_vol_target;             /* Q15 linear gain we are ramping to */
-
-/* Volume smoothing: when the user changes the level mid-playback, jumping the
- * per-sample gain produces a sudden step in the waveform — an audible "pop /
- * click" (the gain itself is constant, so pitch/timbre are unchanged). We
- * instead ramp `s_vol_gain` linearly toward `s_vol_target` over a short window
- * so the gain change is continuous. RAMP_MS is the total transition time; the
- * per-sample increment is recomputed each write_pcm call from the current gap
- * and the number of samples being processed (so it always finishes within the
- * call, even for short bursts). */
-#define VOL_RAMP_MS        15
-static int32_t s_vol_step;               /* Q15 gain delta applied per sample */
+static uint8_t s_vol_speaker = 80;       /* per-route volume, percent */
+static uint8_t s_vol_bt      = 80;
+static uint8_t s_volume = 80;            /* active route volume (UI view) */
+static int32_t s_vol_gain;               /* target Q15 linear gain */
+static int32_t s_vol_gain_sm;            /* smoothed gain actually applied */
 
 /* Perceptual volume taper (built once at init into s_vol_tab).
  *
@@ -236,17 +220,77 @@ static void audio_update_vol_gain(void)
     else if (v > 100) {
         v = 100;
     }
-    /* Sets the target only; s_vol_gain is ramped toward it sample-by-sample in
-     * hw_audio_write_pcm() to avoid step-noise. Initialize both at startup. */
-    s_vol_target = s_vol_tab[v];
+    if (v == 0) {
+        s_vol_gain = 0;                  /* hard mute */
+        return;
+    }
+    float dB = ((float)v / 100.0f - 1.0f) * (float)VOL_MAX_ATTEN_DB;
+    s_vol_gain = s_vol_tab[vol_tab_index(dB)];
+    audio_update_loudness_boost();
 }
 
-/* Snap the applied gain straight to the target (no ramp): used at init and on
- * route/track changes where a smooth transition is neither needed nor wanted. */
-static void audio_vol_gain_snap(void)
+/* Switch the active volume to the current route's slot. Called on route
+ * changes (see hw_audio_write_pcm) so the gain follows the new route;
+ * the write-side fade-in masks the transition. */
+static void audio_select_route(void)
 {
-    s_vol_gain = s_vol_target;
-    s_vol_step = 0;
+    s_volume = audio_route_is_bt() ? s_vol_bt : s_vol_speaker;
+    audio_update_vol_gain();
+}
+
+/* --- Loudness compensation (volume-dependent bass shelf) ----------------
+ * At low output levels the ear is far less sensitive to low frequencies, so
+ * quiet playback sounds thin. A one-pole low-pass is run in parallel with the
+ * main path and added back with a boost that grows as the volume falls:
+ *
+ *     y = x + boost(v) * lp(x),   boost(v) = 10^(dB/20) - 1
+ *     dB = (1 - v/100) * LOUDNESS_MAX_DB      (0 dB at v=100, +9 dB at v=0)
+ *
+ * At full volume the boost is 0 dB, so the shelf only adds level where the
+ * master gain is small; the soft limiter below still bounds the peaks. */
+#define SPEAKER_LOUDNESS_FC_HZ 250   /* shelf low-pass corner (Hz) */
+
+static void audio_set_loudness_coeff(uint32_t rate)
+{
+    if (rate == 0) {
+        return;
+    }
+    float alpha = 1.0f - expf(-AUDIO_2PI * (float)SPEAKER_LOUDNESS_FC_HZ
+                              / (float)rate);
+    s_lp_coeff = (int32_t)(alpha * 32768.0f);
+    if (s_lp_coeff < 1) {
+        s_lp_coeff = 1;                /* keep strictly stable */
+    }
+    else if (s_lp_coeff > 32767) {
+        s_lp_coeff = 32767;
+    }
+}
+
+/* --- Soft limiter (anti-clipping) ---------------------------------------
+ * A hot track at v=100 passes 0 dB straight to the DAC and clips. A peak
+ * envelope (instant attack, ~100 ms release) drives a gain that drops fast
+ * (~0.5 ms) above the threshold and recovers slowly, so transients are tamed
+ * without pumping. The gain curve is piecewise-linear, so no division runs
+ * per sample: below the threshold the limiter is flat 0 dB, above it the
+ * gain falls linearly to ~0.9 at full scale. */
+#define LOUD_LIMIT_THRESH     30000  /* peaks above this get tamed (FS=32767) */
+#define LOUD_LIMIT_SLOPE_Q15  38807  /* gain(env=32767) = 0.9 (-0.9 dB) */
+#define LOUD_LIMIT_MIN_Q15    24576  /* gain floor (0.75), unreachable here */
+#define LIM_ATT_Q15           1453   /* gain drop, ~0.5 ms @ 44.1 kHz */
+#define LIM_REL_Q15           32753  /* envelope & gain release, ~100 ms */
+static int32_t s_lim_env;             /* peak envelope */
+static int32_t s_lim_gain;            /* smoothed limiter gain, Q15 */
+
+/* Clear all per-track DSP history (call when a track starts or the route
+ * switches). The limiter resets to flat gain so the first samples of a new
+ * track are never ducked by the previous track's peak envelope. */
+static void audio_dsp_reset(void)
+{
+    s_hpf_x1[0] = s_hpf_x1[1] = 0;
+    s_hpf_y1[0] = s_hpf_y1[1] = 0;
+    s_lp_state[0] = s_lp_state[1] = 0;
+    s_lim_env = 0;
+    s_lim_gain = 32768;
 }
 
 /* Apply a sample-rate change. Must only be called from the feed task so it is
@@ -426,7 +470,9 @@ void hw_audio_init(void)
     audio_set_loudness_coeff(s_rate); /* default-rate loudness shelf coeff */
     audio_build_vol_table();          /* precompute the 0.1 dB gain table */
     audio_update_vol_gain();
-    audio_vol_gain_snap();             /* start at the configured level, no ramp */
+    s_vol_gain_sm = s_vol_gain;       /* start settled: no fade-in from zero */
+    s_loud_boost_sm = s_loud_boost;   /* shelf boost settled too */
+    s_lim_gain = 32768;               /* limiter flat until audio starts */
     xTaskCreate(audio_feed_task, "audio_feed", 4 * 1024, NULL, 6, &s_feed_task);
 }
 
@@ -568,38 +614,17 @@ void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
     static bool s_prev_bt_out;
     if (bt_out != s_prev_bt_out) {
         s_prev_bt_out = bt_out;
-        audio_hpf_reset();         /* fresh filter history on route switch */
-        audio_vol_gain_snap();     /* no ramp across a route change */
-        ESP_LOGI(TAG, "audio route -> %s", bt_out ? "bluetooth" : "speaker");
+        audio_select_route();      /* switch to the new route's volume */
+        audio_dsp_reset();         /* fresh filter history on route switch */
+        s_vol_gain_sm = 0;         /* fade in the newly active route */
+        s_fade_in_rem = VOL_FADE_IN_SAMPLES;
+        ESP_LOGI(TAG, "audio route -> %s (vol %u%%)",
+                 bt_out ? "bluetooth" : "speaker", (unsigned)s_volume);
     }
 
+    const int32_t g_target = s_vol_gain;    /* Q15 target logarithmic gain */
+    int32_t g = s_vol_gain_sm;              /* smoothed gain to apply */
     size_t n = frames * 2;
-
-    /* Prepare the volume ramp: if the applied gain differs from the target,
-     * compute a per-sample increment so the gain (and thus `s_vol_gain`) moves
-     * from its current value to `s_vol_target` across these `n` samples.
-     * VOL_RAMP_MS worth of samples is used as the reference, but the step is
-     * clamped so a partial buffer still completes the transition within the
-     * call — keeping the change click-free without ever leaving a stale gain. */
-    int32_t g = s_vol_gain;
-    if (g != s_vol_target) {
-        int32_t ramp_samples = (int32_t)((uint64_t)s_rate * VOL_RAMP_MS / 1000u);
-        if (ramp_samples < 1) {
-            ramp_samples = 1;
-        }
-        int32_t remaining = (int32_t)n;
-        if (remaining > ramp_samples) {
-            remaining = ramp_samples;       /* cap ramp length to VOL_RAMP_MS */
-        }
-        s_vol_step = (s_vol_target - g) / remaining;
-        if (s_vol_step == 0) {
-            /* gap smaller than 1 LSB over the ramp: jump on the last sample */
-            s_vol_step = (s_vol_target > g) ? 1 : -1;
-        }
-    }
-    else {
-        s_vol_step = 0;
-    }
 
     if (bt_out) {
         /* Bluetooth route: volume only, full band. The blocking send inside
@@ -613,15 +638,8 @@ void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
             }
             g += ((g_target - g) * a) >> 15;
             stereo_frames[i] = (int16_t)(((int32_t)stereo_frames[i] * g) >> 15);
-            if (s_vol_step != 0 && g != s_vol_target) {
-                g += s_vol_step;
-                if ((s_vol_step > 0 && g >= s_vol_target) ||
-                    (s_vol_step < 0 && g <= s_vol_target)) {
-                    g = s_vol_target;
-                }
-            }
         }
-        s_vol_gain = g;
+        s_vol_gain_sm = g;
         bt_audio_write_pcm(stereo_frames, frames);
         return;
     }
@@ -642,17 +660,48 @@ void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
             else if (y < -32768) {
                 y = -32768;
             }
-            y = (y * g) >> 15;               /* apply (ramped) logarithmic volume */
-            stereo_frames[i] = (int16_t)y;
-            if (s_vol_step != 0 && g != s_vol_target) {
-                g += s_vol_step;
-                if ((s_vol_step > 0 && g >= s_vol_target) ||
-                    (s_vol_step < 0 && g <= s_vol_target)) {
-                    g = s_vol_target;
+
+            /* Loudness: add back the volume-dependent bass shelf */
+            int32_t lp = s_lp_state[ch]
+                         + (((y - s_lp_state[ch]) * s_lp_coeff) >> 15);
+            s_lp_state[ch] = lp;
+            s_loud_boost_sm += ((s_loud_boost - s_loud_boost_sm) * VOL_SMOOTH_A_Q15) >> 15;
+            y = y + ((s_loud_boost_sm * lp) >> 15);
+            if (y > 32767) {
+                y = 32767;
+            }
+            else if (y < -32768) {
+                y = -32768;
+            }
+
+            g += ((g_target - g) * (s_fade_in_rem-- > 0 ? VOL_FADE_IN_A_Q15
+                                                         : VOL_SMOOTH_A_Q15)) >> 15;
+            y = (y * g) >> 15;               /* apply logarithmic volume */
+
+            /* Soft limiter: tame peaks above the threshold */
+            int32_t a = (y < 0) ? -y : y;
+            if (a > s_lim_env) {
+                s_lim_env = a;               /* instant peak attack */
+            }
+            else {
+                s_lim_env = (s_lim_env * LIM_REL_Q15) >> 15;   /* slow release */
+            }
+            int32_t tg = 32768;              /* flat 0 dB below threshold */
+            if (s_lim_env > LOUD_LIMIT_THRESH) {
+                tg = 32768 - (((s_lim_env - LOUD_LIMIT_THRESH) * LOUD_LIMIT_SLOPE_Q15) >> 15);
+                if (tg < LOUD_LIMIT_MIN_Q15) {
+                    tg = LOUD_LIMIT_MIN_Q15;
                 }
             }
+            if (tg < s_lim_gain) {
+                s_lim_gain += ((tg - s_lim_gain) * LIM_ATT_Q15) >> 15;
+            }
+            else {
+                s_lim_gain += ((tg - s_lim_gain) * LIM_REL_Q15) >> 15;
+            }
+            y = (y * s_lim_gain) >> 15;
+            stereo_frames[i] = (int16_t)y;
         }
-        s_vol_gain = g;
     }
     s_vol_gain_sm = g;
 
