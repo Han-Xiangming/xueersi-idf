@@ -9,6 +9,7 @@
 #include "lcd.h"
 
 #include "driver/spi_master.h"
+#include "driver/ledc.h"
 #include "esp_heap_caps.h"
 #include "esp_err.h"
 #include "esp_lcd_panel_io.h"
@@ -39,6 +40,14 @@ static const char *TAG = "hw_lcd";
 static esp_lcd_panel_io_handle_t s_lcd_io_handle;
 static bool s_lcd_display_on;
 static volatile bool s_lcd_first_flush_done;
+
+/* Backlight PWM (LEDC) on PIN_NUM_LCD_BL. 0..100 % maps to 0..duty_max. */
+#define BL_LEDC_TIMER         LEDC_TIMER_1
+#define BL_LEDC_CHANNEL       LEDC_CHANNEL_1
+#define BL_LEDC_SPEED_HZ      5000
+#define BL_LEDC_DUTY_RES      LEDC_TIMER_10_BIT   /* 0..1023 */
+#define BL_DUTY_MAX           ((1 << 10) - 1)
+static bool s_bl_inited;
 
 static void st7789_tx_param(esp_lcd_panel_io_handle_t io_handle, int cmd, const void *param, size_t param_size)
 {
@@ -181,6 +190,9 @@ static void lvgl_flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t 
     lv_display_flush_ready(display);
 }
 
+/* Forward declaration so hw_lcd_init() can call it before its definition. */
+static void backlight_init(void);
+
 void hw_lcd_init(void)
 {
     ESP_LOGI(TAG, "Initialize SPI bus for ST7789 TFT");
@@ -212,6 +224,8 @@ void hw_lcd_init(void)
     s_lcd_display_on = false;
     s_lcd_first_flush_done = false;
     st7789_init_240x320_rot90(io_handle);
+
+    backlight_init();   /* default PWM at full brightness until UI overrides */
 }
 
 /* Partial-refresh draw buffers sized for LCD_DRAW_BUF_LINES lines. Prefer
@@ -270,6 +284,49 @@ lv_display_t *hw_lcd_create_display(void)
 void hw_lcd_display_on(void)
 {
     lcd_display_on();
+}
+
+/* Configure LEDC timer + channel to drive the backlight pin with a 5 kHz PWM.
+ * Active-high: duty 0 = off, BL_DUTY_MAX = full brightness. */
+static void backlight_init(void)
+{
+    if (s_bl_inited) {
+        return;
+    }
+
+    const ledc_timer_config_t timer_cfg = {
+        .speed_mode      = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = BL_LEDC_DUTY_RES,
+        .timer_num       = BL_LEDC_TIMER,
+        .freq_hz         = BL_LEDC_SPEED_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&timer_cfg));
+
+    const ledc_channel_config_t chan_cfg = {
+        .gpio_num   = PIN_NUM_LCD_BL,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel    = BL_LEDC_CHANNEL,
+        .timer_sel  = BL_LEDC_TIMER,
+        .duty       = BL_DUTY_MAX,   /* default: full brightness */
+        .hpoint     = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&chan_cfg));
+    s_bl_inited = true;
+}
+
+/* Set backlight brightness as a percentage (0..100). Clamped to range. */
+void hw_lcd_set_backlight(uint8_t percent)
+{
+    if (percent > 100) {
+        percent = 100;
+    }
+    if (!s_bl_inited) {
+        backlight_init();
+    }
+    const uint32_t duty = (BL_DUTY_MAX * percent) / 100;
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, duty));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL));
 }
 
 bool hw_lcd_first_flush_done(void)

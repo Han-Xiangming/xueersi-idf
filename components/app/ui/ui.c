@@ -13,6 +13,7 @@
 #include "buttons.h"
 #include "audio.h"
 #include "bt_audio.h"
+#include "lcd.h"
 #include "sd.h"
 #include "ui.h"
 #include "player.h"
@@ -63,17 +64,22 @@ static const ui_page_t s_menu_pages[] = {
  * Add new options here and they appear automatically in the list. */
 typedef enum {
     SETTING_VOLUME = 0,
+    SETTING_BACKLIGHT,
     SETTING_BTOUT,
     SETTING_LOG,
     SETTING_COUNT,
 } setting_item_t;
 
-static const int s_setting_y[SETTING_COUNT] = {38, 68, 98};
+static const int s_setting_y[SETTING_COUNT] = {38, 68, 98, 128};
 
 /* Verbose (DEBUG) logging; off = normal INFO. Covers the audio/player tags
  * and the Bluetooth stack (our bt_audio wrapper plus the classic-BT Bluedroid
  * components that surface discovery / connection internals). */
 static bool s_log_debug;
+
+/* Backlight brightness (0..100 %), driven via PWM on PIN_NUM_LCD_BL.
+ * Persisted to NVS; restored at boot. */
+static uint8_t s_backlight = 70;
 
 /* Bluetooth output master switch (settings page ON/OFF). Persisted to NVS;
  * restored at boot. Drives bt_audio_set_enabled() — the audio routing gate. */
@@ -95,6 +101,7 @@ static void ui_apply_log_level(void)
 #define UI_NVS_VOLBT   "vol_bt"
 #define UI_NVS_LOGDBG  "log_dbg"
 #define UI_NVS_BT      "bt_on"
+#define UI_NVS_BACKL   "backlight"
 
 static void ui_settings_load(void)
 {
@@ -105,10 +112,14 @@ static void ui_settings_load(void)
     int32_t v = -1;
     if (nvs_get_i32(h, UI_NVS_VOLUME, &v) == ESP_OK && v >= 0 && v <= 100) {
         hw_audio_set_speaker_volume((uint8_t)v);
+    } else {
+        hw_audio_set_speaker_volume(30);   /* default speaker volume 30% */
     }
     v = -1;
     if (nvs_get_i32(h, UI_NVS_VOLBT, &v) == ESP_OK && v >= 0 && v <= 100) {
         hw_audio_set_bt_volume((uint8_t)v);
+    } else {
+        hw_audio_set_bt_volume(30);        /* default BT volume 30% */
     }
     int32_t dbg = 0;
     if (nvs_get_i32(h, UI_NVS_LOGDBG, &dbg) == ESP_OK) {
@@ -119,6 +130,13 @@ static void ui_settings_load(void)
     if (nvs_get_i32(h, UI_NVS_BT, &bt) == ESP_OK) {
         s_bt_on = (bt != 0);
         bt_audio_set_enabled(s_bt_on);
+    }
+    int32_t bl = -1;
+    if (nvs_get_i32(h, UI_NVS_BACKL, &bl) == ESP_OK && bl >= 0 && bl <= 100) {
+        s_backlight = (uint8_t)bl;
+        hw_lcd_set_backlight(s_backlight);
+    } else {
+        hw_lcd_set_backlight(s_backlight);
     }
     nvs_close(h);
 }
@@ -154,12 +172,23 @@ static void ui_settings_save_bt(void)
     }
 }
 
+static void ui_settings_save_backlight(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, UI_NVS_BACKL, (int32_t)s_backlight);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
 /* Debounced persistence: a setting change only marks a dirty bit and arms a
  * timer; ui_settings_flush() (called every refresh) commits once the user
  * stops tweaking, folding long-press repeats into a single NVS write. */
 #define SETTINGS_DIRTY_VOLUME   (1u << 0)
 #define SETTINGS_DIRTY_LOG      (1u << 1)
 #define SETTINGS_DIRTY_BT       (1u << 2)
+#define SETTINGS_DIRTY_BACKL    (1u << 3)
 
 static uint32_t s_save_pending;
 static uint32_t s_save_at_ms;
@@ -186,6 +215,9 @@ static void ui_settings_flush(void)
     }
     if (s_save_pending & SETTINGS_DIRTY_BT) {
         ui_settings_save_bt();
+    }
+    if (s_save_pending & SETTINGS_DIRTY_BACKL) {
+        ui_settings_save_backlight();
     }
     s_save_pending = 0;
 }
@@ -493,7 +525,7 @@ static void ui_set_hint(const char *normal)
 static void ui_build_settings(lv_obj_t *page)
 {
     s_setting_sel = 0;
-    static const char *const labels[SETTING_COUNT] = {"音量", "蓝牙", "日志等级"};
+    static const char *const labels[SETTING_COUNT] = {"音量", "背光", "蓝牙", "日志等级"};
 
     for (int i = 0; i < SETTING_COUNT; i++) {
         lv_obj_t *cur = lv_label_create(page);
@@ -982,6 +1014,9 @@ void ui_refresh(void)
                     snprintf(buf, sizeof(buf), "开");
                 }
                 break;
+            case SETTING_BACKLIGHT:
+                snprintf(buf, sizeof(buf), "%u%%", (unsigned)s_backlight);
+                break;
             case SETTING_LOG:
                 snprintf(buf, sizeof(buf), "%s", s_log_debug ? "Debug" : "Normal");
                 break;
@@ -1436,6 +1471,24 @@ static void ui_adjust_lr(int dir)
         ui_settings_mark_dirty(SETTINGS_DIRTY_BT);
         set_action(s_bt_on ? "蓝牙开" : "蓝牙关");
         break;
+    case SETTING_BACKLIGHT: {
+        /* Same stepping as volume: 1% steps at/below 10% (down), else 10%. */
+        int v = (int)s_backlight;
+        int step = (v < 10 || (v == 10 && dir < 0)) ? 1 : 10;
+        v += dir * step;
+        /* Snap coarse upward moves onto multiples of 10 once out of the fine
+         * zone (9% + coarse -> 10%), keeping the scale tidy like volume. */
+        if (step == 1 && dir > 0 && v > 10) {
+            v = 10;
+        }
+        s_backlight = (uint8_t)MAX(0, MIN(v, 100));
+        hw_lcd_set_backlight(s_backlight);
+        ui_settings_mark_dirty(SETTINGS_DIRTY_BACKL);
+        char buf[24];
+        snprintf(buf, sizeof(buf), "背光 %u%%", (unsigned)s_backlight);
+        set_action(buf);
+        break;
+    }
     default:
         return;
     }

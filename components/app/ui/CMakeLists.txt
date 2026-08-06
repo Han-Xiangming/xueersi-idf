@@ -8,6 +8,7 @@ idf_component_register(
              ebook
              esp_timer
              fonts
+             lcd
              lvgl
              nvs_flash
              player

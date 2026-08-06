@@ -38,6 +38,9 @@
 #define PIN_NUM_LCD_CS          GPIO_NUM_5
 #define PIN_NUM_LCD_DC          GPIO_NUM_4
 
+/* LCD backlight (active-high PWM on GPIO 14, see lcd.c). */
+#define PIN_NUM_LCD_BL          GPIO_NUM_14
+
 /* SD card (SDSPI on shared SPI2) */
 #define PIN_NUM_SD_CS           GPIO_NUM_22
 #define SD_SPI_MAX_FREQ_KHZ     10000

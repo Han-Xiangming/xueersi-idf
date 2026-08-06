@@ -24,3 +24,6 @@ void hw_lcd_display_on(void);
 
 /* True once the first frame has been pushed to the panel. */
 bool hw_lcd_first_flush_done(void);
+
+/* Set backlight brightness as a percentage (0..100) via PWM on PIN_NUM_LCD_BL. */
+void hw_lcd_set_backlight(uint8_t percent);

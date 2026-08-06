@@ -361,22 +361,71 @@ static size_t layout_page(reader_t *r, size_t start, char *out, size_t cap)
         }
 
         if (cp >= 0x21 && cp <= 0x7E) {
-            /* ASCII run = unbreakable word (letters/digits and '-' '.' '/' etc);
-             * breaking only between words keeps '--', route numbers and URLs
-             * intact (docs/ebook.md 4.3). */
+            /* ASCII run. We only protect real words (a run that contains at
+             * least one letter/digit: route numbers, URLs, "9路" style tokens)
+             * from being split. Pure separators (only '-' '.' '/' ' ' etc, no
+             * alphanumeric) are breakable so route lists such as
+             *   "赣州六中 -- 工业路口 -- 华坚鞋城 -- ..."
+             * can break at the separator instead of pushing the whole "-- "
+             * run to the next line (which left the previous line short and put
+             * an ugly "--" at the next line's head). See docs/ebook.md 4.2(4). */
             size_t run_off = po;
             uint32_t run_w = 0;
+            int has_alnum = 0;
+            size_t last_space = 0;   /* offset just after a space in the run */
+            int has_space = 0;
             while (1) {
                 int bo = reader_byte(r, run_off);
                 if (bo < 0x21 || bo > 0x7E) {
                     break;
                 }
                 run_w += s_ascii_w16[bo];
+                if ((bo >= '0' && bo <= '9') ||
+                    (bo >= 'A' && bo <= 'Z') ||
+                    (bo >= 'a' && bo <= 'z')) {
+                    has_alnum = 1;
+                }
+                if (bo == ' ') {
+                    last_space = run_off + 1;
+                    has_space = 1;
+                }
                 run_off++;
             }
+
             if (w16 > 0 && w16 + run_w > EBOOK_LINE_W16) {
+                if (has_alnum) {
+                    /* Real word: keep it intact — break before it (and drop
+                     * the dangling space already placed at line end). */
+                    line_drop_space(out, &out_len, &w16, &last_sp);
+                    line_end(out, &out_len, cap, &line, &w16);
+                    continue;
+                }
+                /* Pure separator run (e.g. "-- " or ". "). Try to break inside
+                 * at the last space so the next line starts with the following
+                 * CJK word instead of a hanging "-- ". */
+                if (has_space && w16 + (run_w - (uint32_t)(last_space - po) * 0) > 0) {
+                    /* Width of the part after the last space. */
+                    uint32_t tail_w = 0;
+                    for (size_t k = last_space; k < run_off; k++) {
+                        tail_w += s_ascii_w16[reader_byte(r, k)];
+                    }
+                    if (w16 + tail_w <= EBOOK_LINE_W16 && tail_w > 0) {
+                        /* Keep everything up to the last space on this line. */
+                        while (po < last_space) {
+                            page_putc(out, &out_len, cap, (char)reader_byte(r, po));
+                            w16 += s_ascii_w16[reader_byte(r, po)];
+                            po++;
+                        }
+                        line_drop_space(out, &out_len, &w16, &last_sp);
+                        line_end(out, &out_len, cap, &line, &w16);
+                        continue;
+                    }
+                }
+                /* Separator run does not fit at all: drop it, next line starts
+                 * with the following CJK word (no hanging "--" at line head). */
                 line_drop_space(out, &out_len, &w16, &last_sp);
                 line_end(out, &out_len, cap, &line, &w16);
+                o = run_off;
                 continue;
             }
             while (po < run_off) {
