@@ -1,9 +1,9 @@
 /*
- * Hardware layer: ST7735 LCD driver and LVGL display binding.
+ * Hardware layer: ST7789 LCD driver and LVGL display binding.
  *
  * Owns the SPI bus, the panel IO handle and the LVGL display object.
  * Exposes a ready-to-use lv_display_t; the software layer must not
- * touch low-level ST7735 commands.
+ * touch low-level ST7789 commands.
  */
 #pragma once
 
@@ -13,7 +13,7 @@
 #include "esp_lcd_panel_io.h"
 #include "lvgl.h"
 
-/* Initialize SPI bus, panel IO and run the ST7735 init sequence. */
+/* Initialize SPI bus, panel IO and run the ST7789 init sequence. */
 void hw_lcd_init(void);
 
 /* Create and configure the LVGL display (draw buffers + flush binding). */

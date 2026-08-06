@@ -14,12 +14,12 @@
 #define LCD_PIXEL_CLOCK_HZ      (60 * 1000 * 1000)
 
 /* Native (controller) and rotated (90 deg) display resolution */
-#define LCD_NATIVE_H_RES        128
-#define LCD_NATIVE_V_RES        160
-#define LCD_H_RES               160
-#define LCD_V_RES               128
+#define LCD_NATIVE_H_RES        240
+#define LCD_NATIVE_V_RES        320
+#define LCD_H_RES               320
+#define LCD_V_RES               240
 
-/* Partial-refresh draw buffers: ~1/3 of the screen height (40 of 128 lines)
+/* Partial-refresh draw buffers: 40 of 240 lines
  * so LVGL renders and flushes only dirty regions instead of the whole panel.
  * Two buffers let LVGL render the next chunk while the previous one is being
  * flushed over SPI. */
@@ -31,7 +31,7 @@
 #define LCD_X_GAP               0
 #define LCD_Y_GAP               0
 
-/* LCD / ST7735 pins */
+/* LCD / ST7789 pins */
 #define PIN_NUM_LCD_SCLK        GPIO_NUM_18
 #define PIN_NUM_LCD_MOSI        GPIO_NUM_23
 #define PIN_NUM_LCD_MISO        GPIO_NUM_19
@@ -43,6 +43,6 @@
 #define SD_SPI_MAX_FREQ_KHZ     10000
 
 /* I2S audio output (MAX98357 Class-D DAC, internal PLL, no MCLK) */
-#define PIN_NUM_I2S_BCLK        GPIO_NUM_25
-#define PIN_NUM_I2S_LRC         GPIO_NUM_32
-#define PIN_NUM_I2S_DIN         GPIO_NUM_33
+#define PIN_NUM_I2S_BCLK        GPIO_NUM_32
+#define PIN_NUM_I2S_LRC         GPIO_NUM_15
+#define PIN_NUM_I2S_DIN         GPIO_NUM_21

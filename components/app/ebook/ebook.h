@@ -3,7 +3,7 @@
  *
  * Streams UTF-8 plain-text books from the SD card (/sdcard, all .txt files,
  * plus a built-in ROM test book) and lays them out into fixed 5-line pages
- * that fit the 160x128 ST7735 screen with the 12px CJK font. Pagination is
+ * with the 16px CJK font. Pagination is
  * deterministic (independent of LVGL), so forward/backward flips and the
  * background page-count task always agree. See docs/ebook.md.
  */

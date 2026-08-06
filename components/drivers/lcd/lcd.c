@@ -1,5 +1,5 @@
 /*
- * Hardware layer: ST7735 LCD driver and LVGL display binding.
+ * Hardware layer: ST7789 LCD driver and LVGL display binding.
  * See hardware/lcd.h.
  */
 #include <assert.h>
@@ -17,30 +17,19 @@
 
 static const char *TAG = "hw_lcd";
 
-/* ST7735 command set */
-#define ST7735_SWRESET              0x01
-#define ST7735_SLPOUT               0x11
-#define ST7735_NORON                0x13
-#define ST7735_INVOFF               0x20
-#define ST7735_DISPOFF              0x28
-#define ST7735_DISPON               0x29
-#define ST7735_CASET                0x2A
-#define ST7735_RASET                0x2B
-#define ST7735_RAMWR                0x2C
-#define ST7735_MADCTL               0x36
-#define ST7735_COLMOD               0x3A
-#define ST7735_FRMCTR1              0xB1
-#define ST7735_FRMCTR2              0xB2
-#define ST7735_FRMCTR3              0xB3
-#define ST7735_INVCTR               0xB4
-#define ST7735_PWCTR1               0xC0
-#define ST7735_PWCTR2               0xC1
-#define ST7735_PWCTR3               0xC2
-#define ST7735_PWCTR4               0xC3
-#define ST7735_PWCTR5               0xC4
-#define ST7735_VMCTR1               0xC5
-#define ST7735_GMCTRP1              0xE0
-#define ST7735_GMCTRN1              0xE1
+/* ST7789 command set */
+#define ST7789_SWRESET              0x01
+#define ST7789_SLPOUT               0x11
+#define ST7789_NORON                0x13
+#define ST7789_INVOFF               0x20
+#define ST7789_INVON                0x21
+#define ST7789_DISPOFF              0x28
+#define ST7789_DISPON               0x29
+#define ST7789_CASET                0x2A
+#define ST7789_RASET                0x2B
+#define ST7789_RAMWR                0x2C
+#define ST7789_MADCTL               0x36
+#define ST7789_COLMOD               0x3A
 
 #define MADCTL_MY                   0x80
 #define MADCTL_MX                   0x40
@@ -51,90 +40,67 @@ static esp_lcd_panel_io_handle_t s_lcd_io_handle;
 static bool s_lcd_display_on;
 static volatile bool s_lcd_first_flush_done;
 
-static void st7735_tx_param(esp_lcd_panel_io_handle_t io_handle, int cmd, const void *param, size_t param_size)
+static void st7789_tx_param(esp_lcd_panel_io_handle_t io_handle, int cmd, const void *param, size_t param_size)
 {
     ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, cmd, param, param_size));
 }
 
-static void st7735_delay_ms(uint32_t ms)
+static void st7789_delay_ms(uint32_t ms)
 {
     vTaskDelay(pdMS_TO_TICKS(ms));
 }
 
-static void st7735_clear_black(esp_lcd_panel_io_handle_t io_handle)
+static void st7789_clear_black(esp_lcd_panel_io_handle_t io_handle)
 {
     static uint16_t line[LCD_H_RES * 8];
-    const uint8_t caset[] = {0x00, 0x00, 0x00, LCD_H_RES - 1};
+    const uint8_t caset[] = {
+        0x00, 0x00,
+        (LCD_H_RES - 1) >> 8, (LCD_H_RES - 1) & 0xFF,
+    };
 
     memset(line, 0, sizeof(line));
-    ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, ST7735_CASET, caset, sizeof(caset)));
+    ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, ST7789_CASET, caset, sizeof(caset)));
     for (uint16_t y = 0; y < LCD_V_RES; y += 8) {
         const uint16_t y2 = MIN((uint16_t)(y + 7), (uint16_t)(LCD_V_RES - 1));
         const uint8_t raset[] = {
             y >> 8, y & 0xFF,
             y2 >> 8, y2 & 0xFF,
         };
-        ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, ST7735_RASET, raset, sizeof(raset)));
-        ESP_ERROR_CHECK(esp_lcd_panel_io_tx_color(io_handle, ST7735_RAMWR, line, (y2 - y + 1) * LCD_H_RES * sizeof(uint16_t)));
+        ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, ST7789_RASET, raset, sizeof(raset)));
+        ESP_ERROR_CHECK(esp_lcd_panel_io_tx_color(io_handle, ST7789_RAMWR, line, (y2 - y + 1) * LCD_H_RES * sizeof(uint16_t)));
     }
 }
 
-static void st7735_init_black_tab_rot90(esp_lcd_panel_io_handle_t io_handle)
+static void st7789_init_240x320_rot90(esp_lcd_panel_io_handle_t io_handle)
 {
-    const uint8_t frmctr[] = {0x01, 0x2C, 0x2D};
-    const uint8_t frmctr3[] = {0x01, 0x2C, 0x2D, 0x01, 0x2C, 0x2D};
-    const uint8_t invctr[] = {0x07};
-    const uint8_t pwctr1[] = {0xA2, 0x02, 0x84};
-    const uint8_t pwctr2[] = {0xC5};
-    const uint8_t pwctr3[] = {0x0A, 0x00};
-    const uint8_t pwctr4[] = {0x8A, 0x2A};
-    const uint8_t pwctr5[] = {0x8A, 0xEE};
-    const uint8_t vmctr1[] = {0x0E};
-    const uint8_t madctl_default[] = {MADCTL_MX | MADCTL_MY | MADCTL_RGB};
-    const uint8_t colmod[] = {0x05};
-    const uint8_t caset[] = {0x00, 0x00, 0x00, LCD_NATIVE_H_RES - 1};
-    const uint8_t raset[] = {0x00, 0x00, 0x00, LCD_NATIVE_V_RES - 1};
-    const uint8_t gamma_pos[] = {
-        0x02, 0x1C, 0x07, 0x12,
-        0x37, 0x32, 0x29, 0x2D,
-        0x29, 0x25, 0x2B, 0x39,
-        0x00, 0x01, 0x03, 0x10,
+    const uint8_t colmod[] = {0x55}; /* RGB565 */
+    const uint8_t madctl_default[] = {MADCTL_RGB};
+    const uint8_t caset[] = {
+        0x00, 0x00,
+        (LCD_NATIVE_H_RES - 1) >> 8, (LCD_NATIVE_H_RES - 1) & 0xFF,
     };
-    const uint8_t gamma_neg[] = {
-        0x03, 0x1D, 0x07, 0x06,
-        0x2E, 0x2C, 0x29, 0x2D,
-        0x2E, 0x2E, 0x37, 0x3F,
-        0x00, 0x00, 0x02, 0x10,
+    const uint8_t raset[] = {
+        0x00, 0x00,
+        (LCD_NATIVE_V_RES - 1) >> 8, (LCD_NATIVE_V_RES - 1) & 0xFF,
     };
-    const uint8_t madctl_rot90[] = {MADCTL_MX | MADCTL_MV | MADCTL_RGB};
+    const uint8_t madctl_rot90[] = {MADCTL_MV | MADCTL_MY | MADCTL_RGB};
 
-    ESP_LOGI(TAG, "Initialize ST7735R panel with MicroPython init(2) compatible sequence");
-    st7735_tx_param(io_handle, ST7735_DISPOFF, NULL, 0);
-    st7735_tx_param(io_handle, ST7735_SWRESET, NULL, 0);
-    st7735_delay_ms(150);
-    st7735_tx_param(io_handle, ST7735_SLPOUT, NULL, 0);
-    st7735_delay_ms(500);
-    st7735_tx_param(io_handle, ST7735_FRMCTR1, frmctr, sizeof(frmctr));
-    st7735_tx_param(io_handle, ST7735_FRMCTR2, frmctr, sizeof(frmctr));
-    st7735_tx_param(io_handle, ST7735_FRMCTR3, frmctr3, sizeof(frmctr3));
-    st7735_tx_param(io_handle, ST7735_INVCTR, invctr, sizeof(invctr));
-    st7735_tx_param(io_handle, ST7735_PWCTR1, pwctr1, sizeof(pwctr1));
-    st7735_tx_param(io_handle, ST7735_PWCTR2, pwctr2, sizeof(pwctr2));
-    st7735_tx_param(io_handle, ST7735_PWCTR3, pwctr3, sizeof(pwctr3));
-    st7735_tx_param(io_handle, ST7735_PWCTR4, pwctr4, sizeof(pwctr4));
-    st7735_tx_param(io_handle, ST7735_PWCTR5, pwctr5, sizeof(pwctr5));
-    st7735_tx_param(io_handle, ST7735_VMCTR1, vmctr1, sizeof(vmctr1));
-    st7735_tx_param(io_handle, ST7735_INVOFF, NULL, 0);
-    st7735_tx_param(io_handle, ST7735_MADCTL, madctl_default, sizeof(madctl_default));
-    st7735_tx_param(io_handle, ST7735_COLMOD, colmod, sizeof(colmod));
-    st7735_tx_param(io_handle, ST7735_CASET, caset, sizeof(caset));
-    st7735_tx_param(io_handle, ST7735_RASET, raset, sizeof(raset));
-    st7735_tx_param(io_handle, ST7735_GMCTRP1, gamma_pos, sizeof(gamma_pos));
-    st7735_tx_param(io_handle, ST7735_GMCTRN1, gamma_neg, sizeof(gamma_neg));
-    st7735_tx_param(io_handle, ST7735_NORON, NULL, 0);
-    st7735_delay_ms(10);
-    st7735_tx_param(io_handle, ST7735_MADCTL, madctl_rot90, sizeof(madctl_rot90));
-    st7735_clear_black(io_handle);
+    ESP_LOGI(TAG, "Initialize ST7789 panel (native 240x320, rotated 90 deg)");
+    st7789_tx_param(io_handle, ST7789_DISPOFF, NULL, 0);
+    st7789_tx_param(io_handle, ST7789_SWRESET, NULL, 0);
+    st7789_delay_ms(150);
+    st7789_tx_param(io_handle, ST7789_SLPOUT, NULL, 0);
+    st7789_delay_ms(500);
+    st7789_tx_param(io_handle, ST7789_MADCTL, madctl_default, sizeof(madctl_default));
+    st7789_tx_param(io_handle, ST7789_COLMOD, colmod, sizeof(colmod));
+    st7789_delay_ms(10);
+    st7789_tx_param(io_handle, ST7789_CASET, caset, sizeof(caset));
+    st7789_tx_param(io_handle, ST7789_RASET, raset, sizeof(raset));
+    st7789_tx_param(io_handle, ST7789_INVON, NULL, 0);
+    st7789_tx_param(io_handle, ST7789_NORON, NULL, 0);
+    st7789_delay_ms(10);
+    st7789_tx_param(io_handle, ST7789_MADCTL, madctl_rot90, sizeof(madctl_rot90));
+    st7789_clear_black(io_handle);
 }
 
 static void lcd_display_on(void)
@@ -143,8 +109,8 @@ static void lcd_display_on(void)
         return;
     }
 
-    st7735_tx_param(s_lcd_io_handle, ST7735_DISPON, NULL, 0);
-    st7735_delay_ms(20);
+    st7789_tx_param(s_lcd_io_handle, ST7789_DISPON, NULL, 0);
+    st7789_delay_ms(20);
     s_lcd_display_on = true;
 }
 
@@ -165,28 +131,59 @@ static void lvgl_flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t 
 {
     esp_lcd_panel_io_handle_t io_handle = lv_display_get_user_data(display);
     const int width = area->x2 - area->x1 + 1;
-    const int height = area->y2 - area->y1 + 1;
-    const uint16_t x_start = area->x1 + LCD_X_GAP;
-    const uint16_t x_end = area->x2 + LCD_X_GAP;
-    const uint16_t y_start = area->y1 + LCD_Y_GAP;
-    const uint16_t y_end = area->y2 + LCD_Y_GAP;
-    const uint8_t caset[] = {
-        x_start >> 8, x_start & 0xFF,
-        x_end >> 8, x_end & 0xFF,
-    };
-    const uint8_t raset[] = {
-        y_start >> 8, y_start & 0xFF,
-        y_end >> 8, y_end & 0xFF,
-    };
+    const size_t line_bytes = (size_t)width * sizeof(uint16_t);
+    const uint8_t *line = px_map;
 
-    ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, ST7735_CASET, caset, sizeof(caset)));
-    ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, ST7735_RASET, raset, sizeof(raset)));
-    ESP_ERROR_CHECK(esp_lcd_panel_io_tx_color(io_handle, ST7735_RAMWR, px_map, width * height * sizeof(uint16_t)));
+    /* Send the dirty rectangle one row at a time instead of as a single big
+     * block. esp_lcd_panel_io_tx_color() allocates a private DMA "TX buffer"
+     * when the payload is large / not DMA-friendly, and a full-screen flush
+     * (320*240*2 = 153600 bytes) can fail that allocation (ESP_ERR_NO_MEM ->
+     * abort). Per-row transfers cap the payload at width*2 bytes (<= 640 for
+     * this panel), so the internal buffer is always tiny and the allocation
+     * succeeds even under PSRAM fragmentation. */
+    for (int y = area->y1; y <= area->y2; ++y) {
+        const uint16_t x_start = area->x1 + LCD_X_GAP;
+        const uint16_t x_end = area->x2 + LCD_X_GAP;
+        const uint16_t y_pos = y + LCD_Y_GAP;
+        const uint8_t caset[] = {
+            x_start >> 8, x_start & 0xFF,
+            x_end >> 8, x_end & 0xFF,
+        };
+        const uint8_t raset[] = {
+            y_pos >> 8, y_pos & 0xFF,
+            y_pos >> 8, y_pos & 0xFF,
+        };
+
+        esp_err_t err = esp_lcd_panel_io_tx_param(io_handle, ST7789_CASET, caset, sizeof(caset));
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "flush caset failed: %s", esp_err_to_name(err));
+            lv_display_flush_ready(display);
+            return;
+        }
+        err = esp_lcd_panel_io_tx_param(io_handle, ST7789_RASET, raset, sizeof(raset));
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "flush raset failed: %s", esp_err_to_name(err));
+            lv_display_flush_ready(display);
+            return;
+        }
+        err = esp_lcd_panel_io_tx_color(io_handle, ST7789_RAMWR, line, line_bytes);
+        if (err != ESP_OK) {
+            /* Never abort on a transient transfer error: just unlock the
+             * display so LVGL can retry next frame instead of deadlocking or
+             * crashing the whole firmware. */
+            ESP_LOGW(TAG, "flush line %d failed: %s", y, esp_err_to_name(err));
+            lv_display_flush_ready(display);
+            return;
+        }
+        line += line_bytes;
+    }
+
+    lv_display_flush_ready(display);
 }
 
 void hw_lcd_init(void)
 {
-    ESP_LOGI(TAG, "Initialize SPI bus for ST7735 TFT");
+    ESP_LOGI(TAG, "Initialize SPI bus for ST7789 TFT");
     spi_bus_config_t buscfg = {
         .sclk_io_num = PIN_NUM_LCD_SCLK,
         .mosi_io_num = PIN_NUM_LCD_MOSI,
@@ -214,7 +211,7 @@ void hw_lcd_init(void)
     s_lcd_io_handle = io_handle;
     s_lcd_display_on = false;
     s_lcd_first_flush_done = false;
-    st7735_init_black_tab_rot90(io_handle);
+    st7789_init_240x320_rot90(io_handle);
 }
 
 /* Partial-refresh draw buffers sized for LCD_DRAW_BUF_LINES lines. Prefer

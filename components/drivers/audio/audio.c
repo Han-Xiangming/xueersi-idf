@@ -3,7 +3,7 @@
  * See hardware/audio.h.
  *
  * Wiring (from board_config.h):
- *   BCLK -> GPIO25, LRC(WS) -> GPIO32, DIN -> GPIO33, no MCLK.
+ *   BCLK -> GPIO32, LRC(WS) -> GPIO15, DIN -> GPIO21, no MCLK.
  *
  * The I2S bus is configured as 16-bit STEREO; raw PCM is streamed for MP3
  * playback.

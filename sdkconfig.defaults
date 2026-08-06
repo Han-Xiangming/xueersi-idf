@@ -38,6 +38,7 @@ CONFIG_LV_FONT_DEFAULT_MONTSERRAT_10=y
 # CONFIG_LV_USE_SYSMON is not set
 # CONFIG_LV_USE_PERF_MONITOR is not set
 CONFIG_LV_USE_PERF_MONITOR_LOG_MODE=n
+# CONFIG_LV_BUILD_EXAMPLES is not set
 # CONFIG_LV_BUILD_DEMOS is not set
 # CONFIG_LV_USE_DEMO_WIDGETS is not set
 # CONFIG_LV_USE_DEMO_BENCHMARK is not set
@@ -64,3 +65,10 @@ CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST=y
 # second link; with only 1 the controller rejects it (0x09 Conn Limit).
 CONFIG_BTDM_CTRL_BR_EDR_MAX_ACL_CONN=2
 CONFIG_BTDM_CTRL_BR_EDR_MAX_SYNC_CONN=0
+
+# FATFS: long file names from heap (FF_USE_LFN=3) + UTF-8 API encoding
+# (FF_LFN_UNICODE=2) so readdir() returns UTF-8 names. Required to list
+# Chinese filenames from the SD card; the 16px CJK font already covers
+# 4E00-9FFF and kana, so no font change is needed.
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_API_ENCODING_UTF_8=y

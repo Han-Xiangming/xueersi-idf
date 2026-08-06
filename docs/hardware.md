@@ -6,7 +6,7 @@
 
 ```text
 ESP32（WROVER-B，PSRAM 8MB）@ 240MHz
-  ├─ ST7735  TFT 160×128（原生 128×160，旋转 90°）  SPI2 @ 60MHz
+  ├─ ST7789  TFT 320×240（原生 240×320，旋转 90°）  SPI2 @ 60MHz
   ├─ MicroSD 卡（SDSPI，与 LCD 共用 SPI2）          CS=22 @ 10MHz
   ├─ MAX98357 单声道 Class-D DAC                    I2S，无 MCLK
   ├─ 6 键矩阵（低有效）                             上/下/左/右/A/B
@@ -31,8 +31,8 @@ ESP32（WROVER-B，PSRAM 8MB）@ 240MHz
 
 ## 3. 显示驱动（components/drivers/lcd/lcd.c）
 
-- ST7735 初始化采用 MicroPython `init(2)` 兼容序列（SWRESET → SLPOUT → FRMCTR/PWCTR/GMCTR 全套寄存器 → NORON）。
-- 旋转 90°（MADCTL `MX|MV`），显示区 = 原生 128×160 → 160×128，无偏移（X/Y gap = 0）。
+- ST7789 初始化采用 Adafruit 兼容序列（SWRESET → SLPOUT → MADCTL/COLMOD=RGB565 → CASET/RASET → INVON → NORON）。
+- 旋转 90°（MADCTL `MX|MV`），显示区 = 原生 240×320 → 320×240，无偏移（X/Y gap = 0）。
 - **部分刷新双 DMA 缓冲**（`LCD_DRAW_BUF_COUNT=2`）：`LCD_DRAW_BUF_LINES=40`（约 1/3 屏高），前一块在 SPI 刷出时 LVGL 渲染下一块；缓冲优先 PSRAM（`MALLOC_CAP_SPIRAM|DMA`），失败退回内部 DMA 池；LVGL 只渲染并刷新脏区域，SPI 事务由 esp_lcd panel_io 驱动（`trans_queue_depth=10`）。
 - 首帧 flush 完成后 `hw_lcd_display_on()` 点亮背光（避免开机黑屏/白屏闪烁）。
 - 刷新模式 `LV_DISPLAY_RENDER_MODE_PARTIAL`，颜色 `LV_COLOR_FORMAT_RGB565_SWAPPED`，DPI 60。
@@ -70,7 +70,7 @@ ESP32（WROVER-B，PSRAM 8MB）@ 240MHz
 esp_log_level_set("BT_L2CAP", WARN)     降噪（BT 拥塞回调日志泛滥，见 main.c 注释）
   → nvs_flash_init
   → hw_buttons_init()        GPIO + 消抖
-  → hw_lcd_init()            SPI/panel/ST7735 初始化
+  → hw_lcd_init()            SPI/panel/ST7789 初始化
   → hw_audio_init()          I2S + MAX98357 + 环形缓冲 + feed 任务
   → bt_audio_init()          环形缓冲（不碰蓝牙控制器）
   → 注册 AVRCP 回调（cmd / volume）

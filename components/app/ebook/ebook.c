@@ -25,9 +25,9 @@ static const char *TAG = "ebook";
 #define EBOOK_CHUNK         (4 * 1024)   /* stream window of the reader */
 #define EBOOK_PAGE_BUF      1024         /* rendered page text buffer */
 #define EBOOK_PAGE_LINES    5            /* lines per page */
-#define EBOOK_LINE_W        152          /* text-area width, px */
+#define EBOOK_LINE_W        304          /* text-area width, px (= LCD_H_RES - 16) */
 #define EBOOK_LINE_W16      (EBOOK_LINE_W * 16)  /* width in 1/16 px */
-#define EBOOK_CHAR_W16      192          /* fullwidth advance, 1/16 px = 12 px */
+#define EBOOK_CHAR_W16      256          /* fullwidth advance, 1/16 px = 16 px */
 #define EBOOK_HIST_N        32           /* page-start offset history ring */
 #define EBOOK_ROM_PREFIX    "(ROM)"
 
@@ -36,35 +36,33 @@ static const char *TAG = "ebook";
 extern const uint8_t _binary_Test_txt_start[];
 extern const uint8_t _binary_Test_txt_end[];
 
-/* ASCII advance widths (1/16 px), copied verbatim from the lv_font_cn_12
+/* ASCII advance widths (1/16 px), copied verbatim from the lv_font_cn_16
  * glyph_dsc table so the reader's line breaks match LVGL rendering. */
 static const uint16_t s_ascii_w16[128] = {
-    /* 0x20 */ 43, 60, 88, 105, 105, 175, 129, 52, 64, 64, 88, 105, 52, 66, 52, 75,
-    /* 0x30 */ 105, 105, 105, 105, 105, 105, 105, 105, 105, 105, 52, 52, 105, 105, 105, 90,
-    /* 0x40 */ 180, 116, 125, 122, 131, 112, 105, 131, 139, 55, 102, 123, 103, 154, 138, 142,
-    /* 0x50 */ 120, 142, 120, 113, 114, 137, 109, 167, 108, 100, 115, 64, 75, 64, 105, 107,
-    /* 0x60 */ 116, 107, 118, 97, 118, 105, 61, 107, 116, 52, 52, 104, 54, 177, 116, 116,
-    /* 0x70 */ 118, 118, 73, 89, 71, 116, 98, 152, 93, 98, 90, 64, 51, 64, 105,
+    /* 0x20 */ 57, 80, 117, 141, 141, 234, 172, 69, 85, 85, 118, 141, 69, 88, 69, 100,
+    /* 0x30 */ 141, 141, 141, 141, 141, 141, 141, 141, 141, 141, 69, 69, 141, 141, 141, 120,
+    /* 0x40 */ 239, 154, 167, 162, 175, 150, 140, 175, 185, 73, 136, 164, 137, 206, 184, 189,
+    /* 0x50 */ 160, 189, 161, 151, 152, 183, 145, 223, 144, 134, 154, 85, 100, 85, 141, 143,
+    /* 0x60 */ 154, 143, 157, 130, 157, 141, 81, 143, 154, 69, 69, 139, 71, 236, 155, 154,
+    /* 0x70 */ 157, 157, 97, 119, 95, 154, 131, 203, 124, 131, 120, 85, 68, 85, 141,
 };
 
-/* Real advances (1/16 px) of the rare typographic glyphs that lv_font_cn_12
+/* Real advances (1/16 px) of the rare typographic glyphs that lv_font_cn_16
  * carries with a non-fullwidth metric (docs/ebook.md 4.2). CJK, hiragana and
- * every FF00/3000-range glyph are exactly 192, so those fall back to
+ * every FF00/3000-range glyph are exactly 256, so those fall back to
  * EBOOK_CHAR_W16; only these codepoints (drawn from the font's glyph_dsc)
  * deviate, and honoring their true advance keeps reader line breaks identical
  * to LVGL rendering. */
 typedef struct { uint16_t cp; uint16_t w16; } typ_w16_t;
 static const typ_w16_t s_typ_w16[] = {
-    { 0x2011, 66 }, { 0x2012, 103 }, { 0x2013, 103 }, { 0x2014, 171 },
-    { 0x2019, 52 }, { 0x201C, 88 },  { 0x2024, 52 },  { 0x2025, 88 },
-    { 0x2027, 57 }, { 0x2028, 57 },  { 0x202A, 115 }, { 0x202C, 173 },
-    { 0x202D, 143 }, { 0x202E, 143 }, { 0x202F, 321 }, { 0x2030, 471 },
-    { 0x205B, 0 },  { 0x205C, 0 },   { 0x205D, 0 },   { 0x205E, 0 },
-    { 0x205F, 48 }, { 0x2060, 48 },  { 0x20C7, 0 },   { 0x20C8, 0 },
+    { 0x2011, 88 }, { 0x2012, 137 }, { 0x2013, 137 }, { 0x2014, 228 },
+    { 0x201A, 69 }, { 0x201E, 117 }, { 0x2032, 69 },  { 0x2033, 117 },
+    { 0x2039, 76 }, { 0x203A, 76 },  { 0x203C, 154 }, { 0x2047, 230 },
+    { 0x2048, 191 }, { 0x2049, 191 }, { 0x2E3A, 428 }, { 0x2E3B, 628 },
 };
 
 /* True: *out receives the real advance of `cp` (may be 0). False: not in the
- * table, caller uses the 192 full-width default. */
+ * table, caller uses the 256 full-width default. */
 static bool typ_adv_w(uint32_t cp, uint32_t *out)
 {
     for (size_t i = 0; i < sizeof(s_typ_w16) / sizeof(s_typ_w16[0]); i++) {
@@ -92,9 +90,9 @@ static bool is_trail_punct(uint32_t cp)
 }
 
 /* Half-width form of a line-ending punctuation (标点压缩, docs/ebook.md 4.2).
- * The lv_font_cn_12 font carries no narrow CJK punctuation, so the narrow
+ * The lv_font_cn_16 font carries no narrow CJK punctuation, so the narrow
  * ASCII look-alike is substituted: its true advance (s_ascii_w16) is smaller
- * than the 192/16 px full-width advance, freeing 6-9 px at the line end.
+ * than the 256/16 px full-width advance, freeing 8-12 px at the line end.
  * Substitutes are guaranteed to exist in the font (0x20-0x7E). Returns 0 for
  * code points without a usable narrow form (e.g. 0x2026 …). */
 static uint8_t compress_punct(uint32_t cp)
@@ -341,7 +339,7 @@ static size_t layout_page(reader_t *r, size_t start, char *out, size_t cap)
             cw = s_ascii_w16[sub];
         }
         else if (!typ_adv_w((uint32_t)cp, &cw)) {
-            cw = EBOOK_CHAR_W16;         /* CJK / 全角 = fixed 192/16 px */
+            cw = EBOOK_CHAR_W16;         /* CJK / 全角 = fixed 256/16 px = 16 px */
         }
 
         if (cp == ' ') {
