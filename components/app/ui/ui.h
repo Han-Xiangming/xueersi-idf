@@ -20,7 +20,6 @@
 
 typedef enum {
     UI_PAGE_PLAYER = 0,
-    UI_PAGE_SD,
     UI_PAGE_BT,
     UI_PAGE_SETTINGS,
     UI_PAGE_EBOOK_LIST,

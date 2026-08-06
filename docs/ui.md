@@ -23,11 +23,10 @@ app/ui/ui.c（页面控制器，不依赖具体硬件）
 | 播放器 | `UI_PAGE_PLAYER` | MP3 列表（4 行）+ 播放状态 | `ui_build_player` |
 | 书列表 | `UI_PAGE_EBOOK_LIST` | 扫描 `/sdcard/*.txt`（含内置 ROM 书） | `ui_build_ebook_list` |
 | 阅读 | `UI_PAGE_EBOOK_READ` | TXT 电子书分页阅读 | `ui_build_ebook_read` |
-| SD 卡 | `UI_PAGE_SD` | 挂载状态页 | （通用 value/bar 页） |
 | 蓝牙 | `UI_PAGE_BT` | A2DP 设备扫描/配对/连接 | `ui_build_bt` |
 | 设置 | `UI_PAGE_SETTINGS` | 音量/蓝牙/日志等级 | `ui_build_settings` |
 
-- 主菜单只列出 4 项：`Music Player`、`电子书`、`SD卡`、`设置`（蓝牙已并入设置页子页，见 §7）。
+- 主菜单只列出 4 项：`Music Player`、`电子书`、`设置`（蓝牙已并入设置页子页，见 §7）。SD 卡挂载状态不再单独成页，由播放器列表在卡插入/拔出时自动刷新。
 - 电子书引擎在 `app/ebook/ebook.c`，UI 通过 `ebook.h` 公开 API 交互（见 `docs/ebook.md`）。
 
 ## 3. 版面参数

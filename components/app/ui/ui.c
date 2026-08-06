@@ -45,7 +45,6 @@ extern const lv_font_t lv_font_cn_16;
 
 static const char *const s_page_names[UI_PAGE_COUNT] = {
     "Music Player",
-    "SD卡",
     "蓝牙",
     "设置",
     "电子书",
@@ -56,7 +55,7 @@ static const char *const s_page_names[UI_PAGE_COUNT] = {
  * sub-page (opened from the 蓝牙 settings item), so it is no longer a
  * top-level tab in the main menu. */
 static const ui_page_t s_menu_pages[] = {
-    UI_PAGE_PLAYER, UI_PAGE_EBOOK_LIST, UI_PAGE_SD, UI_PAGE_SETTINGS,
+    UI_PAGE_PLAYER, UI_PAGE_EBOOK_LIST, UI_PAGE_SETTINGS,
 };
 #define UI_MENU_PAGE_COUNT ((int)(sizeof(s_menu_pages) / sizeof(s_menu_pages[0])))
 
@@ -952,21 +951,6 @@ void ui_refresh(void)
     }
 
     switch (s_ui.page_id) {
-    case UI_PAGE_SD: {
-        char sub[64];
-        ui_label_set(s_ui.value, hw_sd_is_mounted() ? "已挂载" : "无卡");
-        if (hw_sd_is_mounted()) {
-            snprintf(sub, sizeof(sub), "%s  %luMB",
-                     hw_sd_name(), (unsigned long)hw_sd_mb());
-        }
-        else {
-            snprintf(sub, sizeof(sub), "GPIO22 CS  %s", short_err(hw_sd_last_err()));
-        }
-        ui_label_set(s_ui.sub, sub);
-        ui_set_hint(hw_sd_is_mounted() ? "B返回" : "A重扫 B返回");
-        ui_set_bar(hw_sd_is_mounted() ? 100 : 0);
-        break;
-    }
     case UI_PAGE_SETTINGS: {
         char buf[24];
         const bool sel_changed = (s_setting_sel != s_paint_set_sel);
@@ -1271,16 +1255,6 @@ static void ui_action(void)
 {
     ui_mark_dirty();                   /* an action may change visible state */
     switch (s_ui.page_id) {
-    case UI_PAGE_SD:
-        /* The mount blocks the UI task for tens to hundreds of ms on SDSPI,
-         * so render the pending toast before it — the user sees feedback
-         * immediately instead of a frozen screen. */
-        set_action("重扫中...");
-        lv_refr_now(NULL);
-        hw_sd_try_mount();
-        player_scan_start();   /* card may have been inserted / replaced */
-        set_action(hw_sd_is_mounted() ? "SD已挂载" : "无SD卡");
-        break;
     case UI_PAGE_PLAYER:
         if (s_mp3_count == 0) {
             set_action(player_scan_busy() ? "扫描中..." : "无MP3文件");
