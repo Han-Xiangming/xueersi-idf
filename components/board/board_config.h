@@ -49,3 +49,27 @@
 #define PIN_NUM_I2S_BCLK        GPIO_NUM_32
 #define PIN_NUM_I2S_LRC         GPIO_NUM_15
 #define PIN_NUM_I2S_DIN         GPIO_NUM_21
+
+/* Battery level sensing (ADC1 channel 3 = GPIO 39).
+ *
+ * A 2-resistor divider scales the single-cell Li-ion pack down into the
+ * ESP32 ADC range:
+ *
+ *     V_bat --[R_top]-- GPIO39 --[R_bot]-- GND
+ *
+ * A 2-resistor divider (two 0.1 MΩ / "01D" parts, R_top = R_bot = 100 kΩ)
+ * scales the single-cell Li-ion pack down into the ESP32 ADC range:
+ *
+ *     V_bat --[R_top]-- GPIO39 --[R_bot]-- GND
+ *
+ * At full charge V_bat ≈ 4.20 V → GPIO ≈ 2.10 V (well inside the 0..3.3 V
+ * ADC span). The divider ratio is 1/2, so V_bat = V_adc * (R_top + R_bot)/R_bot. */
+#define PIN_NUM_BAT_ADC         GPIO_NUM_39
+#define BAT_DIV_R_TOP_KOHM      100     /* upper divider resistor (kΩ) */
+#define BAT_DIV_R_BOT_KOHM      100     /* lower divider resistor (kΩ) */
+/* V_bat = V_adc * BAT_DIV_FACTOR. (100+100)/100 = 2.0 */
+#define BAT_DIV_FACTOR          ((float)(BAT_DIV_R_TOP_KOHM + BAT_DIV_R_BOT_KOHM) / BAT_DIV_R_BOT_KOHM)
+
+/* Li-ion cell voltage points used for the percent mapping (single cell). */
+#define BAT_V_FULL              4.20f   /* 100% */
+#define BAT_V_EMPTY            3.30f   /* 0%   (cut-off) */

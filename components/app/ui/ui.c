@@ -12,6 +12,7 @@
 #include "board_config.h"
 #include "buttons.h"
 #include "audio.h"
+#include "battery.h"
 #include "bt_audio.h"
 #include "lcd.h"
 #include "sd.h"
@@ -21,7 +22,7 @@
 
 #include "esp_attr.h"
 #include "esp_err.h"
-#include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "lvgl.h"
@@ -66,16 +67,11 @@ typedef enum {
     SETTING_VOLUME = 0,
     SETTING_BACKLIGHT,
     SETTING_BTOUT,
-    SETTING_LOG,
+    SETTING_RESET,
     SETTING_COUNT,
 } setting_item_t;
 
 static const int s_setting_y[SETTING_COUNT] = {38, 68, 98, 128};
-
-/* Verbose (DEBUG) logging; off = normal INFO. Covers the audio/player tags
- * and the Bluetooth stack (our bt_audio wrapper plus the classic-BT Bluedroid
- * components that surface discovery / connection internals). */
-static bool s_log_debug;
 
 /* Backlight brightness (0..100 %), driven via PWM on PIN_NUM_LCD_BL.
  * Persisted to NVS; restored at boot. */
@@ -85,21 +81,12 @@ static uint8_t s_backlight = 70;
  * restored at boot. Drives bt_audio_set_enabled() — the audio routing gate. */
 static bool s_bt_on;
 
-static void ui_apply_log_level(void)
-{
-    esp_log_level_t lvl = s_log_debug ? ESP_LOG_DEBUG : ESP_LOG_INFO;
-    esp_log_level_set("player", lvl);
-    esp_log_level_set("hw_audio", lvl);
-    esp_log_level_set("bt_audio", lvl);
-}
-
 /* Settings persistence: volume and log level survive reboot via NVS.
  * NVS is initialised in app_main() before ui_create(), so these helpers
  * can open the handle at any time. */
 #define UI_NVS_NS      "ui_cfg"
 #define UI_NVS_VOLUME  "volume"
 #define UI_NVS_VOLBT   "vol_bt"
-#define UI_NVS_LOGDBG  "log_dbg"
 #define UI_NVS_BT      "bt_on"
 #define UI_NVS_BACKL   "backlight"
 
@@ -120,11 +107,6 @@ static void ui_settings_load(void)
         hw_audio_set_bt_volume((uint8_t)v);
     } else {
         hw_audio_set_bt_volume(30);        /* default BT volume 30% */
-    }
-    int32_t dbg = 0;
-    if (nvs_get_i32(h, UI_NVS_LOGDBG, &dbg) == ESP_OK) {
-        s_log_debug = (dbg != 0);
-        ui_apply_log_level();
     }
     int32_t bt = 0;
     if (nvs_get_i32(h, UI_NVS_BT, &bt) == ESP_OK) {
@@ -147,16 +129,6 @@ static void ui_settings_save_volume(void)
     if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_i32(h, UI_NVS_VOLUME, (int32_t)hw_audio_get_speaker_volume());
         nvs_set_i32(h, UI_NVS_VOLBT, (int32_t)hw_audio_get_bt_volume());
-        nvs_commit(h);
-        nvs_close(h);
-    }
-}
-
-static void ui_settings_save_log(void)
-{
-    nvs_handle_t h;
-    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_i32(h, UI_NVS_LOGDBG, s_log_debug ? 1 : 0);
         nvs_commit(h);
         nvs_close(h);
     }
@@ -186,9 +158,8 @@ static void ui_settings_save_backlight(void)
  * timer; ui_settings_flush() (called every refresh) commits once the user
  * stops tweaking, folding long-press repeats into a single NVS write. */
 #define SETTINGS_DIRTY_VOLUME   (1u << 0)
-#define SETTINGS_DIRTY_LOG      (1u << 1)
-#define SETTINGS_DIRTY_BT       (1u << 2)
-#define SETTINGS_DIRTY_BACKL    (1u << 3)
+#define SETTINGS_DIRTY_BT       (1u << 1)
+#define SETTINGS_DIRTY_BACKL    (1u << 2)
 
 static uint32_t s_save_pending;
 static uint32_t s_save_at_ms;
@@ -209,9 +180,6 @@ static void ui_settings_flush(void)
     }
     if (s_save_pending & SETTINGS_DIRTY_VOLUME) {
         ui_settings_save_volume();
-    }
-    if (s_save_pending & SETTINGS_DIRTY_LOG) {
-        ui_settings_save_log();
     }
     if (s_save_pending & SETTINGS_DIRTY_BT) {
         ui_settings_save_bt();
@@ -292,6 +260,11 @@ typedef struct {
     lv_obj_t *eb_bar;
     lv_obj_t *eb_pct;
 
+    lv_obj_t *battery;   /* battery body outline (persistent gauge) */
+    lv_obj_t *bat_cap;   /* positive terminal cap */
+    lv_obj_t *bat_seg[5]; /* 5 fill segments inside the battery icon */
+    lv_obj_t *bat_text;  /* "100%" label next to the battery */
+
     lv_group_t *group;
     ui_page_t page_id;
 } ui_state_t;
@@ -331,6 +304,7 @@ static player_state_t  s_ext_pl_state = PLAYER_IDLE;
 static char            s_ext_pl_name[MP3_NAME_LEN];
 static uint32_t        s_ext_eb_scan_ver;
 static uint32_t        s_ext_eb_cnt_ver;
+static uint8_t         s_ext_bat_pct = UINT8_MAX;   /* forces first paint */
 
 static void ui_mark_dirty(void)
 {
@@ -525,7 +499,7 @@ static void ui_set_hint(const char *normal)
 static void ui_build_settings(lv_obj_t *page)
 {
     s_setting_sel = 0;
-    static const char *const labels[SETTING_COUNT] = {"音量", "背光", "蓝牙", "日志等级"};
+    static const char *const labels[SETTING_COUNT] = {"音量", "背光", "蓝牙", "重置NVS"};
 
     for (int i = 0; i < SETTING_COUNT; i++) {
         lv_obj_t *cur = lv_label_create(page);
@@ -667,11 +641,11 @@ static void ui_build_ebook_read(lv_obj_t *page)
     lv_obj_set_style_text_color(txt, lv_color_hex(UI_GRAY), 0);
     s_ui.eb_text_label = txt;
 
-    /* Status row: wide text progress bar at the left (15 cells, ~110 px) and
-     * the percentage right-aligned to the screen's right edge. The centered
-     * hint label below is used only by toasts (see ui_set_hint). */
+    /* Status row: wide text progress bar at the left (28 cells) and the
+     * percentage right-aligned to the screen's right edge. The centered hint
+     * label below is used only by toasts (see ui_set_hint). */
     lv_obj_t *bar = lv_label_create(page);
-    lv_label_set_text(bar, "[---------------]");
+    lv_label_set_text(bar, "[----------------------------]");
     lv_label_set_long_mode(bar, LV_LABEL_LONG_MODE_CLIP);
     lv_obj_set_pos(bar, 8, 198);
     lv_obj_set_style_text_font(bar, &lv_font_cn_16, 0);
@@ -929,13 +903,92 @@ static bool ui_external_changed(void)
             changed = true;
         }
     }
+
+    /* Battery level is sampled once per second in the background; refresh the
+     * gauge whenever the percentage moves. */
+    uint8_t bp = hw_battery_percent();
+    if (bp != s_ext_bat_pct) {
+        s_ext_bat_pct = bp;
+        changed = true;
+    }
     return changed;
+}
+
+/* 5-color appearance scheme: one color per battery-level band. The whole
+ * gauge (body, cap, filled segments and text) takes the band color so a low
+ * battery reads as an obvious red icon.
+ *   <=15% red | <=35% orange | <=60% yellow | <=85% cyan | <=100% green */
+static const uint32_t s_bat_palette[5] = {
+    0xFF2020,  /* red    - critical (<=15%)  */
+    0xFF9000,  /* orange - low      (<=35%)  */
+    0xFFE000,  /* yellow - medium   (<=60%)  */
+    0x00E0FF,  /* cyan   - good      (<=85%)  */
+    0x20FF40,  /* green  - full      (<=100%) */
+};
+
+static uint32_t bat_color_for_pct(uint8_t pct)
+{
+    if (pct <= 15)  return s_bat_palette[0];
+    if (pct <= 35)  return s_bat_palette[1];
+    if (pct <= 60)  return s_bat_palette[2];
+    if (pct <= 85)  return s_bat_palette[3];
+    return s_bat_palette[4];
+}
+
+/* Update the persistent top-right battery gauge: re-paint the 5-segment fill
+ * and the "100%" label in the band color. "--" stays until first sample. */
+static void ui_refresh_battery(void)
+{
+    if (!s_ui.battery) {
+        return;
+    }
+
+    uint8_t pct = hw_battery_percent();
+    float vbat = hw_battery_voltage();
+
+    /* Pre-sample: no data yet. */
+    if (pct == 0 && vbat <= 0.0f) {
+        for (int i = 0; i < 5; ++i) {
+            lv_obj_set_style_bg_opa(s_ui.bat_seg[i], LV_OPA_TRANSP, 0);
+        }
+        lv_label_set_text(s_ui.bat_text, "--%");
+        return;
+    }
+
+    const uint32_t color = bat_color_for_pct(pct);
+
+    /* Linear mapping: 0..100% → 0..5 filled segments. */
+    uint8_t filled = (uint8_t)((pct * 5 + 50) / 100); /* round to nearest */
+    if (filled > 5) {
+        filled = 5;
+    }
+    for (int i = 0; i < 5; ++i) {
+        lv_obj_t *seg = s_ui.bat_seg[i];
+        if (i < filled) {
+            lv_obj_set_style_bg_color(seg, lv_color_hex(color), 0);
+            lv_obj_set_style_bg_opa(seg, LV_OPA_COVER, 0);
+        }
+        else {
+            lv_obj_set_style_bg_opa(seg, LV_OPA_TRANSP, 0);
+        }
+    }
+
+    /* Body outline, terminal cap and text all take the band color. */
+    lv_obj_set_style_border_color(s_ui.battery, lv_color_hex(color), 0);
+    lv_obj_set_style_bg_color(s_ui.bat_cap, lv_color_hex(color), 0);
+    lv_obj_set_style_text_color(s_ui.bat_text, lv_color_hex(color), 0);
+
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%u%%", (unsigned)pct);
+    lv_label_set_text(s_ui.bat_text, buf);
 }
 
 void ui_refresh(void)
 {
     ui_settings_flush();
     if (s_in_menu) {
+        /* Menu is event-driven, but keep the battery gauge live on every tick. */
+        ui_refresh_battery();
         return;                         /* menu is event-driven */
     }
 
@@ -1017,8 +1070,9 @@ void ui_refresh(void)
             case SETTING_BACKLIGHT:
                 snprintf(buf, sizeof(buf), "%u%%", (unsigned)s_backlight);
                 break;
-            case SETTING_LOG:
-                snprintf(buf, sizeof(buf), "%s", s_log_debug ? "Debug" : "Normal");
+            case SETTING_RESET:
+                /* Action item: no value to show, just a hint to press A. */
+                snprintf(buf, sizeof(buf), "按A重置");
                 break;
             default:
                 buf[0] = '\0';
@@ -1137,10 +1191,10 @@ void ui_refresh(void)
                                  ? s_bt_list_name[idx]
                                  : bt_audio_device_name(idx);
                 ui_label_set(s_ui.bt_cursor[i], sel ? ">" : " ");
-                if (sel_changed) {
-                    lv_obj_set_style_text_color(s_ui.bt_text[i],
-                                                lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
-                }
+                /* Paint the row color every refresh so the first paint after
+                 * entering shows the selected row in cyan. */
+                lv_obj_set_style_text_color(s_ui.bt_text[i],
+                                            lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
                 ui_label_set(s_ui.bt_text[i], nm);
             }
             else {
@@ -1219,12 +1273,13 @@ void ui_refresh(void)
                 char tmp[64];
                 strip_txt_ext(tmp, sizeof(tmp), ebook_scan_name(idx));
                 ui_label_set(s_ui.eb_cursor[i], sel ? ">" : " ");
-                if (sel_changed) {
-                    lv_obj_set_style_text_color(s_ui.eb_cursor[i],
-                                                lv_color_hex(UI_CYAN), 0);
-                    lv_obj_set_style_text_color(s_ui.eb_text[i],
-                                                lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
-                }
+                /* Paint the row color every refresh (not only on selection
+                 * change) so the first paint after entering the page shows the
+                 * selected row in cyan. */
+                lv_obj_set_style_text_color(s_ui.eb_cursor[i],
+                                            lv_color_hex(UI_CYAN), 0);
+                lv_obj_set_style_text_color(s_ui.eb_text[i],
+                                            lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
                 ui_label_set(s_ui.eb_text[i], tmp);
             }
             else {
@@ -1263,16 +1318,16 @@ void ui_refresh(void)
         ui_label_set(s_ui.status, buf);
         ui_label_set(s_ui.eb_text_label, ebook_page_text());
 
-        /* Status row: 15-cell text progress bar (left) + percentage (right). */
+        /* Status row: 28-cell text progress bar (left) + percentage (right). */
         int pct = ebook_percent();
-        char prog[20];
+        char prog[32];
         prog[0] = '[';
-        int done = (pct * 15 + 50) / 100;   /* rounded to the nearest cell */
-        for (int i = 0; i < 15; i++) {
+        int done = (pct * 28 + 50) / 100;   /* rounded to the nearest cell */
+        for (int i = 0; i < 28; i++) {
             prog[1 + i] = (i < done) ? '=' : '-';
         }
-        prog[16] = ']';
-        prog[17] = '\0';
+        prog[29] = ']';
+        prog[30] = '\0';
         ui_label_set(s_ui.eb_bar, prog);
         char pbuf[8];
         snprintf(pbuf, sizeof(pbuf), "%d%%", pct);
@@ -1283,6 +1338,7 @@ void ui_refresh(void)
     default:
         break;
     }
+    ui_refresh_battery();
     s_ui_dirty = false;                 /* painted; wait for next change */
 }
 
@@ -1334,6 +1390,14 @@ static void ui_action(void)
                 ui_settings_mark_dirty(SETTINGS_DIRTY_BT);
             }
             ui_enter_page(UI_PAGE_BT);
+        }
+        else if (s_setting_sel == SETTING_RESET) {
+            /* Restore NVS to factory defaults: wipe the whole NVS partition
+             * and reboot. Boot will re-create every setting at its default. */
+            set_action("重置中...");
+            ui_refresh();
+            nvs_flash_erase();
+            esp_restart();
         }
         break;
     case UI_PAGE_EBOOK_LIST:
@@ -1453,12 +1517,6 @@ static void ui_adjust_lr(int dir)
         set_action(buf);
         break;
     }
-    case SETTING_LOG:
-        s_log_debug = (dir > 0);
-        ui_apply_log_level();
-        ui_settings_mark_dirty(SETTINGS_DIRTY_LOG);
-        set_action(s_log_debug ? "Debug" : "Normal");
-        break;
     case SETTING_BTOUT:
         /* Left = off, right = on. Toggling applies the routing gate and is
          * persisted to NVS on the next flush. Switching OFF also powers the
@@ -1590,6 +1648,59 @@ void ui_create(lv_group_t *group)
 
     ui_build_menu();
     ui_refresh_menu();
+
+    /* Persistent battery gauge in the top-right corner, above every page.
+     * Layout: a 5-segment battery icon + "100%" text, anchored with absolute
+     * screen coordinates (no clipping container), vertically centered with the
+     * text. Style mirrors the reference look (cyan outline, 5 fill cells). */
+    const lv_color_t bat_color = lv_color_hex(0x00FFFF); /* cyan */
+    const int base_x = 250;
+    const int base_y = 4;                       /* top of the percent text */
+    const int icon_h = 12;                      /* battery body height */
+
+    /* Percent label first, so we can center the icon against its height. */
+    s_ui.bat_text = lv_label_create(s_ui.screen);
+    lv_label_set_text(s_ui.bat_text, "--%");
+    lv_obj_set_pos(s_ui.bat_text, base_x + 28, base_y);
+    lv_obj_set_style_text_font(s_ui.bat_text, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(s_ui.bat_text, bat_color, 0);
+
+    /* Vertically center the icon on the text's line height. */
+    const int text_h = (int)lv_font_get_line_height(&lv_font_cn_16);
+    const int bat_y = base_y + text_h / 2 - icon_h / 2;
+
+    /* Body outline (24x12, 1px border), transparent interior. */
+    lv_obj_t *body = lv_obj_create(s_ui.screen);
+    lv_obj_remove_style_all(body);
+    lv_obj_set_size(body, 24, icon_h);
+    lv_obj_set_pos(body, base_x, bat_y);
+    lv_obj_set_style_border_color(body, bat_color, 0);
+    lv_obj_set_style_border_width(body, 1, 0);
+    lv_obj_set_style_bg_opa(body, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+    s_ui.battery = body;   /* existence flag */
+
+    /* Positive terminal cap (2x5 px). */
+    lv_obj_t *cap = lv_obj_create(s_ui.screen);
+    lv_obj_remove_style_all(cap);
+    lv_obj_set_size(cap, 2, 5);
+    lv_obj_set_pos(cap, base_x + 24, bat_y + (icon_h - 5) / 2);
+    lv_obj_set_style_bg_color(cap, bat_color, 0);
+    lv_obj_set_style_bg_opa(cap, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(cap, LV_OBJ_FLAG_SCROLLABLE);
+    s_ui.bat_cap = cap;
+
+    /* 5 fill segments: 3 px wide, 6 px tall, 1 px gap; live inside the body. */
+    for (int i = 0; i < 5; ++i) {
+        lv_obj_t *seg = lv_obj_create(s_ui.screen);
+        lv_obj_remove_style_all(seg);
+        lv_obj_set_size(seg, 3, 6);
+        lv_obj_set_pos(seg, base_x + 3 + i * 4, bat_y + (icon_h - 6) / 2);
+        lv_obj_set_style_bg_color(seg, bat_color, 0);
+        lv_obj_set_style_bg_opa(seg, LV_OPA_TRANSP, 0);  /* hidden until updated */
+        lv_obj_clear_flag(seg, LV_OBJ_FLAG_SCROLLABLE);
+        s_ui.bat_seg[i] = seg;
+    }
 }
 
 lv_group_t *ui_input_init(lv_display_t *display)

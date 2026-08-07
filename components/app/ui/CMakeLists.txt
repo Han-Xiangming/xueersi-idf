@@ -2,6 +2,7 @@ idf_component_register(
     SRCS "ui.c"
     INCLUDE_DIRS "."
     REQUIRES audio
+             battery
              board
              bt_audio
              buttons

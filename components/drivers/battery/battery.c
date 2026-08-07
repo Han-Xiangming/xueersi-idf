@@ -1,0 +1,244 @@
+/*
+ * Hardware layer: single-cell Li-ion battery level sensing.
+ *
+ * Wiring: V_bat --[100k]-- GPIO39 --[100k]-- GND  (two 0.1 MΩ "01D" parts).
+ * GPIO 39 is ADC1 channel 3. The 1/2 divider keeps the ADC pin within the
+ * 0..3.3 V range for pack voltages up to ~6.6 V (covers a 4.2 V Li-ion cell).
+ *
+ * ADC reading uses the ESP-IDF "oneshot" driver (noise-free single sample)
+ * with the line-fitting calibration scheme, which uses the chip's eFuse
+ * reference when present and falls back to a default VREF otherwise. A small
+ * sliding window smooths the reading.
+ */
+#include "board_config.h"
+#include "battery.h"
+
+#include <math.h>
+
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/timers.h"
+
+static const char *TAG = "hw_battery";
+
+/* ADC setup. */
+#define BAT_ADC_UNIT            ADC_UNIT_1
+#define BAT_ADC_CH              ADC_CHANNEL_3   /* GPIO 39 */
+#define BAT_ADC_ATTEN           ADC_ATTEN_DB_12 /* 0..3.3 V span, max range */
+#define BAT_ADC_WIDTH           ADC_BITWIDTH_12
+
+/* ADC full-scale voltage (mV) under the chosen attenuation, used only by the
+ * no-calibration fallback. DB_12 → 3.3 V; keep in sync with BAT_ADC_ATTEN. */
+#define BAT_ADC_VMAX_MV         3300
+
+/* Sampling / smoothing. */
+#define BAT_SAMPLE_PERIOD_MS    250             /* poll 4x per second for faster averaging */
+#define BAT_WINDOW_SIZE         16              /* sliding-average depth (~4 s window) */
+#define BAT_INVALID_PERCENT     0
+#define BAT_DEFAULT_VREF_MV     3300            /* used if eFuse not burnt */
+
+/* Hysteresis on the displayed percentage: ignore sub-step jitter so the UI
+ * does not flicker between adjacent values. */
+#define BAT_PCT_HYSTERESIS      1               /* % change below this is ignored */
+
+/* Sliding window of calibrated pin voltages (mV). */
+static int      s_window[BAT_WINDOW_SIZE];
+static uint8_t  s_window_idx;
+static uint8_t  s_window_filled;
+
+/* ADC driver handles (persist for the timer callback). */
+static adc_oneshot_unit_handle_t s_adc_handle = NULL;
+static adc_cali_handle_t         s_cali_handle = NULL;
+
+/* Cached, converted results. */
+static float    s_voltage = 0.0f;
+static uint8_t  s_percent = BAT_INVALID_PERCENT;   /* raw mapped value */
+static uint8_t  s_percent_disp = BAT_INVALID_PERCENT; /* hysteresis-filtered for display */
+static bool     s_inited  = false;
+
+/* Map a pack voltage to 0..100 % with a clamped linear Li-ion curve.
+ * Below BAT_V_EMPTY → 0 %, above BAT_V_FULL → 100 %. */
+static uint8_t voltage_to_percent(float vbat)
+{
+    if (vbat <= BAT_V_EMPTY) {
+        return 0;
+    }
+    if (vbat >= BAT_V_FULL) {
+        return 100;
+    }
+    const float span = BAT_V_FULL - BAT_V_EMPTY;
+    const int pct = (int)(((vbat - BAT_V_EMPTY) / span) * 100.0f + 0.5f);
+    return (pct < 0) ? 0 : (pct > 100 ? 100 : (uint8_t)pct);
+}
+
+static int window_average(void)
+{
+    if (s_window_filled == 0) {
+        return 0;
+    }
+    int sum = 0;
+    for (uint8_t i = 0; i < s_window_filled; ++i) {
+        sum += s_window[i];
+    }
+    return sum / s_window_filled;
+}
+
+void hw_battery_sample(void)
+{
+    if (!s_inited) {
+        return;
+    }
+
+    int raw = 0;
+    esp_err_t err = adc_oneshot_read(s_adc_handle, BAT_ADC_CH, &raw);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "adc_oneshot_read failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    int v_pin_mv = 0;
+    if (s_cali_handle != NULL) {
+        err = adc_cali_raw_to_voltage(s_cali_handle, raw, &v_pin_mv);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "adc_cali_raw_to_voltage failed: %s", esp_err_to_name(err));
+            return;
+        }
+    }
+    else {
+        /* Fallback: assume a linear 0..VMAX map over the 12-bit span. */
+        if (raw < 0) {
+            raw = 0;
+        }
+        if (raw > (1 << 12)) {
+            raw = (1 << 12);
+        }
+        v_pin_mv = (int)(((float)raw / (float)(1 << 12)) * BAT_ADC_VMAX_MV);
+    }
+
+    s_window[s_window_idx] = v_pin_mv;
+    s_window_idx = (s_window_idx + 1) % BAT_WINDOW_SIZE;
+    if (s_window_filled < BAT_WINDOW_SIZE) {
+        s_window_filled++;
+    }
+
+    const float v_pin_v = ((float)window_average()) / 1000.0f;
+    s_voltage = v_pin_v * BAT_DIV_FACTOR;
+    s_percent = voltage_to_percent(s_voltage);
+
+    /* Apply display hysteresis: only move the shown value when the raw
+     * percentage changes by more than BAT_PCT_HYSTERESIS, which suppresses
+     * flicker from ADC noise around a steady state. */
+    if (s_percent_disp == BAT_INVALID_PERCENT) {
+        s_percent_disp = s_percent;
+    }
+    else if (s_percent >= s_percent_disp) {
+        if (s_percent - s_percent_disp > BAT_PCT_HYSTERESIS) {
+            s_percent_disp = s_percent;
+        }
+    }
+    else {
+        if (s_percent_disp - s_percent > BAT_PCT_HYSTERESIS) {
+            s_percent_disp = s_percent;
+        }
+    }
+
+    ESP_LOGD(TAG, "raw=%d v_pin=%d mV vbat=%.2f V pct=%u%%",
+             raw, v_pin_mv, s_voltage, s_percent);
+}
+
+static void battery_timer_cb(TimerHandle_t timer)
+{
+    (void)timer;
+    hw_battery_sample();
+}
+
+void hw_battery_init(void)
+{
+    if (s_inited) {
+        return;
+    }
+
+    /* ADC oneshot unit (ADC1). Leave clk_src at its default. */
+    adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id = BAT_ADC_UNIT,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    esp_err_t err = adc_oneshot_new_unit(&unit_cfg, &s_adc_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "adc_oneshot_new_unit failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten = BAT_ADC_ATTEN,
+        .bitwidth = BAT_ADC_WIDTH,
+    };
+    err = adc_oneshot_config_channel(s_adc_handle, BAT_ADC_CH, &chan_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "adc_oneshot_config_channel failed: %s", esp_err_to_name(err));
+        adc_oneshot_del_unit(s_adc_handle);
+        s_adc_handle = NULL;
+        return;
+    }
+
+    /* Line-fitting calibration: uses eFuse VREF if present, else the default. */
+#if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+    adc_cali_line_fitting_config_t cali_cfg = {
+        .unit_id = BAT_ADC_UNIT,
+        .atten = BAT_ADC_ATTEN,
+        .bitwidth = BAT_ADC_WIDTH,
+#ifdef CONFIG_IDF_TARGET_ESP32
+        .default_vref = BAT_DEFAULT_VREF_MV,
+#endif
+    };
+    if (adc_cali_create_scheme_line_fitting(&cali_cfg, &s_cali_handle) == ESP_OK) {
+        ESP_LOGI(TAG, "ADC line-fitting calibration enabled");
+    }
+    else
+#endif
+    {
+        ESP_LOGW(TAG, "ADC calibration unavailable; using nominal VREF");
+        s_cali_handle = NULL;
+    }
+
+    s_window_idx = 0;
+    s_window_filled = 0;
+    s_voltage = 0.0f;
+    s_percent = BAT_INVALID_PERCENT;
+    s_percent_disp = BAT_INVALID_PERCENT;
+    s_inited = true;
+
+    /* Prime the window with one immediate sample, then poll periodically. */
+    hw_battery_sample();
+
+    TimerHandle_t timer = xTimerCreate("bat_sample",
+                                       pdMS_TO_TICKS(BAT_SAMPLE_PERIOD_MS),
+                                       pdTRUE,   /* auto-reload */
+                                       NULL,
+                                       battery_timer_cb);
+    if (timer != NULL) {
+        if (xTimerStart(timer, pdMS_TO_TICKS(100)) != pdPASS) {
+            ESP_LOGW(TAG, "battery sample timer failed to start");
+        }
+    }
+    else {
+        ESP_LOGW(TAG, "battery sample timer alloc failed");
+    }
+
+    ESP_LOGI(TAG, "battery sense on GPIO%d (ADC1_CH%d), divider %.2f",
+             PIN_NUM_BAT_ADC, BAT_ADC_CH, BAT_DIV_FACTOR);
+}
+
+float hw_battery_voltage(void)
+{
+    return s_voltage;
+}
+
+uint8_t hw_battery_percent(void)
+{
+    return s_percent_disp;
+}

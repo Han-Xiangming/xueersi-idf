@@ -17,6 +17,7 @@
 #include "freertos/task.h"
 #include "buttons.h"
 #include "audio.h"
+#include "battery.h"
 #include "bt_audio.h"
 #include "lcd.h"
 #include "sd.h"
@@ -113,6 +114,7 @@ void app_main(void)
     hw_buttons_init();
     hw_lcd_init();
     hw_audio_init();
+    hw_battery_init();
     bt_audio_init();
     bt_audio_set_avrc_cmd_cb(xiaomiao_avrc_cmd);
     bt_audio_set_avrc_volume_cb(xiaomiao_avrc_volume);
