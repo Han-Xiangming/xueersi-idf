@@ -312,12 +312,15 @@ static void decode_loop(void)
             s_state = PLAYER_IDLE;
             return;
         }
-        hw_audio_set_player_active(true);
+        /* Drop any PCM left over from the previous track so the new stream
+         * never starts with stale samples at the wrong sample rate. */
+        hw_audio_flush();
         ESP_LOGI(TAG, "start track '%s'", s_name);
 
         bool rate_set = false;
         int frame_cnt = 0;
         s_dbg_frames = 0;                 /* reset debug frame counter */
+        bool started = false;            /* player-active claimed after 1st frame */
         while (!s_stop_req) {
             if (s_pause_req) {
                 ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -331,6 +334,15 @@ static void decode_loop(void)
                 break;
             }
             frame_cnt++;
+            if (!started) {
+                /* Claim the I2S bus only AFTER the first decoded frame has been
+                 * enqueued and its sample rate applied. This closes the window
+                 * where the feed task would enable the channel and stream an
+                 * empty/stale ring (or reconfigure the rate) before any real
+                 * PCM arrived — which is what made the next track silent. */
+                hw_audio_set_player_active(true);
+                started = true;
+            }
         }
 
         ESP_LOGI(TAG, "track ended: frames=%u (~%u ms est.), %s",

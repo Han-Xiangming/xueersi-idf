@@ -58,6 +58,11 @@ void hw_audio_set_sample_rate(uint32_t sample_rate_hz);
 /* Mark/unmark the MP3 player as the owner of the I2S bus. */
 void hw_audio_set_player_active(bool active);
 
+/* Discard all PCM currently queued in the ring (leftovers from the previous
+ * track) without parking the channel. Call before starting a new track so the
+ * stream opens cleanly at the new sample rate. */
+void hw_audio_flush(void);
+
 /* Stream raw 16-bit stereo PCM (L,R interleaved). `frames` = number of
  * L/R pairs. Used by the MP3 player to output decoded audio. Samples are
  * filtered in place by the speaker-protection high-pass before enqueueing. */

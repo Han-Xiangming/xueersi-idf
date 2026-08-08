@@ -612,13 +612,36 @@ void hw_audio_set_sample_rate(uint32_t sample_rate_hz)
     }
 }
 
+/* Discard everything currently queued in the PCM ring (e.g. leftovers from
+ * the previous track) WITHOUT touching the feed task or parking the channel.
+ * The next samples enqueued start the stream cleanly at the new track's rate.
+ * Safe to call from the player task; the ring is accessed lock-free here
+ * because the feed task only RECEIVES (never sends) into it. */
+void hw_audio_flush(void)
+{
+    if (s_pcm_ring == NULL) {
+        return;
+    }
+    uint8_t *item;
+    size_t item_size;
+    while ((item = (uint8_t *)xRingbufferReceive(s_pcm_ring, &item_size, 0)) != NULL) {
+        vRingbufferReturnItem(s_pcm_ring, item);
+    }
+    ESP_LOGD(TAG, "pcm ring flushed");
+}
+
 /* Mark/unmark the MP3 player as the owner of the I2S bus. */
 void hw_audio_set_player_active(bool active)
 {
     s_player_active = active;
     if (active) {
         s_feeding = true;
-        s_pending_rate = 0;           /* set by the first decoded frame */
+        /* NOTE: s_pending_rate is intentionally NOT cleared here. The first
+         * decoded frame sets it (via hw_audio_set_sample_rate) and the feed
+         * task applies it. Clearing it on activate would discard that rate
+         * whenever set_player_active(true) is deferred until after the first
+         * frame (as the player does), leaving the I2S clock stuck at the
+         * previous track's rate — which makes the next track silent. */
         audio_dsp_reset();            /* fresh filter history per track */
         s_vol_gain_sm = s_vol_gain;   /* start at full gain: no fade-in */
         audio_set_hpf_coeff(s_rate);  /* default-rate coeff until 1st frame */
@@ -630,6 +653,7 @@ void hw_audio_set_player_active(bool active)
     }
     else {
         s_feeding = false;            /* feed task drains the ring then idles */
+        s_pending_rate = 0;           /* drop any unapplied rate from the track */
         ESP_LOGD(TAG, "player inactive: draining ring");
     }
 }
