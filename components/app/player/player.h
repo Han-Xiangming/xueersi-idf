@@ -12,6 +12,11 @@
 
 #define MP3_NAME_LEN 64
 
+/* Max length of a fully-qualified track path ("/sdcard/<name>"). Kept in one
+ * place so the player / ebook buffers and the snprintf() calls below never
+ * disagree and can never overflow. */
+#define PLAYER_PATH_LEN 192
+
 typedef enum {
     PLAYER_IDLE = 0,
     PLAYER_PLAYING,

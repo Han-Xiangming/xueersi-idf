@@ -28,12 +28,12 @@ static const char *TAG = "player";
 static TaskHandle_t s_task;
 static player_state_t s_state = PLAYER_IDLE;
 
-static char s_path[192];        /* full path: /sdcard/<name> */
+static char s_path[PLAYER_PATH_LEN];        /* full path: /sdcard/<name> */
 static char s_name[MP3_NAME_LEN];
 static bool s_stop_req;
 static bool s_pause_req;
 static bool s_new_req;
-static char s_new_path[192];
+static char s_new_path[PLAYER_PATH_LEN];
 static char s_new_name[MP3_NAME_LEN];
 static uint32_t s_dbg_frames;          /* decode-frame counter for debug logs */
 static uint32_t s_dbg_rate;            /* samplerate captured from 1st frame */
@@ -149,6 +149,33 @@ const char *player_scan_name(int i)
     return s_scan_names[i];
 }
 
+/* Skip an ID3v2 tag at the head of the open file so the MP3 decoder doesn't
+ * mistake tag bytes for audio frame headers. An ID3v2 tag starts with the
+ * magic "ID3" followed by 7 bytes of header; the 4 size bytes are
+ * "syncsafe" (top bit always 0), so the real tag length is:
+ *   (b0<<21)|(b1<<14)|(b2<<7)|b3   + 10 header bytes.
+ * Without this, MP3FindSyncWord can lock onto a 0xFFEx sequence inside the
+ * tag and report a bogus sample rate, wrecking pitch/speed for the track. */
+static void skip_id3v2(void)
+{
+    unsigned char hdr[10];
+    long base = ftell(s_src.fp);
+    if (fread(hdr, 1, sizeof(hdr), s_src.fp) != sizeof(hdr)) {
+        fseek(s_src.fp, base, SEEK_SET);
+        return;
+    }
+    if (hdr[0] != 'I' || hdr[1] != 'D' || hdr[2] != '3') {
+        fseek(s_src.fp, base, SEEK_SET);   /* not an ID3v2 tag: rewind */
+        return;
+    }
+    long size = ((long)(hdr[6] & 0x7f) << 21) |
+                ((long)(hdr[7] & 0x7f) << 14) |
+                ((long)(hdr[8] & 0x7f) << 7)  |
+                ((long)(hdr[9] & 0x7f));
+    fseek(s_src.fp, base + 10 + size, SEEK_SET);
+    ESP_LOGD(TAG, "skipped ID3v2 tag (%ld bytes)", 10L + size);
+}
+
 static bool open_track(void)
 {
     s_src.fp = fopen(s_path, "rb");
@@ -164,6 +191,7 @@ static bool open_track(void)
         s_src.fp = NULL;
         return false;
     }
+    skip_id3v2();   /* the decoder must only see real audio frames */
     s_bytes_left = 0;
     s_consumed = 0;
     return true;
@@ -357,9 +385,15 @@ const char *player_current_name(void)
 
 void player_play(const char *name)
 {
+    /* Clamp the track name to MP3_NAME_LEN so the "/sdcard/<name>" path can
+     * never exceed PLAYER_PATH_LEN (strlen("/sdcard/") + MP3_NAME_LEN). */
+    size_t nlen = strnlen(name, MP3_NAME_LEN + 1);
+    if (nlen > MP3_NAME_LEN) {
+        ESP_LOGW(TAG, "name too long (%u), truncating", (unsigned)nlen);
+    }
     strncpy(s_new_name, name, sizeof(s_new_name) - 1);
     s_new_name[sizeof(s_new_name) - 1] = '\0';
-    snprintf(s_new_path, sizeof(s_new_path), "/sdcard/%s", name);
+    snprintf(s_new_path, sizeof(s_new_path), "/sdcard/%s", s_new_name);
 
     s_new_req = true;
     s_stop_req = true;          /* ask any current decode to stop */
