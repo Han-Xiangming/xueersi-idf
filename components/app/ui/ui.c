@@ -629,40 +629,47 @@ static void ui_build_ebook_list(lv_obj_t *page)
 
 static void ui_build_ebook_read(lv_obj_t *page)
 {
-    /* Single body label: the reader engine joins exactly 5 lines with '\n'
+    /* Single body label: the reader engine joins exactly 8 lines with '\n'
      * and measures with the same font, so the layout matches exactly. The
-     * 16 px font's natural line height is 30 px, so the widget must be
-     * 5*30 = 150 px tall (y=36..186) to hold all 5 rows. */
+     * 16 px font's natural line height is 30 px; we compress it with a
+     * negative line-space so the effective row height becomes 22 px and the
+     * widget needs 8*22 = 176 px (y=36..212, just above the y=214 status bar). */
     lv_obj_t *txt = lv_label_create(page);
     lv_label_set_long_mode(txt, LV_LABEL_LONG_MODE_CLIP);
-    lv_obj_set_pos(txt, 8, 36);
-    lv_obj_set_size(txt, 304, 150);
+    lv_obj_set_pos(txt, 0, 36);
+    lv_obj_set_size(txt, 320, 176);
     lv_obj_set_style_text_font(txt, &lv_font_cn_16, 0);
     lv_obj_set_style_text_color(txt, lv_color_hex(UI_GRAY), 0);
+    lv_obj_set_style_text_line_space(txt, -8, 0);
     s_ui.eb_text_label = txt;
 
     /* Status row: wide text progress bar at the left (28 cells) and the
      * percentage right-aligned to the screen's right edge. The centered hint
-     * label below is used only by toasts (see ui_set_hint). */
+     * label below is used only by toasts (see ui_set_hint). The status row
+     * sits 20 px below the 6-line body (body ends at y=168 -> y=188) so it is
+     * clearly separated; compress line space to keep it a slim one-line strip.
+     * The hint row sits just under it. */
     lv_obj_t *bar = lv_label_create(page);
     lv_label_set_text(bar, "[----------------------------]");
     lv_label_set_long_mode(bar, LV_LABEL_LONG_MODE_CLIP);
-    lv_obj_set_pos(bar, 8, 198);
+    lv_obj_set_pos(bar, 8, 214);
     lv_obj_set_style_text_font(bar, &lv_font_cn_16, 0);
     lv_obj_set_style_text_color(bar, lv_color_hex(UI_GRAY), 0);
+    lv_obj_set_style_text_line_space(bar, -8, 0);
     s_ui.eb_bar = bar;
 
     lv_obj_t *pct = lv_label_create(page);
     lv_label_set_text(pct, "0%");
     lv_label_set_long_mode(pct, LV_LABEL_LONG_MODE_CLIP);
-    lv_obj_set_pos(pct, 272, 198);
+    lv_obj_set_pos(pct, 272, 214);
     lv_obj_set_size(pct, 40, LV_SIZE_CONTENT);
     lv_obj_set_style_text_font(pct, &lv_font_cn_16, 0);
     lv_obj_set_style_text_color(pct, lv_color_hex(UI_GRAY), 0);
     lv_obj_set_style_text_align(pct, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_text_line_space(pct, -8, 0);
     s_ui.eb_pct = pct;
 
-    s_ui.hint = ui_label(page, "", 198, UI_GRAY, &lv_font_cn_16,
+    s_ui.hint = ui_label(page, "", 214, UI_GRAY, &lv_font_cn_16,
                          LV_TEXT_ALIGN_CENTER);
 }
 

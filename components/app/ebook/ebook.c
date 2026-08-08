@@ -24,8 +24,15 @@ static const char *TAG = "ebook";
 #define EBOOK_LIST_MAX      64           /* max books in the scan list */
 #define EBOOK_CHUNK         (4 * 1024)   /* stream window of the reader */
 #define EBOOK_PAGE_BUF      1024         /* rendered page text buffer */
-#define EBOOK_PAGE_LINES    5            /* lines per page */
-#define EBOOK_LINE_W        304          /* text-area width, px (= LCD_H_RES - 16) */
+#define EBOOK_PAGE_LINES    8            /* lines per page. Body label starts at
+                                          * y=36 and the status bar at y=214, leaving
+                                          * ~178 px; at 22 px/row that holds 8 rows
+                                          * (8*22=176) without colliding with the bar. */
+#define EBOOK_LINE_W        320          /* text-area width, px (= LCD_H_RES, full screen)
+                                          * Raised from 304 (LCD_H_RES-16) so a line can
+                                          * hold 20 full-width glyphs (20*16=320) instead of
+                                          * 19, killing the trailing right margin. The UI
+                                          * label is sized to match (see ui.c). */
 #define EBOOK_LINE_W16      (EBOOK_LINE_W * 16)  /* width in 1/16 px */
 #define EBOOK_CHAR_W16      256          /* fullwidth advance, 1/16 px = 16 px */
 #define EBOOK_HIST_N        32           /* page-start offset history ring */
@@ -37,14 +44,15 @@ extern const uint8_t _binary_Test_txt_start[];
 extern const uint8_t _binary_Test_txt_end[];
 
 /* ASCII advance widths (1/16 px), copied verbatim from the lv_font_cn_16
- * glyph_dsc table so the reader's line breaks match LVGL rendering. */
+ * glyph_dsc table so the reader's line breaks match LVGL rendering. Indexed
+ * by the ASCII code point (0x20..0x7E); the rest are left at 0. */
 static const uint16_t s_ascii_w16[128] = {
-    /* 0x20 */ 57, 80, 117, 141, 141, 234, 172, 69, 85, 85, 118, 141, 69, 88, 69, 100,
-    /* 0x30 */ 141, 141, 141, 141, 141, 141, 141, 141, 141, 141, 69, 69, 141, 141, 141, 120,
-    /* 0x40 */ 239, 154, 167, 162, 175, 150, 140, 175, 185, 73, 136, 164, 137, 206, 184, 189,
-    /* 0x50 */ 160, 189, 161, 151, 152, 183, 145, 223, 144, 134, 154, 85, 100, 85, 141, 143,
-    /* 0x60 */ 154, 143, 157, 130, 157, 141, 81, 143, 154, 69, 69, 139, 71, 236, 155, 154,
-    /* 0x70 */ 157, 157, 97, 119, 95, 154, 131, 203, 124, 131, 120, 85, 68, 85, 141,
+    [0x20] = 57, 80, 117, 141, 141, 234, 172, 69, 85, 85, 118, 141, 69, 88, 69, 100,
+    [0x30] = 141, 141, 141, 141, 141, 141, 141, 141, 141, 141, 69, 69, 141, 141, 141, 120,
+    [0x40] = 239, 154, 167, 162, 175, 150, 140, 175, 185, 73, 136, 164, 137, 206, 184, 189,
+    [0x50] = 160, 189, 161, 151, 152, 183, 145, 223, 144, 134, 154, 85, 100, 85, 141, 143,
+    [0x60] = 154, 143, 157, 130, 157, 141, 81, 143, 154, 69, 69, 139, 71, 236, 155, 154,
+    [0x70] = 157, 157, 97, 119, 95, 154, 131, 203, 124, 131, 120, 85, 68, 85, 141,
 };
 
 /* Real advances (1/16 px) of the rare typographic glyphs that lv_font_cn_16
@@ -74,27 +82,25 @@ static bool typ_adv_w(uint32_t cp, uint32_t *out)
     return false;
 }
 
-/* Trailing punctuation that must not begin a line (docs/ebook.md 4.2). */
-static bool is_trail_punct(uint32_t cp)
-{
-    switch (cp) {
-    case 0x3002: case 0x3001: case 0xFF01: case 0xFF1F: case 0xFF0C:
-    case 0xFF1B: case 0xFF1A: case 0xFF09: case 0x3009: case 0x300B:
-    case 0x300D: case 0x300F: case 0x3011: case 0x2026: case 0x201D:
-    case 0x2019: case 0x22: case 0x27: case 0x60: case 0x29:
-    case 0x5D: case 0x7D:
-        return true;
-    default:
-        return false;
-    }
-}
+/* ---------------------------------------------------------------------------
+ * Line-break model: keep ONLY the source file's own line breaks.
+ *
+ * There is no character-class / punctuation / word rule layer at all. A display
+ * line ends only when:
+ *   1. the source text contains a newline (\n / \r / CRLF) — preserved verbatim;
+ *   2. the next glyph would overflow the line width — then we hard-break right
+ *      before it, so each line is filled to the brim.
+ * Nothing else influences breaking. Deterministic: identical input always
+ * yields identical output, so page flips and the background total-page count
+ * agree.
+ * ------------------------------------------------------------------------- */
 
-/* Half-width form of a line-ending punctuation (标点压缩, docs/ebook.md 4.2).
- * The lv_font_cn_16 font carries no narrow CJK punctuation, so the narrow
- * ASCII look-alike is substituted: its true advance (s_ascii_w16) is smaller
- * than the 256/16 px full-width advance, freeing 8-12 px at the line end.
- * Substitutes are guaranteed to exist in the font (0x20-0x7E). Returns 0 for
- * code points without a usable narrow form (e.g. 0x2026 …). */
+/* Half-width form of a line-ending CJK punctuation (标点压缩, docs/ebook.md
+ * 4.2). The lv_font_cn_16 font carries no narrow CJK punctuation, so the narrow
+ * ASCII look-alike is substituted: its advance (s_ascii_w16) is smaller than the
+ * 256/16 px full-width advance, freeing pixels at the line end. Returns 0 when
+ * no usable narrow form exists (e.g. 0x2026 …); in that case the glyph is drawn
+ * at its true advance. */
 static uint8_t compress_punct(uint32_t cp)
 {
     switch (cp) {
@@ -269,228 +275,177 @@ static void line_end(char *out, size_t *out_len, size_t cap,
     *w16 = 0;
 }
 
-/* Drop a dangling trailing space so that no line ends with one (docs/ebook.md
- * 4.3). *last_sp tracks whether the most recent emit was a space; when out is
- * NULL (page-count path) only the flag is cleared -- the popped advance affects
- * only the already-finished line, never following offsets. */
-static void line_drop_space(char *out, size_t *out_len, uint32_t *w16,
-                            bool *last_sp)
+/* Width (1/16 px) of one code point, honoring 标点压缩: a compressible
+ * full-width punctuation is measured at its narrow ASCII advance. CJK and the
+ * bulk of full-width glyphs use EBOOK_CHAR_W16. The exact advances of the rare
+ * typographic glyphs come from s_typ_w16. */
+static uint32_t cp_width(uint32_t cp)
 {
-    if (!*last_sp) {
-        return;
+    if (cp < 0x80) {
+        /* Outside the printable ASCII range (control chars etc.) measure as a
+         * space so they don't corrupt line-fill accounting. */
+        return (cp >= 0x20) ? s_ascii_w16[cp] : s_ascii_w16[0x20];
     }
-    if (out) {
-        while (*out_len > 0 && out[*out_len - 1] == ' ') {
-            (*out_len)--;
-            *w16 -= s_ascii_w16[' '];
+    uint8_t sub = compress_punct(cp);
+    if (sub) {
+        return s_ascii_w16[sub];
+    }
+    uint32_t w;
+    if (typ_adv_w(cp, &w)) {
+        return w;
+    }
+    return EBOOK_CHAR_W16;
+}
+
+/* Skip one newline sequence (LF, or CR / CRLF) at `off`. Returns the offset
+ * just past it. */
+static size_t skip_newline(reader_t *r, size_t off)
+{
+    uint8_t raw[4];
+    int len;
+    int32_t c = reader_char(r, off, raw, &len);
+    if (c == '\n') {
+        return off + (size_t)len;
+    }
+    if (c == '\r') {
+        size_t n = off + (size_t)len;
+        int32_t d = reader_char(r, n, raw, &len);
+        if (d == '\n') {
+            return n + (size_t)len;
         }
+        return n;
     }
-    *last_sp = false;
+    return off;
+}
+
+/* --- greedy line-fill engine (deterministic pagination) ---
+ *
+ * Pipeline:  scan glyphs  ->  emit  ->  break on newline OR width overflow.
+ *
+ * fill_line() walks the source from *po, measuring each glyph with cp_width()
+ * and emitting it. A line stops at the EARLIEST of:
+ *   - a source newline (\n / \r / CRLF): preserved verbatim as a hard break;
+ *   - the next glyph overflowing EBOOK_LINE_W16: a hard break is taken right
+ *     before it, so the line is filled to the brim.
+ * No other rule exists: no word integrity, no punctuation guard, no "--"
+ * handling, no soft-line merging. Deterministic pagination follows. */
+
+/* Fill one display line starting at *po. Emits glyphs into out[] and stops at
+ * the first source newline or when the next glyph would overflow the line
+ * width. On return:
+ *   *po     advanced past the consumed text (points at the next line's start,
+ *           i.e. just past a consumed newline, or at the overflowing glyph),
+ *   *eof    set if the source ran out,
+ *   *nl     set true if the line ended because of a source newline (not EOF or
+ *           width overflow).
+ * Returns true if a line was produced (the caller should emit a line
+ * terminator unless this was the last page line). */
+static bool fill_line(reader_t *r, size_t *po, char *out, size_t *out_len,
+                      size_t cap, bool *eof, bool *nl)
+{
+    uint32_t w16 = 0;
+    bool eof_l = false;
+    bool nl_l = false;
+
+    for (;;) {
+        size_t cur = *po;
+        uint8_t raw[4];
+        int clen;
+        int32_t cp = reader_char(r, cur, raw, &clen);
+        if (cp < 0) {
+            eof_l = true;
+            break;
+        }
+
+        /* Source newline: preserve it as a hard line break. */
+        if (cp == '\n' || cp == '\r') {
+            *po = skip_newline(r, cur);
+            nl_l = true;
+            break;
+        }
+
+        /* Normalize the emitted code point (tab -> space). */
+        int32_t emit_cp = cp;
+        uint8_t emit_raw[4];
+        int emit_len = clen;
+        if (cp == '\t') {
+            emit_cp = ' ';
+            emit_raw[0] = ' ';
+            emit_len = 1;
+        } else {
+            for (int i = 0; i < clen; i++) {
+                emit_raw[i] = raw[i];
+            }
+        }
+
+        uint32_t cw = cp_width((uint32_t)emit_cp);
+
+        /* Width overflow: hard-break BEFORE this glyph so the line is full. */
+        if (w16 > 0 && w16 + cw > EBOOK_LINE_W16) {
+            break;
+        }
+
+        /* Never start a line with a space (a wrapped line that began with one). */
+        if (w16 == 0 && emit_cp == ' ') {
+            *po = cur + (size_t)clen;
+            continue;
+        }
+
+        /* Emit. */
+        uint8_t sub = (emit_cp >= 0x80) ? compress_punct((uint32_t)emit_cp) : 0;
+        if (sub) {
+            page_putc(out, out_len, cap, (char)sub);
+        } else if (emit_cp < 0x80) {
+            page_putc(out, out_len, cap, (char)emit_cp);
+        } else {
+            page_put_raw(out, out_len, cap, emit_raw, emit_len);
+        }
+        w16 += cw;
+        *po = cur + (size_t)clen;
+    }
+
+    *eof = eof_l;
+    *nl = nl_l;
+    return true;
 }
 
 /* Lay out one page of exactly EBOOK_PAGE_LINES lines starting at byte offset
  * `start`. Writes the page text into `out` (NUL-terminated) when non-NULL.
- * Returns the byte offset where the next page starts (== file size at EOF).
- * Deterministic: the same input always yields the same output, so page flips
- * and the background total-page count cannot diverge. */
+ * Returns the byte offset where the next page starts (== file size at EOF). */
 static size_t layout_page(reader_t *r, size_t start, char *out, size_t cap)
 {
     size_t o = start;
     size_t out_len = 0;
     int line = 0;
-    uint32_t w16 = 0;
     bool eof = false;
-    bool last_sp = false;                /* last emitted char was a space */
+    uint32_t w16 = 0;                     /* scratch line width (cleared by helpers) */
 
     if (o == 0 && reader_byte(r, 0) == 0xEF &&
         reader_byte(r, 1) == 0xBB && reader_byte(r, 2) == 0xBF) {
         o = 3;                           /* strip UTF-8 BOM */
     }
 
-    while (line < EBOOK_PAGE_LINES) {
-        uint8_t raw[4];
-        int clen;
-        size_t po = o;
-        int32_t cp = reader_char(r, po, raw, &clen);
-        if (cp < 0) {
-            eof = true;
-            break;
-        }
+    while (line < EBOOK_PAGE_LINES && !eof) {
+        bool line_eof = false;
+        bool line_nl = false;
+        fill_line(r, &o, out, &out_len, cap, &line_eof, &line_nl);
+        eof = line_eof;
 
-        if (cp == '\r') {                /* CRLF -> LF */
-            o = po + (size_t)clen;
-            continue;
-        }
-        if (cp == '\t') {                /* tab -> space */
-            raw[0] = ' ';
-            clen = 1;
-            cp = ' ';
-        }
-
-        /* 标点压缩: every compressible full-width punctuation is emitted in
-         * its narrow ASCII form and measured at the ASCII advance, so lines
-         * hold more characters (docs/ebook.md 4.2). */
-        const uint8_t sub = compress_punct((uint32_t)cp);
-        uint32_t cw;
-        if (cp < 0x80) {
-            cw = s_ascii_w16[cp];
-        }
-        else if (sub) {
-            cw = s_ascii_w16[sub];
-        }
-        else if (!typ_adv_w((uint32_t)cp, &cw)) {
-            cw = EBOOK_CHAR_W16;         /* CJK / 全角 = fixed 256/16 px = 16 px */
-        }
-
-        if (cp == ' ') {
-            if (w16 == 0) {              /* never begin a line with a space */
-                o = po + (size_t)clen;
-                continue;
-            }
-            if (w16 + cw > EBOOK_LINE_W16) {   /* dangling space: drop it */
-                line_drop_space(out, &out_len, &w16, &last_sp);
-                o = po + (size_t)clen;
-                line_end(out, &out_len, cap, &line, &w16);
-                continue;
-            }
-            page_putc(out, &out_len, cap, ' ');
-            w16 += cw;
-            last_sp = true;
-            o = po + (size_t)clen;
-            continue;
-        }
-
-        if (cp >= 0x21 && cp <= 0x7E) {
-            /* ASCII run. We only protect real words (a run that contains at
-             * least one letter/digit: route numbers, URLs, "9路" style tokens)
-             * from being split. Pure separators (only '-' '.' '/' ' ' etc, no
-             * alphanumeric) are breakable so route lists such as
-             *   "赣州六中 -- 工业路口 -- 华坚鞋城 -- ..."
-             * can break at the separator instead of pushing the whole "-- "
-             * run to the next line (which left the previous line short and put
-             * an ugly "--" at the next line's head). See docs/ebook.md 4.2(4). */
-            size_t run_off = po;
-            uint32_t run_w = 0;
-            int has_alnum = 0;
-            size_t last_space = 0;   /* offset just after a space in the run */
-            int has_space = 0;
-            while (1) {
-                int bo = reader_byte(r, run_off);
-                if (bo < 0x21 || bo > 0x7E) {
-                    break;
-                }
-                run_w += s_ascii_w16[bo];
-                if ((bo >= '0' && bo <= '9') ||
-                    (bo >= 'A' && bo <= 'Z') ||
-                    (bo >= 'a' && bo <= 'z')) {
-                    has_alnum = 1;
-                }
-                if (bo == ' ') {
-                    last_space = run_off + 1;
-                    has_space = 1;
-                }
-                run_off++;
-            }
-
-            if (w16 > 0 && w16 + run_w > EBOOK_LINE_W16) {
-                if (has_alnum) {
-                    /* Real word: keep it intact — break before it (and drop
-                     * the dangling space already placed at line end). */
-                    line_drop_space(out, &out_len, &w16, &last_sp);
-                    line_end(out, &out_len, cap, &line, &w16);
-                    continue;
-                }
-                /* Pure separator run (e.g. "-- " or ". "). Try to break inside
-                 * at the last space so the next line starts with the following
-                 * CJK word instead of a hanging "-- ". */
-                if (has_space && w16 + (run_w - (uint32_t)(last_space - po) * 0) > 0) {
-                    /* Width of the part after the last space. */
-                    uint32_t tail_w = 0;
-                    for (size_t k = last_space; k < run_off; k++) {
-                        tail_w += s_ascii_w16[reader_byte(r, k)];
-                    }
-                    if (w16 + tail_w <= EBOOK_LINE_W16 && tail_w > 0) {
-                        /* Keep everything up to the last space on this line. */
-                        while (po < last_space) {
-                            page_putc(out, &out_len, cap, (char)reader_byte(r, po));
-                            w16 += s_ascii_w16[reader_byte(r, po)];
-                            po++;
-                        }
-                        line_drop_space(out, &out_len, &w16, &last_sp);
-                        line_end(out, &out_len, cap, &line, &w16);
-                        continue;
-                    }
-                }
-                /* Separator run does not fit at all: drop it, next line starts
-                 * with the following CJK word (no hanging "--" at line head). */
-                line_drop_space(out, &out_len, &w16, &last_sp);
-                line_end(out, &out_len, cap, &line, &w16);
-                o = run_off;
-                continue;
-            }
-            while (po < run_off) {
-                page_putc(out, &out_len, cap, (char)reader_byte(r, po));
-                w16 += s_ascii_w16[reader_byte(r, po)];
-                po++;
-            }
-            last_sp = false;
-            o = run_off;
-            continue;
-        }
-
-        if (cp != '\n' && w16 > 0 && w16 + cw > EBOOK_LINE_W16) {
-            if (sub) {
-                /* Trailing punctuation must not begin a line: absorb it (it
-                 * is already in its narrow form) and break. */
-                page_putc(out, &out_len, cap, (char)sub);
-                w16 += cw;
-                last_sp = false;
-                o = po + (size_t)clen;
-                line_end(out, &out_len, cap, &line, &w16);
-                continue;
-            }
-            if (is_trail_punct((uint32_t)cp)) {
-                /* No narrow form (e.g. 0x2026 …): absorb full-width as
-                 * before (may spill a few px; the bitmap of these glyphs is
-                 * narrow, so clipping does not eat it). */
-                page_put_raw(out, &out_len, cap, raw, clen);
-                w16 += cw;
-                last_sp = false;
-                o = po + (size_t)clen;
-                line_end(out, &out_len, cap, &line, &w16);
-                continue;
-            }
-            line_drop_space(out, &out_len, &w16, &last_sp);
-            line_end(out, &out_len, cap, &line, &w16);   /* hard break */
-        }
-
-        if (cp == '\n') {
-            line_drop_space(out, &out_len, &w16, &last_sp);
-            o = po + (size_t)clen;
-            line_end(out, &out_len, cap, &line, &w16);
-            continue;
-        }
-
-        if (sub) {
-            page_putc(out, &out_len, cap, (char)sub);
-        }
-        else {
-            page_put_raw(out, &out_len, cap, raw, clen);
-        }
-        w16 += cw;
-        last_sp = false;
-        o = po + (size_t)clen;
-    }
-
-    /* Last page: a dangling trailing '\n' (empty final line) is dropped,
-     * and trailing spaces are trimmed off the final line. */
-    if (out && eof && out_len > 0) {
-        if (out[out_len - 1] == '\n') {
-            out_len--;
-        }
+        /* Trim a dangling trailing space (a wrapped line is never started with
+         * one, but a source line may end with spaces). */
         while (out_len > 0 && out[out_len - 1] == ' ') {
             out_len--;
         }
+
+        if (!eof) {
+            line_end(out, &out_len, cap, &line, &w16);
+        } else {
+            /* Ran out of text: this is the final line, stop. */
+            break;
+        }
+    }
+    if (out && out_len > 0 && out[out_len - 1] == '\n') {
+        out_len--;
     }
     if (out) {
         out[out_len] = '\0';
