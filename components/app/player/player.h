@@ -10,12 +10,21 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define MP3_NAME_LEN 64
+/* Max length of a track file NAME (basename under /sdcard). Sized to the FATFS
+ * long-file-name limit (255 bytes) plus one NUL, so multi-byte (e.g. Japanese)
+ * titles are never truncated here — truncation for DISPLAY is the UI's job, not
+ * the player's, and a truncated name would fail to open on the SD card. */
+/* NOTE: MP3_NAME_LEN is 256 bytes. Do NOT declare a stack-local buffer of this
+ * size (e.g. `char tmp[MP3_NAME_LEN];`) inside a UI/refresh function — the lvgl
+ * task stack is only 10 KB and such an array overflows it under load, corrupting
+ * adjacent memory (seen as a SPI-bus ISR Guru Meditation). Use a `static` buffer
+ * or the dedicated display-width clipped copy instead. */
+#define MP3_NAME_LEN 256
 
 /* Max length of a fully-qualified track path ("/sdcard/<name>"). Kept in one
  * place so the player / ebook buffers and the snprintf() calls below never
- * disagree and can never overflow. */
-#define PLAYER_PATH_LEN 192
+ * disagree and can never overflow. 8 = strlen("/sdcard/"). */
+#define PLAYER_PATH_LEN (8 + MP3_NAME_LEN)
 
 typedef enum {
     PLAYER_IDLE = 0,

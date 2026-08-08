@@ -39,6 +39,7 @@ static volatile uint32_t s_passkey;  /* SSP numeric-comparison code */
  * is disabled in the build 鈥?the handlers are simply never invoked then. */
 static bt_avrc_cmd_cb_t s_avrc_cmd_cb;
 static bt_avrc_volume_cb_t s_avrc_vol_cb;
+static bt_conn_state_cb_t s_conn_state_cb;
 
 #if defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_A2DP_ENABLE)
 
@@ -296,6 +297,9 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             }
             ESP_LOGI(TAG, "A2DP connected, checking media readiness");
             esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
+            if (s_conn_state_cb != NULL) {
+                s_conn_state_cb(true);
+            }
         }
         else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
             if (!s_connected && s_pair_state != BT_PAIR_IDLE) {
@@ -321,6 +325,9 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             s_connected = false;
             s_streaming = false;
             ESP_LOGI(TAG, "A2DP disconnected");
+            if (s_conn_state_cb != NULL) {
+                s_conn_state_cb(false);   /* link dropped: audio layer returns to speaker */
+            }
             if (s_disabling) {
                 /* The link is gone and Bluedroid has disarmed the media
                  * watchdog alarm. Defer the actual deinit to the Timer task:
@@ -979,6 +986,11 @@ void bt_audio_set_avrc_cmd_cb(bt_avrc_cmd_cb_t cb)
 void bt_audio_set_avrc_volume_cb(bt_avrc_volume_cb_t cb)
 {
     s_avrc_vol_cb = cb;
+}
+
+void bt_audio_set_conn_state_cb(bt_conn_state_cb_t cb)
+{
+    s_conn_state_cb = cb;
 }
 
 bt_pair_state_t bt_audio_pair_state(void)

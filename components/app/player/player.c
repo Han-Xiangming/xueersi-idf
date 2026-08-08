@@ -385,8 +385,9 @@ const char *player_current_name(void)
 
 void player_play(const char *name)
 {
-    /* Clamp the track name to MP3_NAME_LEN so the "/sdcard/<name>" path can
-     * never exceed PLAYER_PATH_LEN (strlen("/sdcard/") + MP3_NAME_LEN). */
+    /* Paths and names use one shared upper bound (MP3_NAME_LEN == 256, the
+     * FATFS LFN limit) so "/sdcard/<name>" can never exceed PLAYER_PATH_LEN.
+     * We only warn/truncate past that bound — multi-byte titles stay intact. */
     size_t nlen = strnlen(name, MP3_NAME_LEN + 1);
     if (nlen > MP3_NAME_LEN) {
         ESP_LOGW(TAG, "name too long (%u), truncating", (unsigned)nlen);

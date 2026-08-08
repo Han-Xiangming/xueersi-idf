@@ -123,7 +123,16 @@ typedef void (*bt_avrc_cmd_cb_t)(bt_avrc_cmd_t cmd);
  * scale). Map it to a 0..100% master volume on the application side. */
 typedef void (*bt_avrc_volume_cb_t)(uint8_t volume_0_127);
 
+/* Invoked when the A2DP link state changes: connected=true once a sink is up,
+ * connected=false when it drops (remote power-off, out of range, or a failed
+ * dial-out). The audio layer uses this to return the route to the speaker on a
+ * drop without waiting for the UI to poll; it intentionally does NOT auto-take
+ * the route on connect (that stays an explicit user action) so a speaker
+ * session is never silently hijacked. */
+typedef void (*bt_conn_state_cb_t)(bool connected);
+
 /* Register handlers for remote AVRCP commands. Safe to call at any time;
  * passing NULL disables the corresponding handler. */
 void bt_audio_set_avrc_cmd_cb(bt_avrc_cmd_cb_t cb);
 void bt_audio_set_avrc_volume_cb(bt_avrc_volume_cb_t cb);
+void bt_audio_set_conn_state_cb(bt_conn_state_cb_t cb);

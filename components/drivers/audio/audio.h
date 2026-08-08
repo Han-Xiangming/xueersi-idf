@@ -10,8 +10,29 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Initialize the I2S peripheral and the MAX98357 DAC. */
+/* Audio output route: a single, explicit either/or switch. Exactly ONE
+ * destination is active at any time and only hw_audio_set_route() changes it.
+ * Bluetooth connection state does NOT touch the route — the caller (UI) must
+ * flip it explicitly when it wants Bluetooth output. This keeps playback
+ * deterministic: a speaker session never gets silently hijacked by a Bluetooth
+ * link coming up. */
+typedef enum {
+    AUDIO_ROUTE_SPEAKER,   /* local MAX98357 I2S speaker (default) */
+    AUDIO_ROUTE_BT,        /* Bluetooth A2DP sink (headphones / BT speaker) */
+} audio_route_t;
+
+/* Initialize the I2S peripheral and the MAX98357 DAC. Leaves the route at its
+ * default (SPEAKER). */
 void hw_audio_init(void);
+
+/* Explicitly select the active output route. The writer streams to exactly
+ * this destination. Switching away from the speaker parks the I2S feed (the
+ * amp powers down) so it goes truly silent instead of starving its ring;
+ * switching back resumes it. This is the ONLY way the route changes. */
+void hw_audio_set_route(audio_route_t route);
+
+/* Current active output route. */
+audio_route_t hw_audio_get_route(void);
 
 /* Volume (0..100 %) of the ACTIVE route: while a Bluetooth sink is linked
  * and BT output is on, the BT volume is adjusted; otherwise the speaker

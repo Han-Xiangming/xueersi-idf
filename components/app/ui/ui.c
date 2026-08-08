@@ -1113,15 +1113,20 @@ void ui_refresh(void)
             int idx = top + i;
             const int sel = (idx == s_mp3_sel);
             if (idx < s_mp3_count) {
-                char tmp[MP3_NAME_LEN];
-                copy_utf8_clipped(tmp, sizeof(tmp), player_scan_name(idx));
+                /* Static scratch buffer: this runs every UI refresh (16 ms). The
+                 * lvgl task stack is only 10 KB, so a 256-byte stack array here
+                 * overflows it under load (BT+SDSPI IRQs) and corrupts adjacent
+                 * memory — surfacing as a SPI ISR Guru Meditation. */
+                static char s_pl_name_buf[MP3_NAME_LEN];
+                copy_utf8_clipped(s_pl_name_buf, sizeof(s_pl_name_buf),
+                                  player_scan_name(idx));
                 ui_label_set(s_ui.pl_cursor[i], sel ? ">" : " ");
                 if (sel_changed) {
                     lv_obj_set_style_text_color(s_ui.pl_cursor[i], lv_color_hex(UI_CYAN), 0);
                     lv_obj_set_style_text_color(s_ui.pl_text[i],
                                                 lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
                 }
-                ui_label_set(s_ui.pl_text[i], tmp);
+                ui_label_set(s_ui.pl_text[i], s_pl_name_buf);
             }
             else {
                 ui_label_set(s_ui.pl_cursor[i], " ");
@@ -1219,6 +1224,9 @@ void ui_refresh(void)
             st[27] = '\0';
             ui_label_set(s_ui.bt_status, st);
             ui_set_hint("A断开 B返回");
+            /* Connected sink takes over output: explicitly flip the route so
+             * decoded audio goes to Bluetooth instead of the speaker. */
+            hw_audio_set_route(AUDIO_ROUTE_BT);
         }
         else if (bt_audio_pair_state() == BT_PAIR_PAIRING) {
             /* Show the SSP passkey so the user can verify it on the sink. */
@@ -1277,8 +1285,9 @@ void ui_refresh(void)
             int idx = top + i;
             const int sel = (idx == s_eb_sel);
             if (idx < count) {
-                char tmp[64];
-                strip_txt_ext(tmp, sizeof(tmp), ebook_scan_name(idx));
+                static char s_eb_name_buf[64];
+                strip_txt_ext(s_eb_name_buf, sizeof(s_eb_name_buf),
+                              ebook_scan_name(idx));
                 ui_label_set(s_ui.eb_cursor[i], sel ? ">" : " ");
                 /* Paint the row color every refresh (not only on selection
                  * change) so the first paint after entering the page shows the
@@ -1287,7 +1296,7 @@ void ui_refresh(void)
                                             lv_color_hex(UI_CYAN), 0);
                 lv_obj_set_style_text_color(s_ui.eb_text[i],
                                             lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
-                ui_label_set(s_ui.eb_text[i], tmp);
+                ui_label_set(s_ui.eb_text[i], s_eb_name_buf);
             }
             else {
                 ui_label_set(s_ui.eb_cursor[i], " ");
@@ -1373,6 +1382,9 @@ static void ui_action(void)
         if (bt_audio_is_connected()) {
             set_action("断开中");
             bt_audio_disconnect();
+            /* Return output to the speaker immediately (the route is explicit;
+             * we don't wait for the link to actually drop). */
+            hw_audio_set_route(AUDIO_ROUTE_SPEAKER);
         }
         else if (bt_audio_device_count() > 0) {
             set_action("连接中");
