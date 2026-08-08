@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Hardware layer: Bluetooth A2DP Source audio output.
  * See hardware/bt_audio.h.
  *
@@ -685,11 +685,24 @@ void bt_audio_set_enabled(bool enabled)
             esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
             esp_a2d_source_disconnect(s_peer_bda);
         }
+        /* Force-clear all user-facing link state right now, so a later OFF->ON
+         * re-enable (or plain speaker playback) never observes a stale
+         * "connected"/"streaming" flag. The async disconnect event will simply
+         * re-confirm these. This keeps the audio route strictly tied to
+         * s_enabled and prevents the speaker from stalling on a half-closed link. */
+        s_streaming   = false;
+        s_connected   = false;
+        s_discovering = false;
+        s_pair_state  = BT_PAIR_IDLE;
     }
 }
 
 void bt_audio_scan_start(void)
 {
+    /* When BT output is off, no user-facing feature runs at all. */
+    if (!s_enabled) {
+        return;
+    }
     /* Never scan while linked: inquiry steals RF bandwidth from the A2DP
      * stream and makes playback stutter. */
     if (!s_initialized || s_disabling || s_discovering || s_connected) {
@@ -782,6 +795,11 @@ static void bt_conn_retry_cb(TimerHandle_t t)
 
 bool bt_audio_connect_index(int index)
 {
+    /* When BT output is off, do not dial out. The UI turns s_enabled on before
+     * reaching here on a real user connect, so this only blocks stray calls. */
+    if (!s_enabled) {
+        return false;
+    }
     if (!s_initialized || s_disabling || index < 0 || index >= s_dev_count) {
         return false;
     }
@@ -841,6 +859,13 @@ static void bt_ring_send(const void *data, size_t bytes)
 
 void bt_audio_set_sample_rate(uint32_t rate_hz)
 {
+    /* BT output off (or stack not up): do nothing. This is the hard gate that
+     * stops the "BT resampler" log and the resampler state-update from running
+     * when Bluetooth is disabled in settings. Without it, playback still calls
+     * this on every track and spams the log despite BT being off. */
+    if (!s_enabled || !s_initialized) {
+        return;
+    }
     if (rate_hz == 0 || rate_hz == s_in_rate) {
         return;
     }
@@ -999,4 +1024,9 @@ bool bt_audio_is_enabled(void)
 bool bt_audio_is_connected(void)
 {
     return s_connected;
+}
+
+bool bt_audio_is_streaming(void)
+{
+    return s_streaming;
 }

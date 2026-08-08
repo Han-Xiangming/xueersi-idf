@@ -28,12 +28,12 @@ static const char *TAG = "player";
 static TaskHandle_t s_task;
 static player_state_t s_state = PLAYER_IDLE;
 
-static char s_path[192];        /* full path: /sdcard/<name> */
+static char s_path[256];        /* full path: /sdcard/<name> */
 static char s_name[MP3_NAME_LEN];
 static bool s_stop_req;
 static bool s_pause_req;
 static bool s_new_req;
-static char s_new_path[192];
+static char s_new_path[256];
 static char s_new_name[MP3_NAME_LEN];
 static uint32_t s_dbg_frames;          /* decode-frame counter for debug logs */
 static uint32_t s_dbg_rate;            /* samplerate captured from 1st frame */
@@ -155,6 +155,27 @@ static bool open_track(void)
     if (s_src.fp == NULL) {
         ESP_LOGE(TAG, "open %s failed", s_path);
         return false;
+    }
+
+    /* Skip a leading ID3v2 tag if present. Its binary payload frequently
+     * contains 0xFFEx byte sequences that MP3FindSyncWord mistakes for a frame
+     * sync, which makes the very first MP3GetLastFrameInfo() return a bogus
+     * sample rate (e.g. 32000/22050 instead of the real 44100/48000). Seeking
+     * past it lets the decoder lock onto the true first audio frame. */
+    uint8_t hdr[10];
+    if (fread(hdr, 1, sizeof(hdr), s_src.fp) == sizeof(hdr) &&
+        hdr[0] == 'I' && hdr[1] == 'D' && hdr[2] == '3') {
+        /* Size is stored as a 4-byte synchsafe integer (7 bits per byte). */
+        uint32_t sz = ((uint32_t)(hdr[6] & 0x7F) << 21) |
+                      ((uint32_t)(hdr[7] & 0x7F) << 14) |
+                      ((uint32_t)(hdr[8] & 0x7F) << 7)  |
+                      ((uint32_t)(hdr[9] & 0x7F));
+        if (hdr[5] & 0x10) {           /* footer present: +10 bytes */
+            sz += 10;
+        }
+        fseek(s_src.fp, (long)(10 + sz), SEEK_SET);
+    } else {
+        fseek(s_src.fp, 0, SEEK_SET);  /* not an ID3 tag: rewind to start */
     }
 
     s_dec = MP3InitDecoder();

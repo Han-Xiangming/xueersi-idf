@@ -10,7 +10,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define MP3_NAME_LEN 64
+#define MP3_NAME_LEN 128
 
 typedef enum {
     PLAYER_IDLE = 0,
