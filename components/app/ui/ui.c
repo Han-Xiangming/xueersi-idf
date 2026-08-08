@@ -192,12 +192,12 @@ static void ui_settings_flush(void)
 
 static int s_setting_sel = 0;
 
-#define MP3_LIST_ROWS 4
-static const int s_pl_row_y[MP3_LIST_ROWS] = {38, 68, 98, 128};
+#define MP3_LIST_ROWS 6
+static const int s_pl_row_y[MP3_LIST_ROWS] = {38, 64, 90, 116, 142, 168};
 
 /* Bluetooth sink picker: same 4-row list layout as the MP3 page. */
-#define BT_LIST_ROWS 4
-static const int s_bt_row_y[BT_LIST_ROWS] = {38, 68, 98, 128};
+#define BT_LIST_ROWS 6
+static const int s_bt_row_y[BT_LIST_ROWS] = {38, 64, 90, 116, 142, 168};
 static int s_bt_sel;
 /* Snapshot of the BT device list so the UI does not re-format device names
  * (incl. the MAC-address fallback) on every 16 ms tick. Refreshed only when
@@ -211,8 +211,8 @@ static int s_mp3_count;
 static int s_mp3_sel;
 
 /* Ebook book-list page: same 4-row layout as the MP3 page. */
-#define EBOOK_LIST_ROWS 4
-static const int s_eb_row_y[EBOOK_LIST_ROWS] = {38, 68, 98, 128};
+#define EBOOK_LIST_ROWS 6
+static const int s_eb_row_y[EBOOK_LIST_ROWS] = {38, 64, 90, 116, 142, 168};
 static int s_eb_sel;
 static char s_eb_open_name[MP3_NAME_LEN];
 
@@ -554,8 +554,8 @@ static void ui_build_player(lv_obj_t *page)
         s_ui.pl_text[i] = txt;
     }
 
-    s_ui.pl_prog = ui_label(page, "空闲", 172, UI_GRAY, &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
-    s_ui.hint = ui_label(page, "上/下选择 A播放 B返回", 204, UI_GRAY, &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
+    s_ui.pl_prog = ui_label(page, "空闲", 196, UI_GRAY, &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
+    s_ui.hint = ui_label(page, "上/下选择 A播放 B返回", 214, UI_GRAY, &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
 }
 
 /* Bluetooth page: entering it kicks off a scan; the list fills live. */
@@ -580,9 +580,9 @@ static void ui_build_bt(lv_obj_t *page)
         s_ui.bt_text[i] = txt;
     }
 
-    s_ui.bt_status = ui_label(page, "扫描中...", 172, UI_GRAY,
+    s_ui.bt_status = ui_label(page, "扫描中...", 196, UI_GRAY,
                               &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
-    s_ui.hint = ui_label(page, "上/下选 A连接 B返回", 204, UI_GRAY,
+    s_ui.hint = ui_label(page, "上/下选 A连接 B返回", 214, UI_GRAY,
                          &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
 
     bt_audio_scan_start();
@@ -619,9 +619,9 @@ static void ui_build_ebook_list(lv_obj_t *page)
         s_ui.eb_text[i] = txt;
     }
 
-    s_ui.eb_status = ui_label(page, "扫描中...", 172, UI_GRAY,
+    s_ui.eb_status = ui_label(page, "扫描中...", 196, UI_GRAY,
                               &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
-    s_ui.hint = ui_label(page, "上/下选 A打开 B返回", 204, UI_GRAY,
+    s_ui.hint = ui_label(page, "上/下选 A打开 B返回", 214, UI_GRAY,
                          &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
 
     ebook_scan_start();

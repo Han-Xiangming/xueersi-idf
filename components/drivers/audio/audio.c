@@ -40,13 +40,15 @@ static const char *TAG = "hw_audio";
 
 /* Speaker-protection high-pass cutoff (Hz).
  *
- * Current speaker specs:
- *   Resonance F₀  : 820 Hz ~ 860 Hz
+ * Current speaker specs (racetrack phone unit):
+ *   Resonance Fs  : 880 Hz (850 ~ 920 Hz table)
+ *   Xmax          : ±0.22 mm (distortion limit)
  *   Frequency range: 800 Hz ~ 8000 Hz
- * The HPF removes everything below ~700 Hz so no excursion is wasted on
- * frequencies the cone cannot reproduce, protecting it and reducing
- * audible distortion around the resonance peak. */
-#define SPEAKER_HPF_FC_HZ   700
+ * The HPF removes everything below ~800 Hz so no excursion is wasted on
+ * frequencies the cone cannot reproduce; with Xmax this small, raising the
+ * corner from 700 Hz keeps the driver clear of its break-up region while
+ * still passing the rated band. */
+#define SPEAKER_HPF_FC_HZ   800
 
 /* PCM ring buffer: decouples MP3 decode from I2S output. Sized for >1s of
  * 44.1kHz stereo 16-bit audio so decode jitter / SD stalls are absorbed. */
@@ -73,8 +75,8 @@ static bool s_feeding;
 static uint32_t s_pending_rate;          /* applied serially by the feed task */
 
 /* --- Speaker-protection high-pass filter -------------------------------
- * The on-board driver is a small mid-band voice speaker (usable ~800 Hz..6 kHz,
- * resonance 800..1200 Hz). A 1st-order DC-blocking high-pass is inserted before
+ * The on-board driver is a small phone racetrack speaker (usable ~800 Hz..8 kHz,
+ * Fs ≈ 880 Hz, Xmax ±0.22 mm). A 1st-order DC-blocking high-pass is inserted before
  * the DAC so DC offsets and deep sub-bass (which the cone cannot reproduce and
  * only waste excursion / power) are removed, without touching the voice band.
  *
@@ -232,16 +234,20 @@ static void audio_select_route(void)
 }
 
 /* --- Loudness compensation (volume-dependent bass shelf) ----------------
- * At low output levels the ear is far less sensitive to low frequencies, so
- * quiet playback sounds thin. A one-pole low-pass is run in parallel with the
- * main path and added back with a boost that grows as the volume falls:
+ * At low volumes, the ear is quieter to low frequencies, so quiet playback
+ * sounds thin. A one-pole low-pass is run in parallel with the main path and
+ * added back with a boost that grows as the volume falls:
  *
  *     y = x + boost(v) * lp(x),   boost(v) = 10^(dB/20) - 1
- *     dB = (1 - v/100) * LOUDNESS_MAX_DB      (0 dB at v=100, +9 dB at v=0)
+ *   dB = (1 - v/100) * LOUDNESS_MAX_DB      (0 dB at v=100, +9 dB at v=0)
  *
  * At full volume the boost is 0 dB, so the shelf only adds level where the
- * master gain is small; the soft limiter below still bounds the peaks. */
-#define SPEAKER_LOUDNESS_FC_HZ 250   /* shelf low-pass corner (Hz) */
+ * master gain is small; the soft limiter below still bounds the peaks.
+ *
+ * The corner sits at the rated band edge (800 Hz) of the racetrack unit so
+ * the added signal stays inside what the cone can reproduce — a 250 Hz shelf
+ * was inaudible on this driver (the HPF already cuts below 800 Hz). */
+#define SPEAKER_LOUDNESS_FC_HZ 800   /* shelf low-pass corner (Hz) */
 
 static void audio_set_loudness_coeff(uint32_t rate)
 {
@@ -259,15 +265,18 @@ static void audio_set_loudness_coeff(uint32_t rate)
     }
 }
 
-/* --- Soft limiter (anti-clipping) ---------------------------------------
+/* --- Soft limiter (anti-clipping / small-driver protection) -------------
  * A hot track at v=100 passes 0 dB straight to the DAC and clips. A peak
  * envelope (instant attack, ~100 ms release) drives a gain that drops fast
- * (~0.5 ms) above the threshold and recovers slowly, so transients are tamed
- * without pumping. The gain curve is piecewise-linear, so no division runs
- * per sample: below the threshold the limiter is flat 0 dB, above it the
- * gain falls linearly to ~0.9 at full scale. */
-#define LOUD_LIMIT_THRESH     30000  /* peaks above this get tamed (FS=32767) */
-#define LOUD_LIMIT_SLOPE_Q15  38807  /* gain(env=32767) = 0.9 (-0.9 dB) */
+ * (~0.5 ms) above the threshold and recovers slowly, so transients are
+ * handled without pumping. The gain curve is piecewise-linear, so no division
+ * runs per sample: below the threshold the limiter is flat 0 dB, above it the
+ * gain falls linearly to ~0.9 at full scale.
+ *
+ * The racetrack unit reaches its Xmax (±0.22 mm) early at high level, so the
+ * threshold was pulled down from 30000 to curb the hot peaks sooner. */
+#define LOUD_LIMIT_THRESH     27000  /* peaks above this get tamed (FS=32767) */
+#define LOUD_LIMIT_SLOPE_Q15  18619  /* gain(env=32767) = 0.9 (-0.9 dB) */
 #define LOUD_LIMIT_MIN_Q15    24576  /* gain floor (0.75), unreachable here */
 #define LIM_ATT_Q15           1453   /* gain drop, ~0.5 ms @ 44.1 kHz */
 #define LIM_REL_Q15           32753  /* envelope & gain release, ~100 ms */
