@@ -197,17 +197,11 @@ static void audio_update_loudness_boost(void)
     s_loud_boost = (int32_t)((powf(10.0f, ldB / 20.0f) - 1.0f) * 32768.0f);
 }
 
-/* The ONE and ONLY routing decision: while decoded PCM is actually streaming
- * to the Bluetooth sink, the route is Bluetooth; otherwise it is the speaker.
- *
- * This uses bt_audio_is_streaming() (not bt_audio_is_connected()) so the volume
- * slot, the I2S park/unpark in the feed task and the per-sample routing in
- * hw_audio_write_pcm() all agree on a single definition of "BT route". A
- * connected-but-not-yet-streaming link therefore falls back to the speaker
- * instead of desyncing the volume slot from the actual output path. */
+/* True while the active audio route is Bluetooth (sink linked and BT output
+ * enabled) — mirrors the routing decision in hw_audio_write_pcm(). */
 static bool audio_route_is_bt(void)
 {
-    return bt_audio_is_enabled() && bt_audio_is_streaming();
+    return bt_audio_is_enabled() && bt_audio_is_connected();
 }
 
 static void audio_update_vol_gain(void)
@@ -293,37 +287,32 @@ static void audio_dsp_reset(void)
 }
 
 /* Apply a sample-rate change. Must only be called from the feed task so it is
- * serialized with the I2S writes. The I2S channel MUST be disabled before the
- * clock is reconfigured (ESP-IDF 5.x rejects reconfig on an enabled channel and
- * may hang the DMA). The channel is re-enabled by the speaker path of the feed
- * task (audio_feed_task), which already handles the enable + error path, so we
- * deliberately do NOT call i2s_channel_enable() here. */
+ * serialized with the I2S writes (reconfig disables the channel). When the
+ * channel is parked (idle / BT route) the reconfig runs straight on the
+ * disabled channel and it is re-enabled by the speaker path of the feed task. */
 static void apply_rate(uint32_t rate)
 {
     if (!s_ready || rate == s_rate) {
         return;
     }
     ESP_LOGI(TAG, "reconfig I2S rate %u -> %u", (unsigned)s_rate, (unsigned)rate);
-    /* Fully park the channel first. i2s_channel_disable() is asynchronous (it
-     * just stops the DMA), but reconfig_std_clock tolerates a channel that is
-     * merely "requested off"; the crucial part is that we never re-enable here
-     * and we leave s_i2s_enabled=false so the feed task re-enables it cleanly. */
     if (s_i2s_enabled) {
         i2s_channel_disable(s_tx);
         s_i2s_enabled = false;
     }
     i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(rate);
-    esp_err_t err = i2s_channel_reconfig_std_clock(s_tx, &clk);
+    i2s_channel_reconfig_std_clock(s_tx, &clk);
+    esp_err_t err = i2s_channel_enable(s_tx);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "reconfig clock failed: %s (rate stays %u)",
-                 esp_err_to_name(err), (unsigned)s_rate);
-        return;     /* keep old rate; feed task will retry next time */
+        ESP_LOGW(TAG, "reconfig enable failed: %s", esp_err_to_name(err));
+        s_i2s_enabled = false;
+    }
+    else {
+        s_i2s_enabled = true;
     }
     s_rate = rate;
     audio_set_hpf_coeff(s_rate);
     audio_set_loudness_coeff(s_rate);
-    /* s_i2s_enabled stays false: the speaker branch of audio_feed_task will
-     * i2s_channel_enable() on the next iteration, now at the new rate. */
 }
 
 static void audio_feed_task(void *arg)
@@ -341,8 +330,7 @@ static void audio_feed_task(void *arg)
         while (s_feeding) {
             /* Bluetooth route: decoded audio goes to the sink, the I2S ring is
              * never fed. Park the channel so the amp does not burn power on an
-             * idle BCLK while the headphones play. Uses the same routing
-             * decision as hw_audio_write_pcm() (audio_route_is_bt). */
+             * idle BCLK while the headphones play. */
             if (audio_route_is_bt()) {
                 if (s_ready && s_i2s_enabled) {
                     i2s_channel_disable(s_tx);
@@ -563,11 +551,7 @@ void hw_audio_set_avrc_volume(uint8_t volume_0_127)
 void hw_audio_set_sample_rate(uint32_t sample_rate_hz)
 {
     s_pending_rate = sample_rate_hz;
-    /* Skip the BT resampler entirely when BT output is off, so no CPU/time is
-     * wasted keeping its state in sync and no spurious log is emitted. */
-    if (bt_audio_is_enabled()) {
-        bt_audio_set_sample_rate(sample_rate_hz);
-    }
+    bt_audio_set_sample_rate(sample_rate_hz);
 }
 
 /* Mark/unmark the MP3 player as the owner of the I2S bus. */
@@ -613,13 +597,7 @@ void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
         return;
     }
 
-    /* Route to Bluetooth only while PCM is actually streaming to the sink.
-     * Using is_streaming (instead of is_connected) means a connected-but-not-
-     * yet-streaming link falls back to the speaker, so a half-closed BT link
-     * can never stall the speaker ring and freeze the decoder. BT OFF makes
-     * is_streaming false immediately (bt_audio_set_enabled clears it), which
-     * is exactly the "BT off => no BT function at all" guarantee. */
-    const bool bt_out = bt_audio_is_enabled() && bt_audio_is_streaming();
+    const bool bt_out = bt_audio_is_enabled() && bt_audio_is_connected();
     static bool s_prev_bt_out;
     if (bt_out != s_prev_bt_out) {
         s_prev_bt_out = bt_out;

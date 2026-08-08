@@ -619,7 +619,7 @@ static void ui_build_ebook_list(lv_obj_t *page)
         s_ui.eb_text[i] = txt;
     }
 
-    s_ui.eb_status = ui_label(page, "扫描中...", 190, UI_GRAY,
+    s_ui.eb_status = ui_label(page, "扫描中...", 172, UI_GRAY,
                               &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
     s_ui.hint = ui_label(page, "上/下选 A打开 B返回", 204, UI_GRAY,
                          &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
@@ -1526,13 +1526,13 @@ static void ui_adjust_lr(int dir)
     }
     case SETTING_BTOUT:
         /* Left = off, right = on. Toggling applies the routing gate and is
-         * persisted to NVS on the next flush. Switching OFF keeps the Bluetooth
-         * protocol stack initialised (so re-enabling is instant) but tears down
-         * every user-facing feature: bt_audio_set_enabled(false) disconnects any
-         * live sink, stops the media stream, and force-clears connected/
-         * streaming/discovering/pairing state. No controller power-down. */
+         * persisted to NVS on the next flush. Switching OFF also powers the
+         * Bluetooth controller fully down (if it was up) to save power. */
         s_bt_on = (dir > 0);
         bt_audio_set_enabled(s_bt_on);
+        if (!s_bt_on) {
+            bt_audio_disable();
+        }
         ui_settings_mark_dirty(SETTINGS_DIRTY_BT);
         set_action(s_bt_on ? "蓝牙开" : "蓝牙关");
         break;

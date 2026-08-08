@@ -49,11 +49,6 @@ bool bt_audio_is_enabled(void);
 /* True once a Bluetooth A2DP sink is connected. */
 bool bt_audio_is_connected(void);
 
-/* True only while decoded PCM is actually being streamed to the sink. Use
- * this (not bt_audio_is_connected) as the routing gate so a connected-but-not
- * yet-streaming link still falls back to the speaker instead of stalling it. */
-bool bt_audio_is_streaming(void);
-
 /* --- Sink discovery / selection (drives the BLUETOOTH UI page) ---------- */
 
 /* Clear the device list and start a GAP inquiry for audio sinks. */
