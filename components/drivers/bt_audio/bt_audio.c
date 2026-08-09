@@ -144,7 +144,7 @@ static uint32_t s_dev_version;
  * again after a short backoff, so we retry a bounded number of times instead of
  * making the user hammer the A button. The retry runs from a FreeRTOS timer
  * (not the BTC task), which is a safe context for esp_a2d_* calls. */
-#define BT_CONNECT_RETRY_MS   (2000)   /* backoff between auto retries */
+#define BT_CONNECT_RETRY_MS   (3500)   /* backoff between auto retries */
 #define BT_CONNECT_MAX_RETRY  (4)      /* give up after this many failures */
 static TimerHandle_t s_conn_timer;
 static bool          s_conn_auto;      /* user still wants this link up */
@@ -309,6 +309,13 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
                  * failure to the UI ("A閲嶈瘯"). */
                 if (s_conn_auto && s_conn_retries < BT_CONNECT_MAX_RETRY
                     && s_conn_timer != NULL) {
+                    /* Drop any half-open ACL left hanging from the failed
+                     * dial-out (Page Timeout / SDP race can leave a stale link
+                     * that makes the next esp_a2d_source_connect() overlap and
+                     * trip the BTC security state machine, "rs_disc_pending").
+                     * The disconnect is idempotent: if nothing is pending it is
+                     * a harmless no-op. Only then re-arm the backoff timer. */
+                    esp_a2d_source_disconnect(s_peer_bda);
                     xTimerStart(s_conn_timer, 0);   /* backoff then retry */
                 }
                 else {
@@ -772,7 +779,11 @@ static void bt_conn_retry_cb(TimerHandle_t t)
         return;                             /* linked, disabled, or gone */
     }
     if (s_pair_state == BT_PAIR_CONNECTING) {
-        /* Previous attempt still in flight; nudge again after the backoff. */
+        /* Previous dial-out still in flight (e.g. stuck in Page Timeout).
+         * Don't keep piling on timers: kick a disconnect to force the link
+         * back to a terminal state, then re-dial after the backoff. The
+         * disconnect is idempotent against an already-dead link. */
+        esp_a2d_source_disconnect(s_peer_bda);
         xTimerStart(s_conn_timer, 0);
         return;
     }

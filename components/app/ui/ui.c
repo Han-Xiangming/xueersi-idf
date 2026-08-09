@@ -72,7 +72,7 @@ typedef enum {
     SETTING_COUNT,
 } setting_item_t;
 
-static const int s_setting_y[SETTING_COUNT] = {38, 68, 98, 128, 158};
+static const int s_setting_y[SETTING_COUNT] = {34, 66, 98, 130, 162};
 
 /* Backlight brightness (0..100 %), driven via PWM on PIN_NUM_LCD_BL.
  * Persisted to NVS; restored at boot. */
@@ -561,9 +561,11 @@ static void ui_build_settings(lv_obj_t *page)
 
         lv_obj_t *val = lv_label_create(page);
         lv_label_set_long_mode(val, LV_LABEL_LONG_MODE_CLIP);
-        lv_obj_set_pos(val, 95, s_setting_y[i]);
+        lv_obj_set_size(val, 80, LV_SIZE_CONTENT);
+        lv_obj_set_pos(val, 232, s_setting_y[i]);
         lv_obj_set_style_text_font(val, &lv_font_cn_16, 0);
         lv_obj_set_style_text_color(val, lv_color_hex(UI_GRAY), 0);
+        lv_obj_set_style_text_align(val, LV_TEXT_ALIGN_RIGHT, 0);
         s_ui.set_value[i] = val;
     }
 

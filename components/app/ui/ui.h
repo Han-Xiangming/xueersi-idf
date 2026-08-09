@@ -13,7 +13,12 @@
 
 /* LVGL service timing / task parameters (application layer). */
 #define LVGL_TICK_PERIOD_MS         1
-#define LVGL_TASK_STACK_SIZE        (10 * 1024)
+/* Raised from 10 KB: under concurrent BT-A2DP encoding + SDSPI IRQs the LVGL
+ * flush path overflowed the 10 KB stack and corrupted the adjacent SPI bus
+ * background-lock struct, surfacing as a LoadProhibited panic inside the SPI
+ * ISR (spi_bus_lock.c:317). 16 KB leaves headroom for partial-refresh and
+ * lv_timer_handler(). */
+#define LVGL_TASK_STACK_SIZE        (16 * 1024)
 #define LVGL_TASK_PRIORITY          5
 #define LVGL_TASK_MIN_DELAY_MS      1
 #define LVGL_TASK_MAX_DELAY_MS      16
