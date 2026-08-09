@@ -60,19 +60,65 @@ static uint8_t  s_percent = BAT_INVALID_PERCENT;   /* raw mapped value */
 static uint8_t  s_percent_disp = BAT_INVALID_PERCENT; /* hysteresis-filtered for display */
 static bool     s_inited  = false;
 
-/* Map a pack voltage to 0..100 % with a clamped linear Li-ion curve.
- * Below BAT_V_EMPTY → 0 %, above BAT_V_FULL → 100 %. */
+/* Low-battery warning state (#9). The callback fires once when the level
+ * crosses DOWN through s_low_thresh, and re-arms only after the level recovers
+ * above it by BAT_LOW_REARM_MARGIN % — so a cell hovering at the threshold does
+ * not spam the application. */
+static uint8_t            s_low_thresh = 0;     /* 0 = disabled */
+static bt_battery_low_cb_t s_low_cb = NULL;
+static bool               s_low_armed = true;   /* armed = may fire next crossing */
+#define BAT_LOW_REARM_MARGIN   3               /* % hysteresis to re-arm */
+
+/* Map a pack voltage to 0..100 % via a piecewise open-circuit (rested) Li-ion
+ * table. A single-cell Li-ion curve is strongly non-linear: it sits on a long
+ * ~3.7 V plateau, so a linear 3.30→4.20 V map would report ~50 % near 3.75 V
+ * (actually ~70 %) and make the gauge jitter. The table below is entered as
+ * (voltage_V, percent) breakpoints, sorted ascending; values between breakpoints
+ * are linearly interpolated, and clamped to 0/100 outside the ends.
+ *
+ * Calibrated for a typical 4.20 V-charged single Li-ion cell at rest (no load).
+ * Under audio-playback load the live voltage sags a few tens of mV, so treat the
+ * result as a coarse gauge, not an exact fuel figure. */
+typedef struct {
+    float v;   /* pack voltage, volts */
+    uint8_t p; /* corresponding state-of-charge, % */
+} bat_lut_t;
+
+static const bat_lut_t s_bat_lut[] = {
+    {3.30f,   0},   /* cut-off */
+    {3.45f,  10},
+    {3.55f,  20},
+    {3.62f,  30},
+    {3.68f,  40},
+    {3.72f,  50},
+    {3.78f,  60},
+    {3.85f,  70},
+    {3.93f,  80},
+    {4.02f,  90},
+    {4.20f, 100},   /* full charge */
+};
+
+/* Map a pack voltage to 0..100 % via the open-circuit table above. */
 static uint8_t voltage_to_percent(float vbat)
 {
-    if (vbat <= BAT_V_EMPTY) {
-        return 0;
+    const size_t n = sizeof(s_bat_lut) / sizeof(s_bat_lut[0]);
+    if (vbat <= s_bat_lut[0].v) {
+        return s_bat_lut[0].p;
     }
-    if (vbat >= BAT_V_FULL) {
-        return 100;
+    if (vbat >= s_bat_lut[n - 1].v) {
+        return s_bat_lut[n - 1].p;
     }
-    const float span = BAT_V_FULL - BAT_V_EMPTY;
-    const int pct = (int)(((vbat - BAT_V_EMPTY) / span) * 100.0f + 0.5f);
-    return (pct < 0) ? 0 : (pct > 100 ? 100 : (uint8_t)pct);
+    for (size_t i = 1; i < n; i++) {
+        if (vbat <= s_bat_lut[i].v) {
+            const float v0 = s_bat_lut[i - 1].v;
+            const float v1 = s_bat_lut[i].v;
+            const int p0 = s_bat_lut[i - 1].p;
+            const int p1 = s_bat_lut[i].p;
+            const int pct = p0 + (int)((float)(p1 - p0) * (vbat - v0) / (v1 - v0) + 0.5f);
+            return (pct < 0) ? 0 : (pct > 100 ? 100 : (uint8_t)pct);
+        }
+    }
+    return 100;
 }
 
 static int window_average(void)
@@ -143,6 +189,24 @@ void hw_battery_sample(void)
     else {
         if (s_percent_disp - s_percent > BAT_PCT_HYSTERESIS) {
             s_percent_disp = s_percent;
+        }
+    }
+
+    /* Low-battery crossing detection (#9): fire once on the down-crossing
+     * (recovered=false) and again when the level climbs back above the
+     * threshold + hysteresis margin (recovered=true, so the handler can restore
+     * any user setting it changed). Runs after the display value is settled so
+     * ADC noise around the threshold does not chatter the callback. */
+    if (s_low_thresh > 0 && s_low_cb != NULL) {
+        if (s_percent >= s_low_thresh + BAT_LOW_REARM_MARGIN) {
+            if (!s_low_armed) {
+                s_low_armed = true;             /* recovered above threshold */
+                s_low_cb(s_percent, true);
+            }
+        }
+        else if (s_low_armed && s_percent <= s_low_thresh) {
+            s_low_armed = false;                /* latched until recovery */
+            s_low_cb(s_percent, false);
         }
     }
 
@@ -241,4 +305,13 @@ float hw_battery_voltage(void)
 uint8_t hw_battery_percent(void)
 {
     return s_percent_disp;
+}
+
+void hw_battery_set_low_warn(uint8_t threshold_pct, bt_battery_low_cb_t cb)
+{
+    s_low_thresh = (threshold_pct > 100) ? 100 : threshold_pct;
+    s_low_cb = cb;
+    /* Re-arm from the current level: only a fresh down-crossing will fire. */
+    s_low_armed = (s_percent_disp == BAT_INVALID_PERCENT)
+                  || (s_percent_disp >= s_low_thresh + BAT_LOW_REARM_MARGIN);
 }

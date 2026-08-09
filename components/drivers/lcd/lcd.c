@@ -48,6 +48,7 @@ static volatile bool s_lcd_first_flush_done;
 #define BL_LEDC_DUTY_RES      LEDC_TIMER_10_BIT   /* 0..1023 */
 #define BL_DUTY_MAX           ((1 << 10) - 1)
 static bool s_bl_inited;
+static uint8_t s_bl_percent = 100;   /* last set brightness, for hw_lcd_get_backlight */
 
 static void st7789_tx_param(esp_lcd_panel_io_handle_t io_handle, int cmd, const void *param, size_t param_size)
 {
@@ -324,9 +325,15 @@ void hw_lcd_set_backlight(uint8_t percent)
     if (!s_bl_inited) {
         backlight_init();
     }
+    s_bl_percent = percent;            /* remember for hw_lcd_get_backlight */
     const uint32_t duty = (BL_DUTY_MAX * percent) / 100;
     ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, duty));
     ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL));
+}
+
+uint8_t hw_lcd_get_backlight(void)
+{
+    return s_bl_inited ? s_bl_percent : 0;
 }
 
 bool hw_lcd_first_flush_done(void)

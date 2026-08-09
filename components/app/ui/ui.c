@@ -988,6 +988,14 @@ static void ui_refresh_battery(void)
     char buf[8];
     snprintf(buf, sizeof(buf), "%u%%", (unsigned)pct);
     lv_label_set_text(s_ui.bat_text, buf);
+
+    /* #9 Low-battery banner: when the cell is critically low the battery icon
+     * is already red; surface a plain-text hint on the bottom row too. This
+     * runs last in ui_refresh() (after each page's own hint), so it overrides
+     * the page hint only while the battery is critical. */
+    if (pct != 0 && pct <= 15 && s_ui.hint != NULL) {
+        ui_label_set(s_ui.hint, "低电量");
+    }
 }
 
 void ui_refresh(void)

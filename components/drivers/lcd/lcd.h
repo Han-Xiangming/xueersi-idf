@@ -27,3 +27,7 @@ bool hw_lcd_first_flush_done(void);
 
 /* Set backlight brightness as a percentage (0..100) via PWM on PIN_NUM_LCD_BL. */
 void hw_lcd_set_backlight(uint8_t percent);
+
+/* Current backlight brightness as a percentage (0..100), or 0 before the
+ * backlight has been initialised. */
+uint8_t hw_lcd_get_backlight(void);

@@ -1,10 +1,12 @@
-# 小喵掌机 ESP-IDF 固件与硬件资料
+# 小喵掌机 ESP-IDF 固件
 
-这是给学而思小喵掌机移植的 ESP-IDF / LVGL 固件工程，同时整理了屏幕、按键、传感器、GD32 协处理器和底层协议等硬件资料。
+这是给学而思小喵掌机（ESP32-WROVER-B 版本）移植的 **ESP-IDF / LVGL 9.5 C 固件工程**，提供 MP3 播放、SD 卡浏览、蓝牙 A2DP 音频输出、TXT 电子书阅读、背光/音量设置等功能的分页 UI。
+
+> 注意：本工程是原生 ESP-IDF C 固件（不是 MicroPython），源码位于 `main/`、`components/`，构建系统为 CMake + ESP-IDF v5.x。
 
 ## 固件下载与刷入
 
-已经编译好的 merged bin 会放在本项目的 [Releases](https://github.com/ZyoungInc/xueersi-idf/releases/latest) 页面。普通用户可以直接下载 release 里的 `xiaomiao-merged.bin` 并从 `0x0` 地址刷入，不需要自己搭建 ESP-IDF 编译环境。
+已经编译好的 merged bin 放在本项目的 [Releases](https://github.com/ZyoungInc/xueersi-idf/releases/latest) 页面。普通用户可以直接下载 release 里的 `xiaomiao-merged.bin` 并从 `0x0` 地址刷入，不需要自己搭建 ESP-IDF 编译环境。
 
 示例命令：
 
@@ -14,14 +16,31 @@ esptool.py --chip esp32 -b 460800 write_flash 0x0 xiaomiao-merged.bin
 
 刷入前请确认目标硬件是 ESP32-WROVER-B 版本的小喵掌机，并确认串口连接正常。
 
+## 从源码构建
+
+需要 ESP-IDF v5.x（已针对 5.5.x 验证）。
+
+```bash
+# 在 ESP-IDF 环境下
+idf.py set-target esp32
+idf.py build
+idf.py -p (PORT) flash monitor
+```
+
+关键默认配置位于 `sdkconfig.defaults`：
+
+- CPU 主频 240 MHz，4 MB flash，启用 PSRAM（Quad SPI，80 MHz）
+- LVGL 9.5，RGB565 颜色深度，刷屏周期 16 ms，DPI 60
+- 蓝牙经典 BR/EDR（Bluedroid 主机），启用 A2DP 与 AVRCP；不启用 BLE
+- FATFS 启用长文件名（堆分配）+ UTF-8 文件名编码，以支持中文文件名
+
 ## 当前状态
 
-- ESP32 侧固件已经移植到 ESP-IDF，使用 LVGL 9.x 驱动 ST7735 SPI 屏幕，并提供分页 UI（播放器 / 电子书 / SD 卡 / 蓝牙 / 设置）。
-- 性能优化：240MHz 主频，高速 SPI，PSRAM，部分刷新双 DMA 缓冲，稳定 60fps UI。
-- 由于屏幕的TE引脚没有连接到MCU，无法做垂直同步。抗撕裂。由于背光引脚直连cc，无法调节背光亮度。
-- 按键、MicroSD、I2S 音频（MAX98357）、蓝牙 A2DP 音频、MP3 播放、TXT 电子书阅读等功能已接入 ESP32 侧固件，详见 `docs/` 下各模块文档。
-- GD32 固件仍在开发中，目前公开的 GD32 工程主要完成了 USB 转串口功能。
-- GD32 侧与 ESP32 间的 LED、电机等控制协议仍在斟酌当中，正在考虑是否兼容原有协议。欢迎大家测试或在 Issues 里提出建议。
+- 固件用 LVGL 9.5 驱动 ST7789 显示屏，提供分页 UI：播放器 / 电子书 / 设置（蓝牙管理作为设置页的子页）。
+- 显示：ST7789（旋转 90° 后逻辑分辨率 320×240，实际面板为 240×320 原生），SPI2 最高 60 MHz；采用部分刷新 + 双 DMA 缓冲（每屏只重绘脏区）。由于屏幕 TE 引脚未接 MCU，无法做垂直同步，但双缓冲部分刷新已规避明显撕裂。
+- 背光由 GPIO14 的 LEDC PWM 驱动（5 kHz，10 位分辨率），可在设置页调节亮度（0..100%）。
+- 已接入功能：按键（6 键）、MicroSD（SDSPI）、I2S 音频（MAX98357 Class-D DAC）、MP3 播放（libhelix-mp3 解码）、蓝牙 A2DP 音频输出（SOURCE 角色）、TXT 电子书阅读、单节锂电电量检测与低电量保护。详见 `docs/` 下各模块文档。
+- 蓝牙在用户打开蓝牙页时才懒加载启动（开机不广播），关掉蓝牙开关时彻底断电。蓝牙输出为显式路由切换，不会因蓝牙连接上来而静默抢占本地扬声器。
 
 ## 原理图与鸣谢
 
@@ -31,102 +50,95 @@ esptool.py --chip esp32 -b 460800 write_flash 0x0 xiaomiao-merged.bin
 
 ## 参与项目
 
-如果这个项目对你有帮助，欢迎 Star。遇到问题、发现硬件差异、或者有协议兼容建议，可以提交 Issue。也欢迎提交 PR，我会审核后合并。
-本项目针对官方原厂硬件，不考虑对硬件的魔改因素。对硬件改动的支持需要另外开branch或复制到自己的仓库（但需要注意下一章的要求）。
+如果这个项目对你有帮助，欢迎 Star。遇到问题、发现硬件差异，可以提交 Issue。也欢迎提交 PR，我会审核后合并。
+本项目针对官方原厂硬件，不考虑对硬件的魔改因素。对硬件改动的支持需要另外开 branch 或复制到自己的仓库。
 
 ## 使用与署名要求
 
-本项目由ZYoungInc（wechat/tel：15657325738）完全用爱发电并完全免费提供给爱好者们学习和交流等非营利目的。如有侵权，请联系本人。二次开发、转载、分发、商用或以任何形式使用本项目内容时，请务必保留并明确引用原作者与本项目来源，以尊重劳动成果。违反者将依法追究责任；本人保留所有权利。也欢迎举报滥用。
+本项目由 ZYoungInc（wechat/tel：15657325738）完全用爱发电并完全免费提供给爱好者们学习和交流等非营利目的。如有侵权，请联系本人。二次开发、转载、分发、商用或以任何形式使用本项目内容时，请务必保留并明确引用原作者与本项目来源，以尊重劳动成果。违反者将依法追究责任；本人保留所有权利。也欢迎举报滥用。
+
+***
 
 ## 1. 总体架构
 
 ```text
-PC USB
-  │
-  │ USB CDC / 下载串口
-  ▼
-GD32F350G8
-  ├─ USB 转 ESP32 UART0
-  ├─ ESP32 自动下载 / 自动复位控制
-  ├─ I2C 从机地址 0x40
-  ├─ 控制双路电机驱动 HR8833 / DRV8833
-  └─ 控制板载 LED1 / LED2
-
-ESP32-WROVER-B
-  ├─ SPI TFT 显示屏
-  ├─ MicroSD 卡
-  ├─ 6 个按键
-  ├─ 蜂鸣器 PWM
-  ├─ 光照 ADC
-  ├─ 热敏 ADC
-  ├─ I2C 主机
-  │   ├─ GD32F350G8：0x40
-  │   └─ MPU6050：0x68
-  └─ 预留扩展 IO
+ESP32-WROVER-B (主控)
+  ├─ SPI2 (共用，分时 CS)
+  │   ├─ ST7789 TFT 显示屏   (CS=GPIO5,  DC=GPIO4,  BL=GPIO14)
+  │   └─ MicroSD 卡          (CS=GPIO22)
+  ├─ I2S 音频输出 (MAX98357)
+  │   ├─ BCLK = GPIO32
+  │   ├─ LRC  = GPIO15
+  │   └─ DIN  = GPIO21        (无 MCLK，MAX98357 自带 PLL)
+  ├─ 6 个按键 (GPIO2/13/27/35/34/12)
+  ├─ 电池电压采样 (GPIO39, ADC1_CH3, 电阻分压 1/2)
+  └─ 蓝牙 (Bluedroid, A2DP SOURCE + AVRCP TARGET)
 ```
 
-核心关系：
+代码分层：
 
 ```text
-ESP32 = 主控 / UI / Python 运行环境 / 屏幕 / SD / 按键 / 传感器
-GD32  = USB 串口桥 / ESP32 自动烧录控制 / 电机与 LED 控制器
-0x40  = GD32 的 I2C 从机地址
+main/main.c            —— 启动装配，初始化各驱动、创建 LVGL 与 UI、运行主循环
+components/drivers/    —— 硬件层：buttons / lcd / audio / bt_audio / battery / sd
+components/app/        —— 应用层：ui（LVGL 界面） / player（MP3） / ebook（TXT）
+components/board/      —— 板级硬件配置（board_config.h）
+components/fonts/      —— 中文 CJK 点阵字体（lv_font_cn_10 ~ lv_font_cn_16）
 ```
 
 ***
 
 ## 2. ESP32 引脚分配
 
-### 2.1 TFT 显示屏
+### 2.1 ST7789 TFT 显示屏
 
-| 功能             | ESP32 引脚   |
-| -------------- | ---------- |
-| SPI SCK        | GPIO18     |
-| SPI MOSI       | GPIO23     |
-| SPI MISO       | GPIO19     |
-| TFT DC         | GPIO4      |
-| TFT CS         | GPIO5      |
-| TFT RES / 相关复用 | GPIO19     |
+| 功能        | ESP32 引脚     |
+| --------- | ------------ |
+| SPI SCK   | GPIO18       |
+| SPI MOSI  | GPIO23       |
+| SPI MISO  | GPIO19       |
+| TFT DC    | GPIO4        |
+| TFT CS    | GPIO5        |
+| 背光 BL     | GPIO14 (LEDC PWM) |
 
 显示对象信息：
 
 ```text
-显示分辨率：160 × 128
-SPI：SPI2
-SPI 频率：40 MHz
+显示面板：ST7789
+原生分辨率：240 × 320
+旋转 90° 后逻辑分辨率：320 × 240
+SPI：SPI2 (LCD_HOST)
+SPI 频率：60 MHz
 SCK：GPIO18
 MOSI：GPIO23
 MISO：GPIO19
 DC：GPIO4
+CS：GPIO5
+背光：GPIO14，LEDC PWM 5 kHz / 10 位
 ```
-
-屏幕底层通过 `FrameBuffer` 和 `SCREEN` 对象刷新。
-
-***
 
 ### 2.2 MicroSD 卡
 
-| 功能         | ESP32 引脚   |
-| ---------- | ---------- |
-| SPI SCK    | GPIO18     |
-| SPI MOSI   | GPIO23     |
-| SPI MISO   | GPIO19     |
-| SD CS      | GPIO22     |
+| 功能      | ESP32 引脚     |
+| ------- | ------------ |
+| SPI SCK | GPIO18       |
+| SPI MOSI | GPIO23       |
+| SPI MISO | GPIO19       |
+| SD CS   | GPIO22       |
 
-TFT 与 MicroSD 共用 SPI2，通过不同 CS 分时使用。
-
-***
+TFT 与 MicroSD 共用 SPI2，通过不同 CS 分时使用。SD 挂载在 `/sdcard`，由 `hw_sd_try_mount()` 在启动和插入时尝试挂载。
 
 ### 2.3 按键
 
-| 按键         | ESP32 引脚   |
-| ---------- | ---------- |
-| 上          | GPIO2      |
-| 下          | GPIO13     |
-| 左          | GPIO27     |
-| 右          | GPIO35     |
-| A          | GPIO34     |
-| B          | GPIO12     |
+| 按键  | ESP32 引脚     |
+| --- | ------------ |
+| 上   | GPIO2        |
+| 下   | GPIO13       |
+| 左   | GPIO27       |
+| 右   | GPIO35       |
+| A   | GPIO34       |
+| B   | GPIO12       |
+
+按键为低电平有效，带 25 ms 消抖，经 LVGL keypad 输入设备接入 UI。
 
 注意：
 
@@ -135,521 +147,97 @@ GPIO34、GPIO35 是输入专用脚。
 GPIO12 是启动相关敏感脚。
 ```
 
-***
+### 2.4 I2S 音频（MAX98357 Class-D DAC）
 
-### 2.4 ADC 传感器
+| 功能    | ESP32 引脚     |
+| ----- | ------------ |
+| BCLK  | GPIO32       |
+| LRC   | GPIO15       |
+| DIN   | GPIO21       |
 
-| 功能         | ESP32 引脚   |
-| ---------- | ---------- |
-| 光照传感器      | GPIO36     |
-| 热敏电阻       | GPIO39     |
+MAX98357 由 BCLK 内部派生主时钟，因此 **不需要 MCLK**。
 
-已确认：
+### 2.5 电池电压采样
 
-```text
-sensor.getLight() = ADC(GPIO36).read()
-sensor.getTemp()  = ADC(GPIO39) 后换算
-```
+| 功能  | ESP32 引脚       |
+| --- | -------------- |
+| 分压输入 | GPIO39 (ADC1_CH3) |
 
-***
-
-### 2.5 蜂鸣器
-
-| 功能         | ESP32 引脚   |
-| ---------- | ---------- |
-| 无源蜂鸣器      | GPIO14     |
-
-底层对象：
-
-```text
-PWM(14, freq=440, duty=0)
-```
-
-也就是：
-
-```text
-GPIO14 → PWM → 无源蜂鸣器
-```
+板载两颗 100 kΩ 电阻分压（1/2），将单节锂电电压降到 ADC 量程内。电量通过开路电压经验查表（非线性）换算为 0..100%，详见 `components/drivers/battery/battery.c`。
 
 ***
 
-### 2.6 I2C 总线
+## 3. 功能说明
 
-| 功能         | ESP32 引脚   |
-| ---------- | ---------- |
-| I2C SCL    | GPIO15     |
-| I2C SDA    | GPIO21     |
+### 3.1 播放器（MP3）
 
-I2C 设备：
+- 解码库：`esp-libhelix-mp3`（libhelix C API），运行在独立 FreeRTOS 任务中，不阻塞 UI。
+- 音源：SD 卡 `/sdcard` 下的 `.mp3` 文件（后台扫描，最多 64 首），以及一首内嵌 ROM 测试曲。
+- 支持播放 / 暂停切换 / 停止；播放时上下键调节音量，A 播放/继续，B 停止。
+- 输出路由：`AUDIO_ROUTE_SPEAKER`（本地 MAX98357）与 `AUDIO_ROUTE_BT`（蓝牙 sink）二选一，由 UI 显式切换。
 
-| 地址         | 设备         |
-| ---------- | ---------- |
-| 0x40       | GD32F350G8 |
-| 0x68       | MPU6050    |
+### 3.2 蓝牙音频（A2DP SOURCE）
 
-当前已确认：
+- 设备作为 **A2DP SOURCE**：把解码出的 PCM 通过 SBC 编码后推流给配对的蓝牙音箱/耳机，SBC 编码由 Bluedroid 完成。
+- 懒加载启动：进入「蓝牙」页才拉起蓝牙控制器/协议栈；关闭开关时彻底断电。
+- 扫描：GAP 通用查询（约 12.8 s，`BT_INQ_LEN=10`），只收录带 RENDERING 类的设备，按地址去重，名称取自 inquiry 的 BDNAME/EIR，列表最多 8 个（`BT_MAX_DEVICES`）。
+- 配对：支持 SSP 数字比对（配对时显示 6 位配对码）。
+- 远程控制：作为 AVRCP TARGET，接受远端耳机的播放/暂停/停止媒体键，以及远端绝对音量（0..127）映射回本地主音量。
+- 连接状态变化不会自动抢占本地扬声器路由；反之断链时音频层会把路由交还扬声器。
+
+### 3.3 电子书（TXT）
+
+- 读取 SD 卡 `/sdcard` 下的 `.txt` 文件（UTF-8 纯文本）以及内嵌 ROM 测试书。
+- 用 16px 中文点阵字体按固定 5 行/页确定性排版，前后翻页与后台页数统计始终一致。
+
+### 3.4 设置
+
+设置页可上下选择、左右调整的项目：
 
 ```text
-GD32：0x40
-MPU6050：0x68，未安装时不会出现在 scan 结果中
+音量   —— 当前激活路由音量（蓝牙路由取 BT 音量，否则取扬声器音量），分轨存 NVS
+背光   —— 屏幕亮度 0..100%，存 NVS
+蓝牙   —— 蓝牙输出总开关（开/关），存 NVS；进入后展开蓝牙管理子页
+重置NVS —— 清除已保存配置
 ```
+
+### 3.5 电池与低电量保护
+
+- 电压经 ADC 采样 + 开路电压查表换算为百分比。
+- 低电量保护（`hw_battery_set_low_warn`，阈值 15%）：下穿阈值时暂停播放并把背光调暗至不高于 20%（记住用户设定）；回升超过阈值 + 3% 迟滞后恢复用户背光，不干预播放。
 
 ***
 
-### 2.7 UART0
+## 4. 目录结构与模块接口
 
-| 功能         | ESP32 引脚   |
-| ---------- | ---------- |
-| UART0 TX   | GPIO1      |
-| UART0 RX   | GPIO3      |
+| 路径                                  | 说明                                       |
+| ----------------------------------- | ---------------------------------------- |
+| `main/main.c`                        | 启动装配 + LVGL 主循环                        |
+| `components/board/board_config.h`    | 板级硬件引脚、显示几何、分压系数                      |
+| `components/drivers/buttons/`        | 6 键输入 + 消抖，LVGL keypad 读取回调             |
+| `components/drivers/lcd/`            | ST7789 驱动 + LVGL 显示绑定 + 背光 PWM          |
+| `components/drivers/audio/`          | I2S → MAX98357，路由/音量/采样率/ PCM 写入         |
+| `components/drivers/bt_audio/`       | 蓝牙 A2DP SOURCE + AVRCP + 扫描/配对/连接管理      |
+| `components/drivers/battery/`        | 电池电压采样 + 开路电压查表 + 低电量回调              |
+| `components/drivers/sd/`             | SDSPI 挂载状态与访问                          |
+| `components/app/ui/`                 | LVGL 分页 UI（播放器/电子书/设置/蓝牙）            |
+| `components/app/player/`             | MP3 解码任务 + 后台曲库扫描                      |
+| `components/app/ebook/`              | TXT 电子书读取与确定性分页                       |
+| `components/fonts/`                  | 中文 CJK 点阵字体（10~16px，覆盖 4E00-9FFF 及假名） |
 
-该 UART0 通过 GD32 转 USB 与电脑通信，用于 Python 终端、程序上传、ESP32 自动下载。
-
-***
-
-## 3. GD32F350G8 连接关系
-
-GD32F350G8 在板上承担以下功能：
-
-```text
-1. USB CDC 串口桥
-2. ESP32 自动复位 / 自动下载控制
-3. I2C 从机 0x40
-4. LED1 / LED2 控制
-5. 双路电机控制
-6. HR8833 / DRV8833 控制信号输出
-```
-
-已知相关连接：
-
-| 功能          | 连接对象                     |
-| ----------- | ------------------------ |
-| USB D+ / D- | USB 接口                   |
-| UART 桥      | ESP32 GPIO1 / GPIO3      |
-| 自动下载控制      | ESP32 IO0 / 复位相关线路       |
-| I2C         | ESP32 GPIO15 / GPIO21    |
-| 电机 PWM      | HR8833 / DRV8833         |
-| LED 控制      | LED1 / LED2              |
-| SWD         | TMS / TCK / RST / GND 焊盘 |
+各模块的公共接口见其头文件（`*.h`），软件层（app）只通过硬件层（drivers）的公共 API 访问外设，不直接操作寄存器或 LVGL 显示内部。
 
 ***
 
-## 4. I2C 地址与设备
+## 5. 已知限制与备注
 
-### 4.1 I2C 总线
+- 屏幕 TE 引脚未接 MCU，无法垂直同步；依赖双缓冲 + 部分刷新规避撕裂。
+- 蓝牙路由下 `hw_audio_set_volume()` 仅改本地 BT 增益，未通过 AVRCP 主动下发远端音箱音量（远端音量由远端媒体键控制）。
+- 当前播放器无播放列表导航，AVRCP 的 NEXT/PREV 被忽略。
+- 原 MicroPython 时代的 GD32 协处理器、电机、MPU6050、SugarASR 等功能不在本 ESP-IDF 固件范围内。
 
-```text
-I2C 控制器：ESP32 I2C(0)
-SCL：GPIO15
-SDA：GPIO21
-频率：100 kHz
-```
+详见 `docs/`：
 
-### 4.2 地址表
-
-| I2C 地址     | 设备         | 说明         |
-| ---------- | ---------- | ---------- |
-| 0x40       | GD32F350G8 | LED、电机控制   |
-| 0x68       | MPU6050    | 加速度计 / 陀螺仪 |
-
-***
-
-## 5. GD32 0x40 协议
-
-## 5.1 LED 协议
-
-GD32 的 LED 控制使用 I2C memory write 形式。
-
-| 功能         | I2C 地址     | 寄存器        | 数据         |
-| ---------- | ---------- | ---------- | ---------- |
-| LED1 关闭    | 0x40       | 0xA0       | 0          |
-| LED1 打开    | 0x40       | 0xA0       | 1          |
-| LED2 关闭    | 0x40       | 0xA1       | 0          |
-| LED2 打开    | 0x40       | 0xA1       | 1          |
-
-LED 对象内部状态：
-
-```text
-LED1:
-  reg = 0xA0
-
-LED2:
-  reg = 0xA1
-```
-
-***
-
-## 5.2 电机协议概览
-
-电机控制通过 I2C 向 0x40 写入一组 PWM 寄存器格式数据。
-
-基本格式：
-
-```text
-I2C 地址：0x40
-
-数据格式：
-[
-  起始寄存器,
-  通道A_ON_L,
-  通道A_ON_H,
-  通道A_OFF_L,
-  通道A_OFF_H,
-  通道B_ON_L,
-  通道B_ON_H,
-  通道B_OFF_L,
-  通道B_OFF_H
-]
-```
-
-每个电机占两个 PWM 通道：
-
-```text
-一个通道控制一个方向输入。
-另一个通道控制反方向输入。
-```
-
-方向逻辑：
-
-```text
-方向 1：
-  IN_A = PWM
-  IN_B = 0
-
-方向 0：
-  IN_A = 0
-  IN_B = PWM
-```
-
-***
-
-## 5.3 电机编号与寄存器
-
-| 电机编号       | 起始寄存器      | 占用通道         |
-| ---------- | ---------- | ------------ |
-| Motor 2    | 0x06       | PWM 通道 0 / 1 |
-| Motor 1    | 0x0E       | PWM 通道 2 / 3 |
-
-***
-
-## 5.4 速度映射
-
-速度参数范围：
-
-```text
-speed = 0 ~ 255
-```
-
-转换关系：
-
-```text
-PWM_12bit = speed × 16
-PWM_12bit = speed << 4
-```
-
-示例：
-
-| speed      | PWM 十进制    | PWM 十六进制   | 低字节        | 高字节        |
-| ---------- | ---------- | ---------- | ---------- | ---------- |
-| 0          | 0          | 0x0000     | 0x00       | 0x00       |
-| 1          | 16         | 0x0010     | 0x10       | 0x00       |
-| 10         | 160        | 0x00A0     | 0xA0       | 0x00       |
-| 50         | 800        | 0x0320     | 0x20       | 0x03       |
-| 100        | 1600       | 0x0640     | 0x40       | 0x06       |
-| 128        | 2048       | 0x0800     | 0x00       | 0x08       |
-| 200        | 3200       | 0x0C80     | 0x80       | 0x0C       |
-| 255        | 4080       | 0x0FF0     | 0xF0       | 0x0F       |
-
-***
-
-## 5.5 电机 1 数据格式
-
-### Motor 1，方向 1
-
-```text
-[
-  0x0E,
-  0x00, 0x00, PWM_L, PWM_H,
-  0x00, 0x00, 0x00, 0x00
-]
-```
-
-### Motor 1，方向 0
-
-```text
-[
-  0x0E,
-  0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, PWM_L, PWM_H
-]
-```
-
-***
-
-## 5.6 电机 2 数据格式
-
-### Motor 2，方向 1
-
-```text
-[
-  0x06,
-  0x00, 0x00, PWM_L, PWM_H,
-  0x00, 0x00, 0x00, 0x00
-]
-```
-
-### Motor 2，方向 0
-
-```text
-[
-  0x06,
-  0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, PWM_L, PWM_H
-]
-```
-
-***
-
-## 5.7 全部电机停止
-
-全停命令：
-
-```text
-I2C 地址：0x40
-数据：[0x00, 0x00, 0x00, 0x00, 0x00]
-```
-
-***
-
-## 6. MPU6050
-
-### 6.1 总线连接
-
-| 功能         | ESP32 引脚   |
-| ---------- | ---------- |
-| SCL        | GPIO15     |
-| SDA        | GPIO21     |
-
-### 6.2 地址
-
-```text
-MPU6050 I2C 地址：0x68
-```
-
-### 6.3 传感器对象内部字段
-
-```text
-addr = 104 = 0x68
-imuReady = True / False
-imu = 14 字节缓存
-```
-
-### 6.4 数据类型
-
-MPU6050 提供：
-
-```text
-accX
-accY
-accZ
-gyroX
-gyroY
-gyroZ
-pitch
-roll
-gesture
-```
-
-***
-
-## 7. SugarASR 扩展占用
-
-`sugar_asr.py` 使用：
-
-```text
-UART1
-TX = GPIO21
-RX = GPIO15
-波特率 = 115200
-```
-
-这与板载 I2C 引脚重合：
-
-```text
-GPIO21 = I2C SDA
-GPIO15 = I2C SCL
-```
-
-因此：
-
-```text
-使用 SugarASR 时，GPIO15 / GPIO21 会作为 UART1 使用。
-使用 LED、电机、MPU6050 时，GPIO15 / GPIO21 会作为 I2C 使用。
-```
-
-***
-
-## 8. 板载扩展 IO
-
-板上预留扩展 IO：
-
-| ESP32 GPIO | 类型               | 说明           |
-| ---------- | ---------------- | ------------ |
-| GPIO33     | GPIO / ADC       | 可作输入、输出、ADC  |
-| GPIO32     | GPIO / ADC       | 可作输入、输出、ADC  |
-| GPIO26     | GPIO / DAC / PWM | 可作输出、PWM、DAC |
-| GPIO25     | GPIO / DAC / PWM | 可作输出、PWM、DAC |
-
-推荐作为普通扩展口使用的 ESP32 引脚：
-
-```text
-GPIO25
-GPIO26
-GPIO32
-GPIO33
-```
-
-***
-
-## 9. ESP32 引脚占用总表
-
-| GPIO       | 当前功能                  | 备注               |
-| ---------- | --------------------- | ---------------- |
-| GPIO1      | UART0 TX              | 经 GD32 转 USB 串口  |
-| GPIO2      | 上键                    | 输入               |
-| GPIO3      | UART0 RX              | 经 GD32 转 USB 串口  |
-| GPIO4      | TFT DC                | 显示               |
-| GPIO5      | TFT CS                | 显示               |
-| GPIO12     | B 键                   | 启动相关敏感脚          |
-| GPIO13     | 下键                    | 输入               |
-| GPIO14     | 蜂鸣器                   | PWM              |
-| GPIO15     | I2C SCL / SugarASR RX | 与 GPIO21 成组复用    |
-| GPIO18     | SPI SCK               | TFT / SD 共用      |
-| GPIO19     | SPI MISO / TFT 相关     | TFT / SD 相关      |
-| GPIO21     | I2C SDA / SugarASR TX | 与 GPIO15 成组复用    |
-| GPIO22     | SD CS                 | MicroSD          |
-| GPIO23     | SPI MOSI              | TFT / SD 共用      |
-| GPIO25     | 预留扩展                  | GPIO / DAC / PWM |
-| GPIO26     | 预留扩展                  | GPIO / DAC / PWM |
-| GPIO27     | 左键                    | 输入               |
-| GPIO32     | 预留扩展                  | GPIO / ADC       |
-| GPIO33     | 预留扩展                  | GPIO / ADC       |
-| GPIO34     | A 键                   | 输入专用             |
-| GPIO35     | 右键                    | 输入专用             |
-| GPIO36     | 光照 ADC                | 输入专用             |
-| GPIO39     | 热敏 ADC                | 输入专用             |
-
-***
-
-## 10. 开发用对象映射
-
-| Python 对象 / 模块       | 底层硬件               |
-| -------------------- | ------------------ |
-| `screen`             | FrameBuffer + TFT  |
-| `display`            | 160 × 128 TFT 显示封装 |
-| `tft`                | 底层 SCREEN 对象       |
-| `fb` / `fbuf`        | FrameBuffer        |
-| `vspi`               | SPI2，40 MHz        |
-| `i2c`                | I2C0，SCL=15，SDA=21 |
-| `led1`               | GD32 0x40，寄存器 0xA0 |
-| `led2`               | GD32 0x40，寄存器 0xA1 |
-| `buzzer`             | GPIO14 PWM         |
-| `sensor.adcLight`    | GPIO36 ADC         |
-| `sensor.adcTemp`     | GPIO39 ADC         |
-| `sensor.btns`        | 6 个 ESP32 GPIO 按键  |
-| `motor.Motor`        | GD32 0x40 电机协议     |
-| `sugar_asr.SugarASR` | UART1，TX=21，RX=15  |
-
-***
-
-## 11. 开发时可直接使用的底层信息
-
-### 11.1 I2C
-
-```text
-I2C0:
-  SCL = GPIO15
-  SDA = GPIO21
-  freq = 100000
-
-设备：
-  0x40 = GD32
-  0x68 = MPU6050
-```
-
-### 11.2 LED
-
-```text
-LED1:
-  addr = 0x40
-  reg  = 0xA0
-  value 0 = off
-  value 1 = on
-
-LED2:
-  addr = 0x40
-  reg  = 0xA1
-  value 0 = off
-  value 1 = on
-```
-
-### 11.3 电机
-
-```text
-Motor 1:
-  起始寄存器 = 0x0E
-
-Motor 2:
-  起始寄存器 = 0x06
-
-speed:
-  0 ~ 255
-  PWM = speed << 4
-
-direction:
-  1 = 第一方向通道 PWM，第二方向通道 0
-  0 = 第一方向通道 0，第二方向通道 PWM
-```
-
-### 11.4 蜂鸣器
-
-```text
-GPIO14
-PWM 输出
-无源蜂鸣器
-```
-
-### 11.5 光照 / 温度
-
-```text
-光照：
-  GPIO36
-  ADC
-
-热敏：
-  GPIO39
-  ADC
-```
-
-### 11.6 按键
-
-```text
-up    = GPIO2
-down  = GPIO13
-left  = GPIO27
-right = GPIO35
-a     = GPIO34
-b     = GPIO12
-```
-
-### 11.7 显示
-
-```text
-分辨率：160 × 128
-SPI：SPI2
-SCK：GPIO18
-MOSI：GPIO23
-MISO：GPIO19
-DC：GPIO4
-CS：GPIO5
-```
+- `docs/ui.md` —— UI 页面与交互
+- `docs/player.md` —— MP3 播放器
+- `docs/ebook.md` —— 电子书阅读器
