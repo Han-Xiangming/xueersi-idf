@@ -14,6 +14,7 @@
 #include "esp_err.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "lvgl.h"
 
 static const char *TAG = "hw_lcd";
@@ -49,6 +50,15 @@ static volatile bool s_lcd_first_flush_done;
 #define BL_DUTY_MAX           ((1 << 10) - 1)
 static bool s_bl_inited;
 static uint8_t s_bl_percent = 100;   /* last set brightness, for hw_lcd_get_backlight */
+
+/* ---- Auto screen-off (standby) ----
+ * Idle timer: after s_standby_timeout_ms of no activity the backlight is
+ * switched off and the panel is put into DISPOFF to save power. Any call to
+ * hw_lcd_activity() (wired to key presses in main.c) wakes it back up. */
+static bool     s_standby_enabled   = false;   /* feature on/off */
+static uint32_t s_standby_timeout_ms = 30000;  /* idle delay before standby */
+static int64_t  s_last_activity_ms  = 0;       /* timestamp of last activity */
+static bool     s_standby_active    = false;   /* currently blanked */
 
 static void st7789_tx_param(esp_lcd_panel_io_handle_t io_handle, int cmd, const void *param, size_t param_size)
 {
@@ -339,4 +349,72 @@ uint8_t hw_lcd_get_backlight(void)
 bool hw_lcd_first_flush_done(void)
 {
     return s_lcd_first_flush_done;
+}
+
+/* ---- Auto screen-off (standby) ---- */
+
+/* Enable/disable the auto screen-off feature and set the idle timeout.
+ * timeout_ms == 0 disables standby (screen stays on permanently). */
+void hw_lcd_set_standby_timeout(uint32_t timeout_ms)
+{
+    s_standby_enabled = (timeout_ms > 0);
+    s_standby_timeout_ms = timeout_ms;
+    if (s_standby_enabled) {
+        /* Re-arm the idle timer so the timeout applies from now. */
+        s_last_activity_ms = esp_timer_get_time() / 1000;
+    } else if (s_standby_active) {
+        /* Feature turned off: wake immediately. */
+        hw_lcd_activity();
+    }
+}
+
+uint32_t hw_lcd_get_standby_timeout(void)
+{
+    return s_standby_enabled ? s_standby_timeout_ms : 0;
+}
+
+/* Record user activity: keeps the screen awake and wakes it if blanked.
+ * Call this from key/press handlers or any "user is here" event. */
+void hw_lcd_activity(void)
+{
+    s_last_activity_ms = esp_timer_get_time() / 1000;
+    if (s_standby_active) {
+        s_standby_active = false;
+        if (s_lcd_display_on && s_lcd_io_handle) {
+            st7789_tx_param(s_lcd_io_handle, ST7789_DISPON, NULL, 0);
+            st7789_delay_ms(20);
+        }
+        /* Restore the user-configured brightness (PWM duty). */
+        const uint32_t duty = (BL_DUTY_MAX * s_bl_percent) / 100;
+        ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, duty));
+        ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL));
+        ESP_LOGI(TAG, "Screen wake (backlight %u%%)", s_bl_percent);
+    }
+}
+
+bool hw_lcd_is_standby_active(void)
+{
+    return s_standby_active;
+}
+
+/* Drive the idle timer. Call periodically from the main loop; it blanks the
+ * screen once the timeout elapses and standby is enabled. */
+void hw_lcd_standby_tick(void)
+{
+    if (!s_standby_enabled || s_standby_active) {
+        return;
+    }
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    if (now_ms - s_last_activity_ms < (int64_t)s_standby_timeout_ms) {
+        return;
+    }
+
+    s_standby_active = true;
+    /* Turn the backlight fully off. */
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, 0));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL));
+    if (s_lcd_display_on && s_lcd_io_handle) {
+        st7789_tx_param(s_lcd_io_handle, ST7789_DISPOFF, NULL, 0);
+    }
+    ESP_LOGI(TAG, "Screen standby after %u ms idle", s_standby_timeout_ms);
 }

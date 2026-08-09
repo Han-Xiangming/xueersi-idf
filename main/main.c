@@ -110,6 +110,10 @@ static void lvgl_task(void *arg)
         uint32_t delay_ms = lv_timer_handler();
         delay_ms = MAX(delay_ms, LVGL_TASK_MIN_DELAY_MS);
         delay_ms = MIN(delay_ms, LVGL_TASK_MAX_DELAY_MS);
+
+        /* Drive the auto screen-off (standby) idle timer each loop. */
+        hw_lcd_standby_tick();
+
         usleep(delay_ms * 1000);
     }
 }

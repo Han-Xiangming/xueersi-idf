@@ -31,3 +31,23 @@ void hw_lcd_set_backlight(uint8_t percent);
 /* Current backlight brightness as a percentage (0..100), or 0 before the
  * backlight has been initialised. */
 uint8_t hw_lcd_get_backlight(void);
+
+/* ---- Auto screen-off (standby) ---- */
+
+/* Enable auto screen-off with the given idle timeout in milliseconds.
+ * timeout_ms == 0 disables standby (screen stays on). */
+void hw_lcd_set_standby_timeout(uint32_t timeout_ms);
+
+/* Current idle timeout in ms, or 0 if standby is disabled. */
+uint32_t hw_lcd_get_standby_timeout(void);
+
+/* Record user activity: keeps the screen awake and wakes it if blanked.
+ * Wire this to key/press events. */
+void hw_lcd_activity(void);
+
+/* True while the screen is blanked in standby. */
+bool hw_lcd_is_standby_active(void);
+
+/* Drive the idle timer; call periodically from the main loop. Blanks the
+ * screen once the timeout elapses. */
+void hw_lcd_standby_tick(void);

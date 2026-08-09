@@ -67,11 +67,12 @@ typedef enum {
     SETTING_VOLUME = 0,
     SETTING_BACKLIGHT,
     SETTING_BTOUT,
+    SETTING_STANDBY,
     SETTING_RESET,
     SETTING_COUNT,
 } setting_item_t;
 
-static const int s_setting_y[SETTING_COUNT] = {38, 68, 98, 128};
+static const int s_setting_y[SETTING_COUNT] = {38, 68, 98, 128, 158};
 
 /* Backlight brightness (0..100 %), driven via PWM on PIN_NUM_LCD_BL.
  * Persisted to NVS; restored at boot. */
@@ -81,6 +82,24 @@ static uint8_t s_backlight = 70;
  * restored at boot. Drives bt_audio_set_enabled() — the audio routing gate. */
 static bool s_bt_on;
 
+/* Auto screen-off: idle timeout in seconds. 0 = never (disable standby).
+ * Selectable on the settings page via an index into s_standby_opts. */
+typedef enum {
+    STANDBY_OPT_NEVER = 0,
+    STANDBY_OPT_15S,
+    STANDBY_OPT_30S,
+    STANDBY_OPT_60S,
+    STANDBY_OPT_2MIN,
+    STANDBY_OPT_5MIN,
+    STANDBY_OPT_COUNT,
+} standby_opt_t;
+
+/* Idle timeout (seconds) for each option index. Index 0 is "never". */
+static const uint16_t s_standby_opts[STANDBY_OPT_COUNT] = {
+    0, 15, 30, 60, 120, 300,
+};
+static standby_opt_t s_standby_opt = STANDBY_OPT_30S;  /* default 30 s */
+
 /* Settings persistence: volume and log level survive reboot via NVS.
  * NVS is initialised in app_main() before ui_create(), so these helpers
  * can open the handle at any time. */
@@ -89,6 +108,7 @@ static bool s_bt_on;
 #define UI_NVS_VOLBT   "vol_bt"
 #define UI_NVS_BT      "bt_on"
 #define UI_NVS_BACKL   "backlight"
+#define UI_NVS_STBY    "standby_s"
 
 static void ui_settings_load(void)
 {
@@ -120,6 +140,12 @@ static void ui_settings_load(void)
     } else {
         hw_lcd_set_backlight(s_backlight);
     }
+    int32_t stby = -1;
+    if (nvs_get_i32(h, UI_NVS_STBY, &stby) == ESP_OK &&
+        stby >= 0 && stby < STANDBY_OPT_COUNT) {
+        s_standby_opt = (standby_opt_t)stby;
+    }
+    hw_lcd_set_standby_timeout((uint32_t)s_standby_opts[s_standby_opt] * 1000);
     nvs_close(h);
 }
 
@@ -154,12 +180,23 @@ static void ui_settings_save_backlight(void)
     }
 }
 
+static void ui_settings_save_standby(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, UI_NVS_STBY, (int32_t)s_standby_opt);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
 /* Debounced persistence: a setting change only marks a dirty bit and arms a
  * timer; ui_settings_flush() (called every refresh) commits once the user
  * stops tweaking, folding long-press repeats into a single NVS write. */
 #define SETTINGS_DIRTY_VOLUME   (1u << 0)
 #define SETTINGS_DIRTY_BT       (1u << 1)
 #define SETTINGS_DIRTY_BACKL    (1u << 2)
+#define SETTINGS_DIRTY_STBY     (1u << 3)
 
 static uint32_t s_save_pending;
 static uint32_t s_save_at_ms;
@@ -186,6 +223,9 @@ static void ui_settings_flush(void)
     }
     if (s_save_pending & SETTINGS_DIRTY_BACKL) {
         ui_settings_save_backlight();
+    }
+    if (s_save_pending & SETTINGS_DIRTY_STBY) {
+        ui_settings_save_standby();
     }
     s_save_pending = 0;
 }
@@ -499,7 +539,7 @@ static void ui_set_hint(const char *normal)
 static void ui_build_settings(lv_obj_t *page)
 {
     s_setting_sel = 0;
-    static const char *const labels[SETTING_COUNT] = {"音量", "背光", "蓝牙", "重置NVS"};
+    static const char *const labels[SETTING_COUNT] = {"音量", "背光", "蓝牙", "息屏", "重置NVS"};
 
     for (int i = 0; i < SETTING_COUNT; i++) {
         lv_obj_t *cur = lv_label_create(page);
@@ -588,14 +628,11 @@ static void ui_build_bt(lv_obj_t *page)
     bt_audio_scan_start();
 }
 
-/* Book display name: drop the trailing ".txt" extension. */
-static void strip_txt_ext(char *dst, size_t dst_size, const char *src)
+/* Book display name. Keep the full filename (including the ".txt" suffix) so
+ * the file list and the reader title show the extension consistently. */
+static void copy_book_name(char *dst, size_t dst_size, const char *src)
 {
     snprintf(dst, dst_size, "%s", src ? src : "");
-    size_t l = strlen(dst);
-    if (l > 4 && strcasecmp(dst + l - 4, ".txt") == 0) {
-        dst[l - 4] = '\0';
-    }
 }
 
 static void ui_build_ebook_list(lv_obj_t *page)
@@ -1085,6 +1122,14 @@ void ui_refresh(void)
             case SETTING_BACKLIGHT:
                 snprintf(buf, sizeof(buf), "%u%%", (unsigned)s_backlight);
                 break;
+            case SETTING_STANDBY:
+                if (s_standby_opt == STANDBY_OPT_NEVER) {
+                    snprintf(buf, sizeof(buf), "永不");
+                } else {
+                    snprintf(buf, sizeof(buf), "%u秒",
+                             (unsigned)s_standby_opts[s_standby_opt]);
+                }
+                break;
             case SETTING_RESET:
                 /* Action item: no value to show, just a hint to press A. */
                 snprintf(buf, sizeof(buf), "按A重置");
@@ -1294,8 +1339,8 @@ void ui_refresh(void)
             const int sel = (idx == s_eb_sel);
             if (idx < count) {
                 static char s_eb_name_buf[64];
-                strip_txt_ext(s_eb_name_buf, sizeof(s_eb_name_buf),
-                              ebook_scan_name(idx));
+                copy_book_name(s_eb_name_buf, sizeof(s_eb_name_buf),
+                               ebook_scan_name(idx));
                 ui_label_set(s_ui.eb_cursor[i], sel ? ">" : " ");
                 /* Paint the row color every refresh (not only on selection
                  * change) so the first paint after entering the page shows the
@@ -1436,8 +1481,8 @@ static void ui_action(void)
             set_action("打开失败");
             break;
         }
-        strip_txt_ext(s_eb_open_name, sizeof(s_eb_open_name),
-                      ebook_scan_name(s_eb_sel));
+        copy_book_name(s_eb_open_name, sizeof(s_eb_open_name),
+                       ebook_scan_name(s_eb_sel));
         ui_enter_page(UI_PAGE_EBOOK_READ);
         break;
     case UI_PAGE_EBOOK_READ:
@@ -1574,6 +1619,22 @@ static void ui_adjust_lr(int dir)
         set_action(buf);
         break;
     }
+    case SETTING_STANDBY: {
+        int opt = (int)s_standby_opt + dir;
+        opt = MAX(0, MIN(opt, (int)STANDBY_OPT_COUNT - 1));
+        s_standby_opt = (standby_opt_t)opt;
+        hw_lcd_set_standby_timeout((uint32_t)s_standby_opts[s_standby_opt] * 1000);
+        ui_settings_mark_dirty(SETTINGS_DIRTY_STBY);
+        char buf[24];
+        if (s_standby_opt == STANDBY_OPT_NEVER) {
+            snprintf(buf, sizeof(buf), "息屏 永不");
+        } else {
+            snprintf(buf, sizeof(buf), "息屏 %u秒",
+                     (unsigned)s_standby_opts[s_standby_opt]);
+        }
+        set_action(buf);
+        break;
+    }
     default:
         return;
     }
@@ -1587,6 +1648,18 @@ static void ui_key_event_cb(lv_event_t *e)
     }
 
     const uint32_t key = lv_event_get_key(e);
+
+    /* While the screen is blanked in standby, this key press only wakes it
+     * up: light the panel and re-arm the idle timer, but swallow the key so
+     * the user does not accidentally trigger a selection/page change just by
+     * wanting to "take a look". The next key press is acted upon normally. */
+    if (hw_lcd_is_standby_active()) {
+        hw_lcd_activity();
+        return;
+    }
+
+    /* Any key press counts as user activity: re-arm the idle timer. */
+    hw_lcd_activity();
 
     if (s_in_menu) {
         if (key == LV_KEY_UP) {

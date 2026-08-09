@@ -24,7 +24,7 @@ app/ui/ui.c（页面控制器，不依赖具体硬件）
 | 书列表 | `UI_PAGE_EBOOK_LIST` | 扫描 `/sdcard/*.txt`（含内置 ROM 书） | `ui_build_ebook_list` |
 | 阅读 | `UI_PAGE_EBOOK_READ` | TXT 电子书分页阅读 | `ui_build_ebook_read` |
 | 蓝牙 | `UI_PAGE_BT` | A2DP 设备扫描/配对/连接 | `ui_build_bt` |
-| 设置 | `UI_PAGE_SETTINGS` | 音量/蓝牙/日志等级 | `ui_build_settings` |
+| 设置 | `UI_PAGE_SETTINGS` | 音量/背光/蓝牙/息屏/重置 | `ui_build_settings` |
 
 - 主菜单只列出 4 项：`Music Player`、`电子书`、`设置`（蓝牙已并入设置页子页，见 §7）。SD 卡挂载状态不再单独成页，由播放器列表在卡插入/拔出时自动刷新。
 - 电子书引擎在 `app/ebook/ebook.c`，UI 通过 `ebook.h` 公开 API 交互（见 `docs/ebook.md`）。
@@ -38,7 +38,7 @@ app/ui/ui.c（页面控制器，不依赖具体硬件）
          底部：左 "[n/4]"（x=4,y=206），右 "A:OK B:BK"（x=200,y=206）
 列表页：  4 行 y = 38/68/98/128（30px 行距），光标 x=6，文本 x=16
          滚动窗口：选中项尽量居中（top = sel-1 起 4 行）
-设置页：  3 行 y = 38/68/98，值列 x=95；选中项整行青色
+设置页：  5 行 y = 38/68/98/128/158，值列 x=95；选中项整行青色
 状态行：  y = 172（列表页状态）/ 198（SD、阅读页进度）；hint 一般 y=204
 ```
 
@@ -82,12 +82,15 @@ y=204  "上/下选择 A播放 B返回" / "上/下音量 A暂停 B停止"
 
 ```text
 y=38  "音量"   值列 "80%"
-y=68  "蓝牙"   "关 / 开 / 已连接"
-y=98  "日志等级"  "Normal / Debug"
+y=68  "背光"   "70%"
+y=98  "蓝牙"   "关 / 开 / 已连接"
+y=128 "息屏"   "永不 / 15秒 / 30秒 / 60秒 / 120秒 / 300秒"
+y=158 "重置NVS"
 y=204 "上/下选 A进入 左/右设 B返回"
 ```
 
-- 音量/蓝牙/日志等级持久化到 NVS（命名空间 `ui_cfg`：`volume` / `vol_bt`（蓝牙音量槽位）/ `bt_on` / `log_dbg`）；变更置脏位，800ms 无操作后一次写入（`ui_settings_flush`）。
+- **息屏（自动屏幕待机）**：空闲超时后背光关闭、ST7789 进入 DISPOFF 省电；任意按键唤醒恢复亮度。选项：永不 / 15 秒 / 30 秒 / 60 秒 / 2 分钟 / 5 分钟（默认 30 秒）。超时不计入充电/播放等活跃场景，仅由按键活动重置（见 `hw_lcd_activity()` / `hw_lcd_standby_tick()`）。
+- 音量/蓝牙/背光/息屏持久化到 NVS（命名空间 `ui_cfg`：`volume` / `vol_bt`（蓝牙音量槽位）/ `bt_on` / `backlight` / `standby_s`）；变更置脏位，800ms 无操作后一次写入（`ui_settings_flush`）。
 - 音量行显示**当前生效路由**的音量（蓝牙已连时为蓝牙槽位，否则喇叭槽位）。
 - 选中"蓝牙"按 A 进入蓝牙页（自动把 BT 主开关置开、懒启动蓝牙栈）。
 - 日志等级控制 `player` / `hw_audio` / `bt_audio` 三个 tag 的运行时日志级别。

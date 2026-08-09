@@ -4,5 +4,6 @@ idf_component_register(
     REQUIRES board
              esp_driver_spi
              esp_lcd
+             esp_timer
              lvgl
 )
