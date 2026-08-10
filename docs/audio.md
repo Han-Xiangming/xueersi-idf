@@ -56,8 +56,10 @@ PCM 环形缓冲 256KB（优先 PSRAM，失败退内部堆；>1s @44.1kHz 立体
 ```
 
 - 停止/暂停：`hw_audio_set_player_active(false)` → feed 任务把环内剩余数据丢弃，立即静音（不等 1.5s 缓冲放完）。
-- 采样率变更：`hw_audio_set_sample_rate()` 只写 `s_pending_rate`，由 feed 任务串行执行 `i2s_channel_reconfig_std_clock`（禁用→重配→启用），同时通知蓝牙管线内部重采样。
-- 蓝牙路由时 feed 任务只清空 256KB 环（不入 I2S），并保持通道驻车（见 §1）。
+- **事件驱动 feed**：`hw_audio_write_pcm()` 成功入环后 `xTaskNotifyGive` 唤醒 feed（`xRingbufferSend` 自身也会唤醒阻塞的接收者），feed 的环接收超时只作 100ms 兜底——启动与欠载恢复不再等 50ms 轮询切片。
+- **播放时钟对齐（抗长期 ppm 漂移）**：MP3 解码速率精确，而 I2S BCLK（APLL 派生）只有 ppm 级精度；256KB 环吸收短时漂移，但长播会单向耗尽导致周期性欠载空白（环满侧由 `xRingbufferSend` 背压自限，不可闻，无需处理）。feed 任务每秒测一次环填充率的平滑斜率（`audio_clock_tick`），当环在**衰减**时以 Q16 概率在 I2S 写阶段**插入重复的 L/R 样本对**（`audio_clock_insert_pairs`，1 对/秒 ≈ +22.7ppm，上限 ~4 对/秒 ≈ 90ppm，逐样本统计、随机散布、不可闻），1:1 抵消解码器与硬件的速率差；欠载次数（`s_starve`）与插入数（`s_corr_ins`）在出现时以 WARN 上报。所有状态仅 feed 任务私有，无锁。
+- 采样率变更：`hw_audio_set_sample_rate()` 只写 `s_pending_rate`，由 feed 任务串行执行 `i2s_channel_reconfig_std_clock`（禁用→重配），同时通知蓝牙管线内部重采样。**重配后通道保持禁用**，由 speaker 路径在同一个循环轮次里、紧接环接收/写入之前启用——BCLK 永不先于数据启动（无起始 auto-clear 空白，也没有启用/禁用的空转抖动）。
+- 蓝牙路由时 feed 任务只清空 256KB 环（不入 I2S），保持通道驻车（见 §1），并重置时钟对齐基线（蓝牙侧由 A2DP 流控自行定钟）。
 
 ## 5. 接口摘要
 

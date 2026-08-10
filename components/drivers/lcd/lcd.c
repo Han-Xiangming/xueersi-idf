@@ -15,6 +15,8 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "lvgl.h"
 
 static const char *TAG = "hw_lcd";

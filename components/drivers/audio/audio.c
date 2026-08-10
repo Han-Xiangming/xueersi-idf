@@ -16,6 +16,14 @@
  * The feed task also parks the I2S channel (stops BCLK/LRC) whenever nothing
  * is being played or the audio is routed to Bluetooth, so the MAX98357
  * powers down instead of drawing current on an idle clock.
+ *
+ * To keep long sessions free of dropouts the feed task aligns its clock to
+ * the decoder's: it watches the ring-fill slope and inserts an occasional
+ * duplicated sample at the I2S write stage, cancelling the ppm-level mismatch
+ * between the MP3 sample rate and the APLL-derived BCLK without any
+ * resampling (see the "Playback-clock alignment" block below). The feed is
+ * event-driven (task-notified by the writer) instead of polling, and sample
+ * rate reconfigs never start the clock ahead of the data (see apply_rate()).
  */
 #define LOG_LOCAL_LEVEL ESP_LOG_INFO    /* keep detailed audio tracing out unless explicitly set to DEBUG at compile time */
 #include "board_config.h"
@@ -29,6 +37,7 @@
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/ringbuf.h"
 #include "freertos/task.h"
@@ -78,6 +87,33 @@ static RingbufHandle_t s_pcm_ring;
 static TaskHandle_t s_feed_task;
 static bool s_feeding;
 static uint32_t s_pending_rate;          /* applied serially by the feed task */
+
+/* --- Playback-clock alignment -------------------------------------------
+ * The decoder produces PCM at the exact sample rate claimed by the MP3
+ * header, but the I2S clock (APLL-derived BCLK) is only ppm-accurate. The
+ * 256 KB ring absorbs that drift for a long while, but over a long session
+ * the fill walks in one direction until it drains — and an underrun is an
+ * audible blank. (A fill-up is self-limiting: the xRingbufferSend
+ * back-pressure just paces the decoder down, which is inaudible.)
+ *
+ * Fix: once a second the feed task measures the smoothed ring-fill slope.
+ * While the fill is decaying it "inserts" an occasional duplicate L/R pair
+ * at the I2S write stage — a repeated ~23 µs segment, inaudible at the
+ * 1..4 pairs/s this corrects (±22..90 ppm) — cancelling the sink's clock
+ * debt 1:1. All state is feed-task-private, so no locking is needed. */
+#define FILL_SLOPE_TICK_MS 1000                  /* slope measurement period */
+#define FILL_SLOPE_FILTER  0.4f                  /* ~2 s smoothing of the slope */
+#define CORR_MAX_Q16       ((int32_t)(4.0f * 65536.0f / 44100.0f)) /* ~4 p/s cap */
+
+static int64_t  s_fill_last_ms;        /* last slope tick (ms), 0 = unprimed */
+static int32_t  s_fill_prev;           /* ring fill at last tick (bytes) */
+static float    s_fill_slope;          /* smoothed fill slope, pairs/s (+) */
+static int32_t  s_corr_rate_q16;       /* insert probability, Q16 per pair */
+static int32_t  s_corr_acc_q16;        /* fractional insert accumulator */
+static int16_t  s_last_pair[2];        /* last L/R pair written to I2S */
+static uint32_t s_starve;              /* I2S blanks while a stream ran */
+static uint32_t s_corr_ins;            /* inserted pair count (debug) */
+static bool     s_session_wrote;       /* any data written this session */
 
 /* --- Speaker-protection high-pass filter -------------------------------
  * The on-board driver is a small phone racetrack speaker (usable ~800 Hz..8 kHz,
@@ -324,9 +360,13 @@ static void audio_dsp_reset(void)
 }
 
 /* Apply a sample-rate change. Must only be called from the feed task so it is
- * serialized with the I2S writes (reconfig disables the channel). When the
+ * serialized with the I2S writes (reconfig disables the channel). The channel
+ * is left DISABLED here on purpose: the speaker path re-enables it in the
+ * same loop pass, right before the receive/write, so the BCLK never starts
+ * ahead of the data in the ring (no initial auto-clear blank, no spurious
+ * enable/disable churn when the channel was already parked). When the
  * channel is parked (idle / BT route) the reconfig runs straight on the
- * disabled channel and it is re-enabled by the speaker path of the feed task. */
+ * disabled channel. */
 static void apply_rate(uint32_t rate)
 {
     if (!s_ready || rate == s_rate) {
@@ -339,17 +379,77 @@ static void apply_rate(uint32_t rate)
     }
     i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(rate);
     i2s_channel_reconfig_std_clock(s_tx, &clk);
-    esp_err_t err = i2s_channel_enable(s_tx);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "reconfig enable failed: %s", esp_err_to_name(err));
-        s_i2s_enabled = false;
-    }
-    else {
-        s_i2s_enabled = true;
-    }
     s_rate = rate;
     audio_set_hpf_coeff(s_rate);
     audio_set_loudness_coeff(s_rate);
+}
+
+/* Playback-clock alignment, once per second while a speaker stream flows
+ * (see the state block at the top). Called from the feed task only. */
+static void audio_clock_tick(void)
+{
+    if (s_pcm_ring == NULL) {
+        return;
+    }
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    if (s_fill_last_ms == 0) {
+        /* Session start (or BT pause): prime the baseline from the current
+         * ring level, no correction until a full period has passed. */
+        s_fill_last_ms = now_ms;
+        s_fill_prev = (int32_t)(PCM_RING_BYTES
+                                - (int32_t)xRingbufferGetCurFreeSize(s_pcm_ring));
+        return;
+    }
+    if (now_ms - s_fill_last_ms < FILL_SLOPE_TICK_MS) {
+        return;
+    }
+    const int32_t fill = (int32_t)(PCM_RING_BYTES
+                                   - (int32_t)xRingbufferGetCurFreeSize(s_pcm_ring));
+    const float dt_ms = (float)(now_ms - s_fill_last_ms);
+    /* Ring-fill slope in sample PAIRS per second (+ = filling). */
+    const float slope = (float)(fill - s_fill_prev) / (4.0f * dt_ms / 1000.0f);
+    s_fill_slope += (slope - s_fill_slope) * FILL_SLOPE_FILTER;
+    s_fill_prev = fill;
+    s_fill_last_ms = now_ms;
+
+    /* Only the drain direction is correctable: a filling ring is already
+     * back-pressure limited, so nothing audible ever happens there. Cancel
+     * the measured drain 1:1, capped at ~90 ppm. */
+    float corr = (s_fill_slope < 0.0f) ? -s_fill_slope : 0.0f;
+    int32_t cq = (int32_t)(corr * (65536.0f / 44100.0f) + 0.5f);
+    s_corr_rate_q16 = (cq > CORR_MAX_Q16) ? CORR_MAX_Q16 : cq;
+
+    if (s_starve > 0) {
+        ESP_LOGW(TAG, "clock: %u I2S starves (auto-clear blanks), corr=%d p/s, inserts=%u",
+                 (unsigned)s_starve,
+                 (int)(((int64_t)s_corr_rate_q16 * 44100 + 32768) / 65536),
+                 (unsigned)s_corr_ins);
+        s_starve = 0;
+        s_corr_ins = 0;
+    }
+}
+
+/* Per-pair correction accounting for one chunk just handed to the I2S DMA.
+ * `pairs` = number of L/R pairs in the chunk. While the ring-fill drain debt
+ * exists (s_corr_rate_q16 > 0), every pair written earns a fractional chance
+ * to insert a duplicate of the last pair — so inserts land ~randomly spread
+ * across the stream instead of as salvoes. Called from the feed task only. */
+static void audio_clock_insert_pairs(const int16_t *data, size_t pairs)
+{
+    for (size_t k = 0; k < pairs; k++) {
+        s_last_pair[0] = data[2 * k];
+        s_last_pair[1] = data[2 * k + 1];
+        s_corr_acc_q16 += s_corr_rate_q16;
+        if (s_corr_acc_q16 < 65536) {
+            continue;
+        }
+        s_corr_acc_q16 -= 65536;
+        size_t w2 = 0;
+        if (i2s_channel_write(s_tx, (const uint8_t *)s_last_pair, 4, &w2,
+                              pdMS_TO_TICKS(10)) == ESP_OK && w2 == 4) {
+            s_corr_ins++;
+        }
+    }
 }
 
 static void audio_feed_task(void *arg)
@@ -373,6 +473,7 @@ static void audio_feed_task(void *arg)
                     i2s_channel_disable(s_tx);
                     s_i2s_enabled = false;
                 }
+                s_fill_last_ms = 0;   /* speaker clock state goes stale: re-prime */
                 item = (uint8_t *)xRingbufferReceive(s_pcm_ring, &item_size,
                                                      pdMS_TO_TICKS(50));
                 if (item != NULL) {
@@ -384,7 +485,10 @@ static void audio_feed_task(void *arg)
                 apply_rate(s_pending_rate);
                 s_pending_rate = 0;
             }
-            /* Speaker route: bring the channel back up if it is parked. */
+            /* Speaker route: bring the channel back up if it is parked.
+             * apply_rate() leaves the channel disabled, so it is always
+             * started HERE, right before the receive/write — the clock never
+             * runs ahead of the data in the ring. */
             if (s_ready && !s_i2s_enabled) {
                 esp_err_t e = i2s_channel_enable(s_tx);
                 if (e != ESP_OK) {
@@ -394,11 +498,28 @@ static void audio_feed_task(void *arg)
                     s_i2s_enabled = true;
                 }
             }
-            item = (uint8_t *)xRingbufferReceive(s_pcm_ring, &item_size,
-                                                 pdMS_TO_TICKS(50));
+            /* Playback-clock alignment pass (see the state block above). */
+            audio_clock_tick();
+
+            /* Event-driven receive: woken instantly by the ring send itself,
+             * or by the writer/control notifies (xRingbufferReceive does NOT
+             * see task notifies — hence the explicit wait below). The 100 ms
+             * timeout is a safety net so stop/park requests are never missed
+             * while the ring sits empty. */
+            for (;;) {
+                item = (uint8_t *)xRingbufferReceive(s_pcm_ring, &item_size, 0);
+                if (item != NULL || !s_feeding) {
+                    break;
+                }
+                ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+            }
             if (item == NULL) {
+                if (s_session_wrote && s_ready && s_i2s_enabled) {
+                    s_starve++;   /* DMA blanked while a stream was running */
+                }
                 continue;   /* ring empty: DMA underruns (auto_clear -> silence) */
             }
+            s_session_wrote = true;
             size_t written = 0;
             while (written < item_size) {
                 size_t w = 0;
@@ -409,6 +530,8 @@ static void audio_feed_task(void *arg)
                     break;
                 }
                 written += w;
+                audio_clock_insert_pairs((const int16_t *)(item + written - w),
+                                         w / 4);
             }
             vRingbufferReturnItem(s_pcm_ring, item);
         }
@@ -417,6 +540,12 @@ static void audio_feed_task(void *arg)
         while ((item = (uint8_t *)xRingbufferReceive(s_pcm_ring, &item_size, 0)) != NULL) {
             vRingbufferReturnItem(s_pcm_ring, item);
         }
+        /* Session over: reset the clock-alignment baseline so the next
+         * session re-primes from the current ring level. */
+        s_fill_last_ms = 0;
+        s_session_wrote = false;
+        s_corr_rate_q16 = 0;
+        s_corr_acc_q16 = 0;
         /* 3 s park grace window: keep BCLK running so a quick re-play
          * (next/prev track, pause-resume) does not power-cycle the MAX98357
          * (which clicks) and does not restart the I2S clock. A play within
@@ -503,7 +632,7 @@ void hw_audio_init(void)
     s_vol_gain_sm = s_vol_gain;       /* start settled: no fade-in from zero */
     s_loud_boost_sm = s_loud_boost;   /* shelf boost settled too */
     s_lim_gain = 32768;               /* limiter flat until audio starts */
-    xTaskCreate(audio_feed_task, "audio_feed", 4 * 1024, NULL, 6, &s_feed_task);
+    xTaskCreate(audio_feed_task, "audio_feed", 6 * 1024, NULL, 6, &s_feed_task);
 
     /* Route starts at the speaker; nothing else may flip it (see hw_audio_set_route).
      * A Bluetooth link coming up does NOT hijack a speaker session — but a link
@@ -654,6 +783,9 @@ void hw_audio_set_player_active(bool active)
     else {
         s_feeding = false;            /* feed task drains the ring then idles */
         s_pending_rate = 0;           /* drop any unapplied rate from the track */
+        if (s_feed_task != NULL) {
+            xTaskNotifyGive(s_feed_task);   /* wake it to drain/park now */
+        }
         ESP_LOGD(TAG, "player inactive: draining ring");
     }
 }
@@ -773,6 +905,11 @@ void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
     if (waits > 0) {
         ESP_LOGD(TAG, "pcm back-pressure: waited %d x50ms (frames=%u)", waits,
                  (unsigned)frames);
+    }
+    if (s_feed_task != NULL) {
+        /* Event-driven feed: wake it on data instead of leaving it to sit
+         * out its 100 ms receive timeout (startup / post-underrun latency). */
+        xTaskNotifyGive(s_feed_task);
     }
 }
 

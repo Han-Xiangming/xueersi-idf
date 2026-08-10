@@ -23,6 +23,10 @@ CONFIG_SPIRAM_OCCUPY_VSPI_HOST=y
 CONFIG_SPIRAM_USE_MALLOC=y
 # Allow EXT_RAM_BSS_ATTR statics to live in PSRAM (frees internal DRAM).
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+# Duplicate-load/store cache workaround (rev1+ silicon): the legacy MEMW
+# strategy is a well-known source of silent full freezes with PSRAM + ISRs.
+CONFIG_SPIRAM_CACHE_WORKAROUND_STRATEGY_DUPLDST=y
+# CONFIG_SPIRAM_CACHE_WORKAROUND_STRATEGY_MEMW is not set
 CONFIG_LV_COLOR_DEPTH_16=y
 CONFIG_LV_DEF_REFR_PERIOD=16
 CONFIG_LV_DPI_DEF=60
@@ -42,8 +46,17 @@ CONFIG_LV_USE_PERF_MONITOR_LOG_MODE=n
 # CONFIG_LV_BUILD_DEMOS is not set
 # CONFIG_LV_USE_DEMO_WIDGETS is not set
 # CONFIG_LV_USE_DEMO_BENCHMARK is not set
+# v6.x: SPI master IRAM options only visible when FreeRTOS itself is in IRAM.
+CONFIG_FREERTOS_IN_IRAM=y
 CONFIG_SPI_MASTER_IN_IRAM=y
 CONFIG_SPI_MASTER_ISR_IN_IRAM=y
+# Audio ISR into IRAM: the PSRAM cache workaround disables flash cache while
+# copying to PSRAM; a flash-resident I2S ISR in that window hangs the system.
+CONFIG_I2S_ISR_IRAM_SAFE=y
+CONFIG_I2S_CTRL_FUNC_IN_IRAM=y
+# Same for the console UART ISR: logging during playback is exactly when a
+# PSRAM copy window can lock the CPU inside a flash-resident TX/RX ISR.
+CONFIG_UART_ISR_IN_IRAM=y
 
 # Bluetooth: classic BR/EDR only, Bluedroid host, A2DP (source role used).
 CONFIG_BT_ENABLED=y

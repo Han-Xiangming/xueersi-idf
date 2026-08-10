@@ -43,15 +43,18 @@ typedef struct {
     FILE *fp;
 } track_src_t;
 
-/* Decoder working buffers (owned by the decode loop). PCM buffers are pure
- * CPU access (decode + mono->stereo copy; hw_audio_write_pcm copies into the
- * PSRAM ring), so they live in PSRAM to keep internal DRAM headroom. */
+/* Decoder working buffers (owned by the decode loop). s_pcm stays in
+ * internal DRAM on purpose: for stereo files (the common case) it is the
+ * buffer memcpy'd by hw_audio_write_pcm into the PSRAM audio ring at ~40 Hz,
+ * and a PSRAM source there puts the cache-workaround copy on the hot path
+ * (documented crash source under BT controller load). s_stereo, used only
+ * for mono files, keeps the PSRAM placement to fit the DRAM budget. */
 static track_src_t s_src;
 static HMP3Decoder s_dec;
 static unsigned char s_readbuf[MP3_READ_CHUNK];
 static int s_bytes_left;
 static int s_consumed;
-EXT_RAM_BSS_ATTR static int16_t s_pcm[MP3_PCM_MAX];
+static int16_t s_pcm[MP3_PCM_MAX];
 EXT_RAM_BSS_ATTR static int16_t s_stereo[MP3_PCM_MAX];
 
 /* --- Background SD scan -------------------------------------------------

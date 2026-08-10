@@ -70,13 +70,12 @@ static bt_conn_state_cb_t s_conn_state_cb;
 /* A2DP/SBC always streams at 44.1 kHz; other input rates are resampled. */
 #define BT_STREAM_RATE         44100
 
-/* SBC bitpool cap for the A2DP source: raised to the A2DP maximum of 64
- * (~385 kbps at 44.1 kHz joint stereo) for the best codec quality, instead
- * of the stack default 53 (~328 kbps). The encoder still steps down to the
- * sink's max_bitpool if it advertises a lower one. If a weak/slow sink
- * floods "l2cab is_cong_cback_context", lower this to 53/45/37 to trade
- * quality for a steadier stream. */
-#define BT_SBC_MAX_BITPOOL     64
+/* SBC bitpool for the A2DP source. The stack default 53 (~328 kbps at
+ * 44.1 kHz joint stereo) is kept on purpose: raising it to 64 (~385 kbps,
+ * the A2DP maximum) frequently floods "l2cab is_cong_cback_context" on
+ * real-world sinks and makes the stream stutter. Trade down to 45/37 if a
+ * particular sink still congests. */
+#define BT_SBC_MAX_BITPOOL     53
 
 /* Preferred SBC capability advertised to sinks: same shape as the stack
  * default config, but with max_bitpool capped (see BT_SBC_MAX_BITPOOL).
