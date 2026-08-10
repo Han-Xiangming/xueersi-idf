@@ -76,7 +76,7 @@ static const int s_setting_y[SETTING_COUNT] = {34, 66, 98, 130, 162};
 
 /* Backlight brightness (0..100 %), driven via PWM on PIN_NUM_LCD_BL.
  * Persisted to NVS; restored at boot. */
-static uint8_t s_backlight = 70;
+static uint8_t s_backlight = 60;
 
 /* Bluetooth output master switch (settings page ON/OFF). Persisted to NVS;
  * restored at boot. Drives bt_audio_set_enabled() — the audio routing gate. */
@@ -250,6 +250,20 @@ static char     s_bt_list_name[BT_MAX_DEVICES][BT_DEV_NAME_LEN];
 static int s_mp3_count;
 static int s_mp3_sel;
 
+/* Marquee (scrolling) state for the selected list row. Only the highlighted
+ * row scrolls when its name is wider than the line; others stay clipped. */
+#define LIST_SCROLL_MS   220
+#define LIST_SCROLL_GAP  8
+#define LIST_LINE_W      (LCD_H_RES - 32)
+typedef struct {
+    int ofs;            /* current scroll offset, in characters */
+    uint32_t at;        /* timestamp of last step (ms) */
+    char src[MP3_NAME_LEN];
+    bool scrolling;
+} ui_marquee_t;
+static ui_marquee_t s_mp3_mq;
+static ui_marquee_t s_eb_mq;
+
 /* Ebook book-list page: same 4-row layout as the MP3 page. */
 #define EBOOK_LIST_ROWS 6
 static const int s_eb_row_y[EBOOK_LIST_ROWS] = {38, 64, 90, 116, 142, 168};
@@ -395,6 +409,100 @@ static void copy_utf8_clipped(char *dst, size_t dst_size, const char *src)
         p += seq;
     }
     dst[n] = '\0';
+}
+
+/* Display-only helper: return a pointer to the name with a trailing ".xxx"
+ * extension (e.g. ".mp3") removed. Does not mutate the source; the returned
+ * pointer is into a static buffer (single-slot, fine for our one-shot use).
+ * Storage keeps the real name (player_play builds the path from it). */
+static const char *strip_ext(const char *name)
+{
+    static char s_buf[MP3_NAME_LEN];
+    size_t n = strnlen(name, MP3_NAME_LEN);
+    if (n > 0 && n < MP3_NAME_LEN) {
+        s_buf[n] = '\0';
+        memcpy(s_buf, name, n);
+        /* strip last extension */
+        for (size_t i = n; i > 0; i--) {
+            if (s_buf[i - 1] == '.') {
+                s_buf[i - 1] = '\0';
+                break;
+            }
+            if (s_buf[i - 1] == '/') {
+                break;
+            }
+        }
+        return s_buf;
+    }
+    return name;
+}
+
+/* UTF-8-aware pixel width estimate for a label using the default font.
+ * CJK (3-byte) sequences count as 16px, everything else (ASCII + Latin
+ * extensions, 1-2 bytes) as 8px. Good enough to decide whether a list entry
+ * needs to scroll. */
+static int ui_text_px_width(const char *text)
+{
+    int w = 0;
+    const uint8_t *p = (const uint8_t *)text;
+    while (*p) {
+        uint8_t b = *p;
+        if ((b & 0xE0) == 0xC0) {       /* 2-byte */
+            p += 2; w += 8;
+        } else if ((b & 0xF0) == 0xE0) {/* 3-byte (CJK) */
+            p += 3; w += 16;
+        } else if ((b & 0xF8) == 0xF0) {/* 4-byte */
+            p += 4; w += 16;
+        } else {                        /* 1-byte (ASCII) */
+            p += 1; w += 8;
+        }
+    }
+    return w;
+}
+
+/* Advance the marquee for the selected row. Returns true and fills `out` with
+ * the shifted string "src[ofs:] + gap + src[0:ofs]" when scrolling; the caller
+ * should keep refreshing until it returns false (name fits / finished a loop
+ * and is now static). */
+static bool ui_marquee_step(ui_marquee_t *mq, char *out, size_t out_size,
+                            const char *name)
+{
+    if (name == NULL) {
+        name = "";
+    }
+    int w = ui_text_px_width(name);
+    if (w <= LIST_LINE_W) {
+        mq->scrolling = false;
+        mq->ofs = 0;
+        snprintf(out, out_size, "%s", name);
+        return false;
+    }
+    /* Need to scroll. */
+    if (mq->src[0] == '\0' || strncmp(mq->src, name, MP3_NAME_LEN) != 0) {
+        /* New/changed name: (re)start from the beginning. */
+        strncpy(mq->src, name, MP3_NAME_LEN - 1);
+        mq->src[MP3_NAME_LEN - 1] = '\0';
+        mq->ofs = 0;
+    }
+    mq->scrolling = true;
+    uint32_t now = lv_tick_get();
+    if (now - mq->at >= LIST_SCROLL_MS) {
+        mq->at = now;
+        mq->ofs++;
+    }
+    int len = (int)strlen(mq->src);
+    if (mq->ofs >= len) {
+        mq->ofs = 0;                    /* loop back to start */
+    }
+    /* Build "tail + gap + head" so the name circulates. */
+    char gap[LIST_SCROLL_GAP + 1];
+    memset(gap, ' ', LIST_SCROLL_GAP);
+    gap[LIST_SCROLL_GAP] = '\0';
+    int tail = len - mq->ofs;
+    snprintf(out, out_size, "%.*s%s%.*s",
+             tail, mq->src + mq->ofs, gap,
+             mq->ofs, mq->src);
+    return true;
 }
 
 static void set_action(const char *msg)
@@ -1173,8 +1281,30 @@ void ui_refresh(void)
                  * overflows it under load (BT+SDSPI IRQs) and corrupts adjacent
                  * memory — surfacing as a SPI ISR Guru Meditation. */
                 static char s_pl_name_buf[MP3_NAME_LEN];
-                copy_utf8_clipped(s_pl_name_buf, sizeof(s_pl_name_buf),
-                                  player_scan_name(idx));
+                if (sel) {
+                    /* Selected row scrolls its name if wider than the line — but
+                     * only when idle. While playing we freeze a static (clipped)
+                     * name to avoid needless redraws and save resources. */
+                    if (player_state() == PLAYER_PLAYING) {
+                        s_mp3_mq.scrolling = false;
+                        copy_utf8_clipped(s_pl_name_buf, sizeof(s_pl_name_buf),
+                                          strip_ext(player_scan_name(idx)));
+                    }
+                    else {
+                        ui_marquee_step(&s_mp3_mq, s_pl_name_buf,
+                                        sizeof(s_pl_name_buf),
+                                        strip_ext(player_scan_name(idx)));
+                    }
+                }
+                else {
+                    copy_utf8_clipped(s_pl_name_buf, sizeof(s_pl_name_buf),
+                                      strip_ext(player_scan_name(idx)));
+                    /* Do NOT clear s_mp3_mq.scrolling here: the selected row may
+                     * be drawn earlier in this loop, and a later non-selected row
+                     * would clobber it to false, freezing the marquee after one
+                     * step. ui_marquee_step() already sets scrolling=false when
+                     * the (selected) name fits the line. */
+                }
                 ui_label_set(s_ui.pl_cursor[i], sel ? ">" : " ");
                 if (sel_changed) {
                     lv_obj_set_style_text_color(s_ui.pl_cursor[i], lv_color_hex(UI_CYAN), 0);
@@ -1204,9 +1334,9 @@ void ui_refresh(void)
             }
         }
         else {
-            /* Now-playing line: just the track name. */
+            /* Now-playing line: just the track name (no extension). */
             char prog[28];
-            snprintf(prog, sizeof(prog), "%s", player_current_name());
+            snprintf(prog, sizeof(prog), "%s", strip_ext(player_current_name()));
             prog[27] = '\0';
             ui_label_set(s_ui.pl_prog, prog);
         }
@@ -1343,6 +1473,16 @@ void ui_refresh(void)
                 static char s_eb_name_buf[64];
                 copy_book_name(s_eb_name_buf, sizeof(s_eb_name_buf),
                                ebook_scan_name(idx));
+                if (sel) {
+                    /* Selected row scrolls its name if wider than the line. */
+                    ui_marquee_step(&s_eb_mq, s_eb_name_buf,
+                                    sizeof(s_eb_name_buf), s_eb_name_buf);
+                }
+                else {
+                    /* Same as the MP3 list: never clobber s_eb_mq.scrolling from
+                     * a non-selected row (would freeze the marquee after one step).
+                     * ui_marquee_step() clears it when the selected name fits. */
+                }
                 ui_label_set(s_ui.eb_cursor[i], sel ? ">" : " ");
                 /* Paint the row color every refresh (not only on selection
                  * change) so the first paint after entering the page shows the
@@ -1410,7 +1550,18 @@ void ui_refresh(void)
         break;
     }
     ui_refresh_battery();
-    s_ui_dirty = false;                 /* painted; wait for next change */
+    /* Keep refreshing while a selected list row is still scrolling, otherwise
+     * the marquee freezes after a single step (s_ui_dirty would be cleared).
+     * During playback the MP3 marquee is intentionally frozen, so it must not
+     * force refreshes. */
+    if ((s_ui.page_id == UI_PAGE_PLAYER && s_mp3_mq.scrolling
+         && player_state() != PLAYER_PLAYING) ||
+        (s_ui.page_id == UI_PAGE_EBOOK_LIST && s_eb_mq.scrolling)) {
+        s_ui_dirty = true;
+    }
+    else {
+        s_ui_dirty = false;             /* painted; wait for next change */
+    }
 }
 
 static void ui_action(void)

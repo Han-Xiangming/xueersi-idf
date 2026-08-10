@@ -21,10 +21,14 @@
  * or the dedicated display-width clipped copy instead. */
 #define MP3_NAME_LEN 256
 
-/* Max length of a fully-qualified track path ("/sdcard/<name>"). Kept in one
- * place so the player / ebook buffers and the snprintf() calls below never
- * disagree and can never overflow. 8 = strlen("/sdcard/"). */
-#define PLAYER_PATH_LEN (8 + MP3_NAME_LEN)
+/* Library root: the "Music" folder at the SD card root. */
+#define PLAYER_ROOT "/sdcard/Music"
+
+/* Max length of a fully-qualified track path (PLAYER_ROOT "/<name>").
+ * 14 = strlen("/sdcard/Music/"). Kept in one place so the player / ebook
+ * buffers and the snprintf() calls below never disagree and can never
+ * overflow. */
+#define PLAYER_PATH_LEN (14 + MP3_NAME_LEN)
 
 typedef enum {
     PLAYER_IDLE = 0,

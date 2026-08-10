@@ -28,7 +28,7 @@ static const char *TAG = "player";
 static TaskHandle_t s_task;
 static player_state_t s_state = PLAYER_IDLE;
 
-static char s_path[PLAYER_PATH_LEN];        /* full path: /sdcard/<name> */
+static char s_path[PLAYER_PATH_LEN];        /* full path: /sdcard/Music/<name> */
 static char s_name[MP3_NAME_LEN];
 static bool s_stop_req;
 static bool s_pause_req;
@@ -86,7 +86,7 @@ static int scan_name_cmp(const void *a, const void *b)
 static void scan_do(void)
 {
     int n = 0;
-    DIR *d = opendir("/sdcard");
+    DIR *d = opendir(PLAYER_ROOT);
     if (d != NULL) {
         struct dirent *e;
         while ((e = readdir(d)) != NULL && n < PLAYER_SCAN_MAX - 1) {
@@ -417,7 +417,7 @@ const char *player_current_name(void)
 void player_play(const char *name)
 {
     /* Paths and names use one shared upper bound (MP3_NAME_LEN == 256, the
-     * FATFS LFN limit) so "/sdcard/<name>" can never exceed PLAYER_PATH_LEN.
+     * FATFS LFN limit) so PLAYER_ROOT "/<name>" can never exceed PLAYER_PATH_LEN.
      * We only warn/truncate past that bound — multi-byte titles stay intact. */
     size_t nlen = strnlen(name, MP3_NAME_LEN + 1);
     if (nlen > MP3_NAME_LEN) {
@@ -425,7 +425,7 @@ void player_play(const char *name)
     }
     strncpy(s_new_name, name, sizeof(s_new_name) - 1);
     s_new_name[sizeof(s_new_name) - 1] = '\0';
-    snprintf(s_new_path, sizeof(s_new_path), "/sdcard/%s", s_new_name);
+    snprintf(s_new_path, sizeof(s_new_path), PLAYER_ROOT "/%s", s_new_name);
 
     s_new_req = true;
     s_stop_req = true;          /* ask any current decode to stop */

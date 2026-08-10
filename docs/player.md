@@ -13,7 +13,7 @@ player.c
   ├─ player_task（16KB 栈，优先级 5）
   │    解码循环：读文件 → helix 解码 → hw_audio_write_pcm()（带背压）
   ├─ scan_task（4KB 栈，优先级 4）
-  │    后台扫描 /sdcard 的 .mp3 → 双缓冲快照发布曲目列表
+  │    后台扫描 /sdcard/Music 的 .mp3 → 双缓冲快照发布曲目列表
   └─ 状态机       IDLE / PLAYING / PAUSED
 ```
 
@@ -25,7 +25,7 @@ FATFS 目录遍历在 SDSPI 上耗时数十 ms，故列表由**独立扫描任�
 
 | API | 说明 |
 | ---- | ---- |
-| `player_scan_start()` | 请求后台扫描 `/sdcard` 的 `.mp3`（忽略大小写）；扫描进行中的请求合并为一次后续扫描 |
+| `player_scan_start()` | 请求后台扫描 `/sdcard/Music` 的 `.mp3`（忽略大小写）；扫描进行中的请求合并为一次后续扫描 |
 | `player_scan_busy()` | 扫描中或已排队 |
 | `player_scan_version()` | 每次完成扫描递增；UI 轮询以检测新列表 |
 | `player_scan_count()` | 最近一次扫描的曲目数（最多 64 首，`PLAYER_SCAN_MAX`） |
@@ -42,7 +42,7 @@ FATFS 目录遍历在 SDSPI 上耗时数十 ms，故列表由**独立扫描任�
 | `player_init()` | 创建解码任务 + 扫描任务（app_main 启动时一次） |
 | `player_state()` | 当前状态（IDLE / PLAYING / PAUSED） |
 | `player_current_name()` | 当前载入曲目名（空闲为 ""） |
-| `player_play(name)` | 播放 `/sdcard/<name>`；运行中调用则切换曲目 |
+| `player_play(name)` | 播放 `/sdcard/Music/<name>`；运行中调用则切换曲目 |
 | `player_toggle()` | 播放 ⇄ 暂停 |
 | `player_stop()` | 停止；先释放 I2S 归属（`hw_audio_set_player_active(false)`）使解码背压立即退出，再通知任务 |
 
