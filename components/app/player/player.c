@@ -37,6 +37,10 @@ static char s_new_path[PLAYER_PATH_LEN];
 static char s_new_name[MP3_NAME_LEN];
 static uint32_t s_dbg_frames;          /* decode-frame counter for debug logs */
 static uint32_t s_dbg_rate;            /* samplerate captured from 1st frame */
+/* Consecutive buffer refills that failed to locate an MP3 sync word. Reset on
+ * each new track; if it reaches the limit the track is aborted instead of
+ * spinning forever on a corrupt/non-MP3 file. */
+static int s_no_sync_refills;
 
 /* Abstract data source: a file on the SD card. */
 typedef struct {
@@ -197,6 +201,7 @@ static bool open_track(void)
     skip_id3v2();   /* the decoder must only see real audio frames */
     s_bytes_left = 0;
     s_consumed = 0;
+    s_no_sync_refills = 0;   /* fresh track: restart sync-word watchdog */
     return true;
 }
 
@@ -243,8 +248,13 @@ static bool decode_frame(bool *rate_set)
                  s_bytes_left);
         s_consumed = 0;
         s_bytes_left = 0;
+        if (++s_no_sync_refills >= 64) {
+            ESP_LOGE(TAG, "no MP3 sync word after 64 refills, aborting track");
+            return false;
+        }
         return true;
     }
+    s_no_sync_refills = 0;
     s_consumed += offset;
     s_bytes_left -= offset;
 
@@ -323,7 +333,13 @@ static void decode_loop(void)
         bool rate_set = false;
         int frame_cnt = 0;
         s_dbg_frames = 0;                 /* reset debug frame counter */
-        bool started = false;            /* player-active claimed after 1st frame */
+        /* player-active (feed task) is claimed AFTER the first decoded frame of
+         * THIS track has been enqueued. Reset it per track — including when we
+         * loop back via `continue` for a track switch — otherwise a switch would
+         * leave `s_feeding` false (close_track cleared it) and the feed task
+         * would never re-activate, filling the ring and wedging decode_loop
+         * forever in hw_audio_write_pcm (the "log hangs, no audio" symptom). */
+        bool started = false;
         while (!s_stop_req) {
             if (s_pause_req) {
                 ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
