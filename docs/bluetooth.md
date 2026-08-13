@@ -13,7 +13,7 @@
 PCM 环形缓冲 128KB（bt_audio_init 分配，优先 PSRAM；~740ms @44.1kHz 立体声）
 ```
 
-- 目标 ESP-IDF v5.x（实测 5.5），`CONFIG_BT_ENABLED` + `CONFIG_BT_A2DP_ENABLE`。
+- 目标 ESP-IDF v6.1（当前使用 v6.1-beta1），`CONFIG_BT_ENABLED` + `CONFIG_BT_A2DP_ENABLE`。
 - 所有入口在蓝牙被裁剪时均为安全 no-op。
 - **懒启动**：`bt_audio_init()` 只分配环形缓冲，不碰控制器；`bt_audio_enable()`（进入蓝牙页时调用）才拉起控制器 + Bluedroid + A2DP Source，避免开机即广播 A2DP。
 - 只启用 BR/EDR（A2DP 不需要 BLE），启动时释放 BLE 内存；本机设为**可连接但不可发现**（源角色向外拨号）。

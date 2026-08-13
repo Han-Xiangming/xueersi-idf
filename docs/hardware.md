@@ -23,9 +23,9 @@ ESP32（WROVER-B，PSRAM 8MB）@ 240MHz
 | LCD CS | 5 | |
 | LCD DC | 4 | |
 | SD CS | 22 | SDSPI（SCLK/MOSI/MISO 与 LCD 共用） |
-| I2S BCLK | 25 | 帧时钟输出 |
-| I2S LRC | 32 | 声道选择 |
-| I2S DIN | 33 | PCM 数据 |
+| I2S BCLK | 32 | 帧时钟输出 |
+| I2S LRC | 15 | 声道选择 |
+| I2S DIN | 21 | PCM 数据 |
 | 上 / 下 / 左 / 右 | 2 / 13 / 27 / 35 | 低有效 |
 | A / B | 34 / 12 | 低有效（34/35 外部上拉） |
 

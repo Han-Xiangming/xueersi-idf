@@ -2,7 +2,7 @@
 
 这是给学而思小喵掌机（ESP32-WROVER-B 版本）移植的 **ESP-IDF / LVGL 9.5 C 固件工程**，提供 MP3 播放、SD 卡浏览、蓝牙 A2DP 音频输出、TXT 电子书阅读、背光/音量设置等功能的分页 UI。
 
-> 注意：本工程是原生 ESP-IDF C 固件（不是 MicroPython），源码位于 `main/`、`components/`，构建系统为 CMake + ESP-IDF v5.x。
+> 注意：本工程是原生 ESP-IDF C 固件（不是 MicroPython），源码位于 `main/`、`components/`，构建系统为 CMake + ESP-IDF v6.1（当前使用 v6.1-beta1）。
 
 ## 固件下载与刷入
 
@@ -18,7 +18,7 @@ esptool.py --chip esp32 -b 460800 write_flash 0x0 xiaomiao-merged.bin
 
 ## 从源码构建
 
-需要 ESP-IDF v5.x（已针对 5.5.x 验证）。
+需要 ESP-IDF v6.1（已针对 v6.1-beta1 验证）。
 
 ```bash
 # 在 ESP-IDF 环境下
@@ -173,7 +173,7 @@ MAX98357 由 BCLK 内部派生主时钟，因此 **不需要 MCLK**。
 ### 3.1 播放器（MP3）
 
 - 解码库：`esp-libhelix-mp3`（libhelix C API），运行在独立 FreeRTOS 任务中，不阻塞 UI。
-- 音源：SD 卡 `/sdcard` 下的 `.mp3` 文件（后台扫描，最多 64 首），以及一首内嵌 ROM 测试曲。
+- 音源：SD 卡 `/sdcard/Music` 目录下的 `.mp3` 文件（后台扫描，最多 64 首），以及一首内嵌 ROM 测试曲。
 - 支持播放 / 暂停切换 / 停止；播放时上下键调节音量，A 播放/继续，B 停止。
 - 输出路由：`AUDIO_ROUTE_SPEAKER`（本地 MAX98357）与 `AUDIO_ROUTE_BT`（蓝牙 sink）二选一，由 UI 显式切换。
 
