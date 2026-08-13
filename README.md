@@ -43,12 +43,6 @@ idf.py -p (PORT) flash monitor
 - 已接入功能：按键（6 键）、MicroSD（SDSPI）、I2S 音频（MAX98357 Class-D DAC）、MP3 播放（libhelix-mp3 解码）、蓝牙 A2DP 音频输出（SOURCE 角色）、TXT 电子书阅读、单节锂电电量检测与低电量保护。详见 `docs/` 下各模块文档。
 - 蓝牙在用户打开蓝牙页时才懒加载启动（开机不广播），关掉蓝牙开关时彻底断电。蓝牙输出为显式路由切换，不会因蓝牙连接上来而静默抢占本地扬声器。
 
-## 原理图与鸣谢
-
-原理图文件已整理为 [`docs/xueersi-xiaomiao-schematic.pdf`](docs/xueersi-xiaomiao-schematic.pdf)。
-
-感谢 ID「我为电波狂」对硬件进行测量并制作原理图，这部分资料对后续移植和维护非常关键。
-
 
 ## 1. 总体架构
 
