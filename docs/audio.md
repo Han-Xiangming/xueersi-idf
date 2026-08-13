@@ -11,7 +11,7 @@ MP3 解码（helix） ──> hw_audio_write_pcm() → 按路由分发
                                         → audio_feed 任务 → I2S(MAX98357)
 ```
 
-- 输出 DAC：MAX98357 单声道 Class-D，I2S 标准模式（16-bit 立体声，只写 DOUT 声道），引脚 BCLK=25 / LRC=32 / DIN=33，无 MCLK。
+- 输出 DAC：MAX98357 单声道 Class-D，I2S 标准模式（16-bit 立体声，只写 DOUT 声道），引脚 BCLK=32 / LRC=15 / DIN=21，无 MCLK。
 - 蓝牙输出：A2DP Source，SBC 编码由 Bluedroid 完成（见 `docs/bluetooth.md`）。
 - **路由互斥**：蓝牙连接时只走蓝牙，I2S 完全不喂数据（喇叭静音），解码任务由 BT 环形缓冲的阻塞发送单一时钟驱动，避免双时钟漂移丢音。
 - **通道驻车**：空闲或蓝牙路由时 `audio_feed` 任务禁用 I2S 通道（停 BCLK/LRC），MAX98357 在时钟停止后进入掉电（约 64k BCLK 周期后关断）——菜单待机不空耗；快速续播有 3s 驻车宽限窗口，窗口内不重启时钟（避免 MAX98357 上电咔哒声）。

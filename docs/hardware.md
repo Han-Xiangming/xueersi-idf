@@ -28,6 +28,7 @@ ESP32（WROVER-B，PSRAM 8MB）@ 240MHz
 | I2S DIN | 21 | PCM 数据 |
 | 上 / 下 / 左 / 右 | 2 / 13 / 27 / 35 | 低有效 |
 | A / B | 34 / 12 | 低有效（34/35 外部上拉） |
+| Select / Start / Menu | 25 / 26 / 33 | 均低有效（按下接 GND，内部上拉） |
 
 ## 3. 显示驱动（components/drivers/lcd/lcd.c）
 
@@ -52,7 +53,7 @@ ESP32（WROVER-B，PSRAM 8MB）@ 240MHz
 
 ## 6. 音频输出（components/drivers/audio/audio.c）
 
-- I2S 输出到 MAX98357（BCLK=25/LRC=32/DIN=33，无 MCLK；MAX98357 由 BCLK 自行派生主时钟）。
+- I2S 输出到 MAX98357（BCLK=32/LRC=15/DIN=21，无 MCLK；MAX98357 由 BCLK 自行派生主时钟）。
 - **解耦管线**：MP3 解码写入 256KB PCM 环形缓冲（优先 PSRAM，>1s @44.1kHz），`audio_feed` 任务（4KB 栈，优先级 6）负责从环形缓冲灌 I2S DMA——防爆音与欠载。
 - **DSP 链（喇叭路由，逐样本定点）**：700Hz 保护高通 → 250Hz 响度低音架（boost 0→+9dB 随音量下降）→ 主音量（~5ms 平滑）→ 软限幅（防削波）。蓝牙路由只加音量、全频段。
 - 音量：初始化预计算 **401 项** Q15 对数锥度表（0.1dB 步进，0~-40dB），喇叭与蓝牙各一独立槽位，`hw_audio_set_volume()` 即时生效并平滑渐变；`hw_audio_set_sample_rate()` 延迟到 feed 任务应用。
