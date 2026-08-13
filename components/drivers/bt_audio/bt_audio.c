@@ -31,6 +31,11 @@ static const char *TAG = "bt_audio";
 static volatile bool s_enabled;      /* user wants BT output (settings) */
 static volatile bool s_connected;    /* an A2DP sink is connected */
 static volatile bool s_streaming;    /* media channel started */
+/* True once a link has actually reached CONNECTED during the current dial-out
+ * session. Used to stop auto-retry after a link that WAS up drops: a sink that
+ * connects then dies (range / power) should not be hammered with re-dials that
+ * make the peer reject with "Limited Resources" (HCI 0x22 / L2CAP 0x34). */
+static volatile bool s_ever_connected;
 static volatile bt_pair_state_t s_pair_state;
 static volatile uint32_t s_passkey;  /* SSP numeric-comparison code */
 
@@ -74,8 +79,10 @@ static bt_conn_state_cb_t s_conn_state_cb;
  * 44.1 kHz joint stereo) is kept on purpose: raising it to 64 (~385 kbps,
  * the A2DP maximum) frequently floods "l2cab is_cong_cback_context" on
  * real-world sinks and makes the stream stutter. Trade down to 45/37 if a
- * particular sink still congests. */
-#define BT_SBC_MAX_BITPOOL     53
+ * particular sink still congests. Lowered to 45 (~295 kbps): some sinks
+ * still hit L2CAP congestion at 53 (the "l2cab is_cong_cback_context"
+ * flood), so we trade a little quality for a robust link. */
+#define BT_SBC_MAX_BITPOOL     45
 
 /* Preferred SBC capability advertised to sinks: same shape as the stack
  * default config, but with max_bitpool capped (see BT_SBC_MAX_BITPOOL).
@@ -284,9 +291,13 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
     case ESP_A2D_CONNECTION_STATE_EVT:
         if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
             s_connected = true;
+            s_ever_connected = true;         /* a link was up at least once */
             s_pair_state = BT_PAIR_OK;
             s_conn_auto = false;             /* link is up: stop auto-retry */
             s_conn_retries = 0;
+            /* Re-arm the PCM feed: a previous disconnect (or an auto-retry
+             * failure) may have frozen it; the link is live now. */
+            s_tx_stopped = false;
             if (s_disabling) {
                 /* bt_audio_disable() raced with the connect completing:
                  * drop the fresh link so the disconnect-complete event can
@@ -301,7 +312,7 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             }
         }
         else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
-            if (!s_connected && s_pair_state != BT_PAIR_IDLE) {
+            if (!s_connected && s_pair_state != BT_PAIR_IDLE && !s_ever_connected) {
                 /* The attempt never reached CONNECTED, i.e. it failed. If
                  * auto-retry is armed and we have attempts left, schedule
                  * another dial-out after the backoff; otherwise surface the
@@ -330,6 +341,22 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             }
             s_connected = false;
             s_streaming = false;
+            /* Freeze the PCM feed IMMEDIATELY on link loss, not just during an
+             * explicit teardown: the A2DP media channel may still be "started"
+             * in our view while the underlying ACL is already gone, so the
+             * decode task would otherwise keep pushing PCM into a dead link and
+             * Bluedroid would try to pull from the ring against a missing LCB
+             * (the "no LCB / no ccb" errors). Drain the ring too so nothing
+             * stale is replayed if the same sink reconnects later. */
+            s_tx_stopped = true;
+            if (s_pcm_ring != NULL) {
+                uint8_t *item;
+                size_t sz;
+                while ((item = xRingbufferReceiveUpTo(s_pcm_ring, &sz, 0,
+                                                      BT_PCM_RING_BYTES)) != NULL) {
+                    vRingbufferReturnItem(s_pcm_ring, item);
+                }
+            }
             ESP_LOGI(TAG, "A2DP disconnected");
             if (s_conn_state_cb != NULL) {
                 s_conn_state_cb(false);   /* link dropped: audio layer returns to speaker */
@@ -632,6 +659,7 @@ static void bt_audio_teardown(void *param1, uint32_t param2)
     s_tx_stopped  = false;
     s_conn_auto   = false;
     s_conn_retries = 0;
+    s_ever_connected = false;
     if (s_conn_timer != NULL) {
         xTimerStop(s_conn_timer, 0);
     }
@@ -817,6 +845,7 @@ bool bt_audio_connect_index(int index)
     s_enabled = true;                       /* connecting implies BT output on */
     s_conn_auto = true;                     /* keep auto-retrying until linked */
     s_conn_retries = 0;
+    s_ever_connected = false;                /* fresh dial-out session */
     if (s_conn_timer == NULL) {
         s_conn_timer = xTimerCreate("bt_conn",
                                     pdMS_TO_TICKS(BT_CONNECT_RETRY_MS),
