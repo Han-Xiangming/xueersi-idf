@@ -19,10 +19,11 @@ static const board_button_t s_buttons[] = {
     {GPIO_NUM_13, LV_KEY_DOWN, "DOWN"},
     {GPIO_NUM_27, LV_KEY_LEFT, "LEFT"},
     {GPIO_NUM_35, LV_KEY_RIGHT, "RIGHT"},
-    // {GPIO_NUM_25, LV_KEY_ENTER, "A"},
-    // {GPIO_NUM_26, LV_KEY_ESC, "B"},
     {GPIO_NUM_34, LV_KEY_ENTER, "A"},
     {GPIO_NUM_12, LV_KEY_ESC, "B"},
+    {GPIO_NUM_25, LV_KEY_ENTER, "SELECT"},   /* Select */
+    {GPIO_NUM_26, LV_KEY_PREV, "START"},     /* Start  */
+    {GPIO_NUM_33, LV_KEY_NEXT, "MENU"},      /* Menu   */
 };
 
 void hw_buttons_init(void)
