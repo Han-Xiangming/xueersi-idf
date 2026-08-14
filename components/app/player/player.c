@@ -30,6 +30,7 @@ static player_state_t s_state = PLAYER_IDLE;
 
 static char s_path[PLAYER_PATH_LEN];        /* full path: /sdcard/Music/<name> */
 static char s_name[MP3_NAME_LEN];
+static int s_index = -1;          /* list index of the loaded track (-1 = none) */
 static bool s_stop_req;
 static bool s_pause_req;
 static bool s_new_req;
@@ -317,6 +318,16 @@ static void decode_loop(void)
             s_path[sizeof(s_path) - 1] = '\0';
             strncpy(s_name, s_new_name, sizeof(s_name) - 1);
             s_name[sizeof(s_name) - 1] = '\0';
+            /* Resolve the loaded name back to its list index so the UI can
+             * drive next/prev. A name missing from the (possibly stale) scan
+             * list yields -1, which is harmless for index-based navigation. */
+            s_index = -1;
+            for (int k = 0; k < s_scan_count; k++) {
+                if (strncmp(s_scan_names[k], s_name, MP3_NAME_LEN - 1) == 0) {
+                    s_index = k;
+                    break;
+                }
+            }
             s_stop_req = false;
             s_pause_req = false;
         }
@@ -429,10 +440,31 @@ void player_play(const char *name)
 
     s_new_req = true;
     s_stop_req = true;          /* ask any current decode to stop */
+    /* Drop the previous track's queued PCM immediately. Without this, the feed
+     * task would keep playing the old ring's tail (up to ~1 s) after we park
+     * the bus in close_track(), so a track switch would audibly bleed the
+     * previous song before the new one starts. */
+    hw_audio_flush();
     s_state = PLAYER_PLAYING;
     if (s_task != NULL) {
         xTaskNotifyGive(s_task);
     }
+}
+
+void player_play_index(int i)
+{
+    if (i < 0 || i >= player_scan_count()) {
+        return;
+    }
+    player_play(player_scan_name(i));
+}
+
+int player_current_index(void)
+{
+    if (s_state == PLAYER_IDLE) {
+        return -1;
+    }
+    return s_index;
 }
 
 void player_toggle(void)

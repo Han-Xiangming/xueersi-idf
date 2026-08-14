@@ -1341,13 +1341,13 @@ void ui_refresh(void)
             ui_label_set(s_ui.pl_prog, prog);
         }
         if (st == PLAYER_PLAYING) {
-            ui_set_hint("上/下音量 A暂停 B停止");
+            ui_set_hint("左/右切歌 上/下音量 A暂停 B停止");
         }
         else if (st == PLAYER_PAUSED) {
-            ui_set_hint("上/下音量 A继续 B停止");
+            ui_set_hint("左/右切歌 上/下音量 A继续 B停止");
         }
         else {
-            ui_set_hint("上/下选择 A播放 B返回");
+            ui_set_hint("左/右切歌 上/下选择 A播放 B返回");
         }
         break;
     }
@@ -1707,6 +1707,39 @@ static void ui_adjust(int step)
 static void ui_adjust_lr(int dir)
 {
     ui_mark_dirty();                   /* selected setting value changed */
+
+    /* Music Player: left/right switch tracks. While a track is loaded, the
+     * navigation is relative to the *playing* track (so you can keep skipping
+     * forward/back from where you are); when idle it is relative to the
+     * highlighted list row. Selection follows the new track.
+     * - dir < 0: previous track (wraps to the last at the boundary)
+     * - dir > 0: next track (wraps to the first at the boundary) */
+    if (s_ui.page_id == UI_PAGE_PLAYER) {
+        int count = player_scan_count();
+        if (count == 0) {
+            set_action(player_scan_busy() ? "扫描中..." : "无MP3文件");
+        }
+        else {
+            int cur = player_current_index();
+            if (cur < 0) {
+                cur = s_mp3_sel;                       /* idle: start from list */
+            }
+            int next = (cur + dir + count) % count;
+            s_mp3_sel = next;
+            if (player_state() != PLAYER_IDLE) {
+                /* Switch tracks while playing/paused: load and play the new one. */
+                player_play_index(next);
+                set_action(dir < 0 ? "上一首" : "下一首");
+            }
+            else {
+                /* Idle: just move the cursor, like up/down does. */
+                set_action("选择");
+            }
+        }
+        ui_refresh();
+        return;
+    }
+
     if (s_ui.page_id == UI_PAGE_EBOOK_READ) {
         if (dir > 0) {
             if (ebook_at_end()) {

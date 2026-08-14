@@ -74,6 +74,15 @@ const char *player_current_name(void);
 /* Start/restart playback of the named file (basename under /sdcard). */
 void player_play(const char *name);
 
+/* Play the track at list index `i` (0-based). Out-of-range indices are
+ * ignored. Wraps around the scan list, so it doubles as next/prev when the
+ * caller adds/subtracts 1 modulo player_scan_count(). */
+void player_play_index(int i);
+
+/* Index of the track currently loaded (0-based), or -1 when nothing has been
+ * loaded yet / the list is empty. Lets the UI drive next/prev from the list. */
+int player_current_index(void);
+
 /* Pause the current track, or resume if paused. */
 void player_toggle(void);
 
