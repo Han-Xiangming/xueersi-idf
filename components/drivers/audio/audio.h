@@ -67,3 +67,8 @@ void hw_audio_flush(void);
  * L/R pairs. Used by the MP3 player to output decoded audio. Samples are
  * filtered in place by the speaker-protection high-pass before enqueueing. */
 void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames);
+
+/* True only after I2S, PCM ring and the feed task are all up. Callers must
+ * NOT start playback before this returns true (prevents decode deadlock when
+ * the feed task is missing). */
+bool hw_audio_is_ready(void);

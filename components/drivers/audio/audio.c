@@ -64,9 +64,9 @@ static const char *TAG = "hw_audio";
 #define PCM_RING_BYTES      (256 * 1024)
 
 static i2s_chan_handle_t s_tx;
-static bool s_ready;
+static volatile bool s_ready;
 static uint32_t s_rate = AUDIO_DEFAULT_RATE;
-static bool s_player_active;             /* MP3 player owns the I2S bus */
+static volatile bool s_player_active;    /* MP3 player owns the I2S bus */
 
 /* Active output route: a single, explicit either/or selection. Only
  * hw_audio_set_route() may change it; the writer streams to exactly this
@@ -84,8 +84,8 @@ static bool s_i2s_enabled;
 static uint8_t *s_ring_storage;
 static StaticRingbuffer_t s_ring_struct;
 static RingbufHandle_t s_pcm_ring;
-static TaskHandle_t s_feed_task;
-static bool s_feeding;
+static TaskHandle_t s_feed_task = NULL;
+static volatile bool s_feeding;
 static uint32_t s_pending_rate;          /* applied serially by the feed task */
 
 /* --- Playback-clock alignment -------------------------------------------
@@ -632,7 +632,16 @@ void hw_audio_init(void)
     s_vol_gain_sm = s_vol_gain;       /* start settled: no fade-in from zero */
     s_loud_boost_sm = s_loud_boost;   /* shelf boost settled too */
     s_lim_gain = 32768;               /* limiter flat until audio starts */
-    xTaskCreate(audio_feed_task, "audio_feed", 6 * 1024, NULL, 6, &s_feed_task);
+    BaseType_t feed_ret = xTaskCreate(audio_feed_task, "audio_feed",
+                                      6 * 1024, NULL, 6, &s_feed_task);
+    if (feed_ret != pdPASS) {
+        ESP_LOGE(TAG, "[AUDIO] feed task create FAILED -> audio unusable");
+        s_feed_task = NULL;
+        s_ready = false;          /* mark unready so player never starts */
+        return;
+    }
+
+    ESP_LOGI(TAG, "[AUDIO] I2S ready, RingBuffer created, Feed task started");
 
     /* Route starts at the speaker; nothing else may flip it (see hw_audio_set_route).
      * A Bluetooth link coming up does NOT hijack a speaker session — but a link
@@ -762,6 +771,12 @@ void hw_audio_flush(void)
 /* Mark/unmark the MP3 player as the owner of the I2S bus. */
 void hw_audio_set_player_active(bool active)
 {
+    /* 原则3：audio 未 ready（I2S/ring/feed task 未建好）时禁止启动播放。
+     * 否则 feed task 不存在，ring 永不被消费，decode 卡死。 */
+    if (active && !s_ready) {
+        ESP_LOGE(TAG, "[ERROR] player active requested but audio not ready");
+        return;
+    }
     s_player_active = active;
     if (active) {
         s_feeding = true;
@@ -776,8 +791,13 @@ void hw_audio_set_player_active(bool active)
         audio_set_hpf_coeff(s_rate);  /* default-rate coeff until 1st frame */
         audio_set_loudness_coeff(s_rate);
         ESP_LOGD(TAG, "player active: DSP reset, rate=%u", (unsigned)s_rate);
+        ESP_LOGI(TAG, "[PLAYER] audio pipeline ready");
+        /* 唤醒前先确认 feed task 存在（s_feed_task 在 init 失败时为 NULL）。 */
         if (s_feed_task != NULL) {
             xTaskNotifyGive(s_feed_task);
+        }
+        else {
+            ESP_LOGE(TAG, "[ERROR] player active but feed task NULL (init failed)");
         }
     }
     else {
@@ -788,6 +808,11 @@ void hw_audio_set_player_active(bool active)
         }
         ESP_LOGD(TAG, "player inactive: draining ring");
     }
+}
+
+bool hw_audio_is_ready(void)
+{
+    return s_ready && (s_feed_task != NULL) && (s_pcm_ring != NULL);
 }
 
 /* Enqueue decoded 16-bit stereo PCM (L,R interleaved). `frames` = number of
@@ -895,12 +920,19 @@ void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
 
     size_t bytes = frames * 4;
     int waits = 0;
+    /* 有限重试：ring 满时最多等 ~2s。若 feed task 未运行（pipeline 卡死），
+     * 这里必须退出并返回，而不是永久阻塞 decode task（否则日志卡死、
+     * 设备再也无法播放）。原则2：禁止无超时永久阻塞。 */
+    const int PCM_SEND_MAX_WAITS = 40;   /* 40 * 50ms = ~2s */
     while (xRingbufferSend(s_pcm_ring, stereo_frames, bytes,
                            pdMS_TO_TICKS(50)) != pdPASS) {
         if (!s_player_active) {
             return;
         }
-        waits++;
+        if (++waits >= PCM_SEND_MAX_WAITS) {
+            ESP_LOGE(TAG, "[ERROR] PCM buffer full timeout (AUDIO PIPELINE STALLED)");
+            return;
+        }
     }
     if (waits > 0) {
         ESP_LOGD(TAG, "pcm back-pressure: waited %d x50ms (frames=%u)", waits,

@@ -25,15 +25,15 @@
 
 static const char *TAG = "player";
 
-static TaskHandle_t s_task;
-static player_state_t s_state = PLAYER_IDLE;
+static TaskHandle_t s_task = NULL;
+static volatile player_state_t s_state = PLAYER_IDLE;
 
 static char s_path[PLAYER_PATH_LEN];        /* full path: /sdcard/Music/<name> */
 static char s_name[MP3_NAME_LEN];
 static int s_index = -1;          /* list index of the loaded track (-1 = none) */
-static bool s_stop_req;
-static bool s_pause_req;
-static bool s_new_req;
+static volatile bool s_stop_req;
+static volatile bool s_pause_req;
+static volatile bool s_new_req;
 static char s_new_path[PLAYER_PATH_LEN];
 static char s_new_name[MP3_NAME_LEN];
 static uint32_t s_dbg_frames;          /* decode-frame counter for debug logs */
@@ -408,8 +408,17 @@ void player_init(void)
     s_name[0] = '\0';
     /* Debug tracing is compiled in (LOG_LOCAL_LEVEL) but off by default;
      * the settings page LOG option enables it at runtime. */
-    xTaskCreate(player_task, "mp3_player", 16 * 1024, NULL, 5, &s_task);
-    xTaskCreate(scan_task, "mp3_scan", 4 * 1024, NULL, 4, &s_scan_task);
+    if (xTaskCreate(player_task, "mp3_player", 16 * 1024, NULL, 5, &s_task)
+            != pdPASS) {
+        ESP_LOGE(TAG, "[ERROR] player task create FAILED");
+        s_task = NULL;
+    }
+    if (xTaskCreate(scan_task, "mp3_scan", 4 * 1024, NULL, 4, &s_scan_task)
+            != pdPASS) {
+        ESP_LOGE(TAG, "[ERROR] scan task create FAILED");
+        s_scan_task = NULL;
+    }
+    ESP_LOGI(TAG, "[PLAYER] player + scan tasks started");
     /* Pre-warm the list (SD is mounted by app_main before player_init). The
      * UI re-requests scans on page entry / SD hotplug. */
     player_scan_start();
@@ -427,6 +436,12 @@ const char *player_current_name(void)
 
 void player_play(const char *name)
 {
+    /* 原则3：audio 未 ready 时不接受播放请求，避免 feed task 不存在导致
+     * decode 卡死（"同一次开机随机失败"的根因之一）。 */
+    if (!hw_audio_is_ready()) {
+        ESP_LOGE(TAG, "[ERROR] play requested but audio not ready, ignored");
+        return;
+    }
     /* Paths and names use one shared upper bound (MP3_NAME_LEN == 256, the
      * FATFS LFN limit) so PLAYER_ROOT "/<name>" can never exceed PLAYER_PATH_LEN.
      * We only warn/truncate past that bound — multi-byte titles stay intact. */
