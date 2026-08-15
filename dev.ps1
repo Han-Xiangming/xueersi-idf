@@ -33,7 +33,8 @@ function Get-Port {
 function Show-Help {
     Write-Host "Usage:" -ForegroundColor Cyan
     Write-Host "  .\dev.ps1 [action] [-p COM3]"
-    Write-Host "  .\dev.ps1                  interactive menu"
+    Write-Host "  .\dev.ps1                    interactive menu"
+    Write-Host "  .\dev.ps1 <a>+<b>+...       chain multiple actions"
     Write-Host "Actions:" -ForegroundColor Cyan
     Write-Host "  build        compile firmware"
     Write-Host "  flash        flash (auto-detect port)"
@@ -42,6 +43,9 @@ function Show-Help {
     Write-Host "  erase        erase flash"
     Write-Host "  size         show firmware size"
     Write-Host "  clean        full clean"
+    Write-Host "Examples:" -ForegroundColor Cyan
+    Write-Host "  .\dev.ps1 build+flash"
+    Write-Host "  .\dev.ps1 build+flash+monitor -p COM3"
 }
 
 function Show-Menu {
@@ -82,6 +86,24 @@ if (-not $Action) {
     while ($true) {
         Show-Menu
         $Choice = Read-Host "Select"
+        if ($Choice -match '\+') {
+            # chained choices, e.g. "1+2" or "1+2+3"
+            $Done = $false
+            foreach ($C in ($Choice -split '\+')) {
+                switch ($C) {
+                    "1" { Run-Action "build" }
+                    "2" { Run-Action "flash" }
+                    "3" { Run-Action "monitor" }
+                    "4" { Run-Action "menuconfig" }
+                    "5" { Run-Action "erase" }
+                    "6" { Run-Action "size" }
+                    "7" { Run-Action "clean" }
+                    "0" { exit 0 }
+                    default { Write-Host "Invalid choice: $C" -ForegroundColor Yellow }
+                }
+            }
+            continue
+        }
         switch ($Choice) {
             "1" { Run-Action "build" }
             "2" { Run-Action "flash" }
@@ -94,11 +116,26 @@ if (-not $Action) {
             default { Write-Host "Invalid choice" -ForegroundColor Yellow }
         }
     }
+} elseif ($Action -eq "help" -or $Actions -notcontains ($Action -replace '\+', '')) {
+    # help, or a single unknown token with no '+' separators
+    Show-Help
+    exit 1
 } else {
-    if ($Action -eq "help" -or $Actions -notcontains $Action) {
-        Show-Help
-        exit 1
+    $Steps = $Action -split '\+'
+    foreach ($Step in $Steps) {
+        if ($Actions -notcontains $Step) {
+            Write-Host "Unknown action: $Step" -ForegroundColor Red
+            Show-Help
+            exit 1
+        }
     }
-    Run-Action $Action
-    exit $LASTEXITCODE
+    foreach ($Step in $Steps) {
+        Write-Host "`n>>> $Step" -ForegroundColor Cyan
+        Run-Action $Step
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Action '$Step' failed (exit $LASTEXITCODE)" -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    }
+    exit 0
 }

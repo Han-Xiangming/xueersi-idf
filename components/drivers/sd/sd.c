@@ -50,6 +50,7 @@ void hw_sd_try_mount(void)
                                          &s_sd_card);
     if (s_last_err == ESP_OK && s_sd_card) {
         s_mounted = true;
+        s_last_err = ESP_OK;
         memset(s_name, 0, sizeof(s_name));
         memcpy(s_name,
                s_sd_card->cid.name,
