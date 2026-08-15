@@ -41,7 +41,7 @@ static volatile uint32_t s_passkey;  /* SSP numeric-comparison code */
 
 /* AVRCP remote-control handlers registered by the application (see below).
  * Kept outside the #if so bt_audio_set_avrc_*_cb() compiles even when Bluetooth
- * is disabled in the build 鈥?the handlers are simply never invoked then. */
+ * is disabled in the build —the handlers are simply never invoked then. */
 static bt_avrc_cmd_cb_t s_avrc_cmd_cb;
 static bt_avrc_volume_cb_t s_avrc_vol_cb;
 static bt_conn_state_cb_t s_conn_state_cb;
@@ -111,7 +111,7 @@ static volatile bool s_discovering;
 static volatile bool s_disabling;
 /* Frozen while a teardown is in progress: the A2DP data callback must not
  * pull more PCM (and the decode side must not push more) once the profiles
- * start going away 鈥?feeding SBC during A2DP deinit can crash the BTC task. */
+ * start going away —feeding SBC during A2DP deinit can crash the BTC task. */
 static volatile bool s_tx_stopped;
 static RingbufHandle_t s_pcm_ring;
 static uint8_t *s_ring_storage;
@@ -145,7 +145,7 @@ static uint32_t s_dev_version;
 
 /* Connection auto-retry. A fresh A2DP dial-out can fail the first attempt(s)
  * because Bluedroid opens the AVDTP L2CAP channel before the peer's feature
- * mask has been read back (the "remote features unknown" race) 鈥?or because we
+ * mask has been read back (the "remote features unknown" race) —or because we
  * dial out while the inquiry is still cancelling. Both clear up if we just try
  * again after a short backoff, so we retry a bounded number of times instead of
  * making the user hammer the A button. The retry runs from a FreeRTOS timer
@@ -189,7 +189,7 @@ static bool bt_prop_get_name(esp_bt_gap_cb_param_t *param, char *out, size_t out
 
 /* Inquiry result: append every discoverable device to the scan list
  * (deduplicated by address). The RENDERING-only filter was dropped to widen
- * the scan range 鈥?the user can still only A2DP-connect to a real audio sink,
+ * the scan range —the user can still only A2DP-connect to a real audio sink,
  * but now phones/speakers that omit the rendering service bit are visible. */
 static void bt_handle_disc_res(esp_bt_gap_cb_param_t *param)
 {
@@ -281,7 +281,7 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 
 /* Forward declaration. The real teardown runs in the FreeRTOS Timer task
  * (deferred from the BTC callback) so the esp_*_deinit() calls never execute
- * inside the BTC task itself 鈥?doing that there would deadlock. The Timer-task
+ * inside the BTC task itself —doing that there would deadlock. The Timer-task
  * context also lets Bluedroid finish disarming the media watchdog alarm first. */
 static void bt_audio_teardown(void *param1, uint32_t param2);
 
@@ -316,7 +316,7 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
                 /* The attempt never reached CONNECTED, i.e. it failed. If
                  * auto-retry is armed and we have attempts left, schedule
                  * another dial-out after the backoff; otherwise surface the
-                 * failure to the UI ("A閲嶈瘯"). */
+                 * failure to the UI ("A重试"). */
                 if (s_conn_auto && s_conn_retries < BT_CONNECT_MAX_RETRY
                     && s_conn_timer != NULL) {
                     /* Drop any half-open ACL left hanging from the failed
@@ -335,7 +335,7 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             }
             else {
                 /* A live link dropped (user or remote). Don't auto-retry a
-                 * session that was already up 鈥?let the user decide. */
+                 * session that was already up —let the user decide. */
                 s_pair_state = BT_PAIR_IDLE;
                 s_conn_auto = false;
             }
@@ -587,7 +587,7 @@ void bt_audio_enable(void)
  * FreeRTOS Timer task (see a2d_cb). MUST only be entered when no A2DP link is
  * live: while streaming, Bluedroid arms a media watchdog alarm, and deinit()-ing
  * the source profile before that alarm fires (or is disarmed) makes it run into
- * freed control blocks 鈥?a NULL-deref crash in the BTC task. Re-checks
+ * freed control blocks —a NULL-deref crash in the BTC task. Re-checks
  * s_disabling so a concurrent bt_audio_enable() can cancel a pending teardown
  * (the user flipped BT back ON before it ran). */
 /* True while the stack has link-layer activity that makes a profile deinit
@@ -668,7 +668,7 @@ static void bt_audio_teardown(void *param1, uint32_t param2)
     ESP_LOGI(TAG, "BT audio disabled, controller powered off");
 }
 
-/* Tear the stack down and power off the controller 鈥?the reverse of
+/* Tear the stack down and power off the controller —the reverse of
  * bt_audio_enable(). Idempotent: returns immediately if already down or a
  * teardown is already pending. The real work is deferred to the disconnect
  * event when a link is live (see bt_audio_teardown for why). */
@@ -680,12 +680,12 @@ void bt_audio_disable(void)
 
     if (s_connected || s_discovering || s_pair_state != BT_PAIR_IDLE) {
         /* A live (or in-flight) link: stop the media stream and kick a
-         * disconnect, then defer the teardown to the Timer task 鈥?it re-checks
+         * disconnect, then defer the teardown to the Timer task —it re-checks
          * the link with a bounded retry budget (see bt_audio_teardown) instead
          * of relying on the disconnect-complete event alone. The second
          * pending call is the safety net: if that event is lost, the teardown
          * still runs after BT_TD_SAFETY_MS, polls for the link to drop, and
-         * proceeds 鈥?the stack cannot stay half-disabled forever. Doing it
+         * proceeds —the stack cannot stay half-disabled forever. Doing it
          * inline here is what crashes. */
         s_disabling = true;
         s_tx_stopped = true;
@@ -782,7 +782,7 @@ const char *bt_audio_device_name(int index)
 
 /* (Re)issue the A2DP dial-out to s_peer_bda. Returns false only if the stack
  * could not queue the request; the async result arrives via a2d_cb. Callers
- * must be single-flight 鈥?do not call while BT_PAIR_CONNECTING. */
+ * must be single-flight —do not call while BT_PAIR_CONNECTING. */
 static bool bt_conn_start(void)
 {
     s_pair_state = BT_PAIR_CONNECTING;
@@ -816,7 +816,7 @@ static void bt_conn_retry_cb(TimerHandle_t t)
     }
     if (s_conn_retries >= BT_CONNECT_MAX_RETRY) {
         s_conn_auto = false;
-        s_pair_state = BT_PAIR_FAIL;        /* hand back to UI "A閲嶈瘯" */
+        s_pair_state = BT_PAIR_FAIL;        /* hand back to UI "A重试" */
         return;
     }
     s_conn_retries++;
@@ -832,7 +832,7 @@ bool bt_audio_connect_index(int index)
     }
     /* Single-flight: an attempt already in progress means the auto-retry (or a
      * prior press) owns the link. Report "connecting" instead of spawning a
-     * second overlapping dial-out 鈥?overlapping attempts are exactly what makes
+     * second overlapping dial-out —overlapping attempts are exactly what makes
      * the "remote features unknown" failure repeat. */
     if (s_pair_state == BT_PAIR_CONNECTING) {
         return true;

@@ -67,7 +67,7 @@ main/main.c            —— 启动装配，初始化各驱动、创建 LVGL �
 components/drivers/    —— 硬件层：buttons / lcd / audio / bt_audio / battery / sd
 components/app/        —— 应用层：ui（LVGL 界面） / player（MP3） / ebook（TXT）
 components/board/      —— 板级硬件配置（board_config.h）
-components/fonts/      —— 中文 CJK 点阵字体（lv_font_cn_10 ~ lv_font_cn_16）
+components/fonts/      —— 中文 CJK 点阵字体（lv_font_cn_16，16px）
 ```
 
 ***
