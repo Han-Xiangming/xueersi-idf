@@ -45,14 +45,19 @@ FATFS 目录遍历在 SDSPI 上耗时数十 ms，故列表由**独立扫描任�
 | `player_play(name)` | 播放 `/sdcard/Music/<name>`；运行中调用则切换曲目 |
 | `player_toggle()` | 播放 ⇄ 暂停 |
 | `player_stop()` | 停止；先释放 I2S 归属（`hw_audio_set_player_active(false)`）使解码背压立即退出，再通知任务 |
+| `player_repeat_mode()` | 当前循环模式（`PLAYER_REPEAT_ALL` 列表循环 / `PLAYER_REPEAT_ONE` 单曲循环） |
+| `player_repeat_toggle()` | 切换循环模式（UI 播放页按 Select 键触发） |
 
 - 暂停/停止不阻塞：`hw_audio_write_pcm()` 的环形缓冲背压在 `s_player_active=false` 时立即放弃剩余数据。
 - 播放进度（字节偏移百分比）对 VBR MP3 不准确，UI 不展示（`player.h` 注释明示）。
 - 采样率随首帧变化：`hw_audio_set_sample_rate()` 由解码任务调用，I2S 重配在 audio feed 任务内串行执行。
 
-## 4. 曲目切换
+## 4. 循环模式与曲目切换
 
-- 播放器**没有播放列表导航**：`player_play()` 每次都是新曲目；AVRCP 的 NEXT/PREV 回调在 main.c 中被忽略（仅记日志）。
+- 曲目**自然播放结束（EOF）**时的行为由循环模式决定（播放页按 Select 键切换，右上角状态栏显示当前模式）：
+  - `PLAYER_REPEAT_ALL`（列表循环，默认）：切到列表下一首，末尾回绕到第一首；当前曲目不在列表（`s_index < 0`）或列表为空时停止。
+  - `PLAYER_REPEAT_ONE`（单曲循环）：按当前曲目路径从头重播，不依赖播放列表。
+- 播放器没有手动播放列表导航 API：`player_play()` 每次都是新曲目；AVRCP 的 NEXT/PREV 回调在 main.c 中被忽略（仅记日志）。
 
 ## 5. 与其它模块的接口
 

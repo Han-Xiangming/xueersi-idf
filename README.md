@@ -159,6 +159,7 @@ MAX98357 由 BCLK 内部派生主时钟，因此 **不需要 MCLK**。
 - 解码库：`esp-libhelix-mp3`（libhelix C API），运行在独立 FreeRTOS 任务中，不阻塞 UI。
 - 音源：SD 卡 `/sdcard/Music` 目录下的 `.mp3` 文件（后台扫描，最多 64 首），以及一首内嵌 ROM 测试曲。
 - 支持播放 / 暂停切换 / 停止；播放时上下键调节音量，A 播放/继续，B 停止。
+- 循环模式：列表循环（默认）/ 单曲循环，播放页按 Select 键切换，右上角状态栏显示当前模式。
 - 输出路由：`AUDIO_ROUTE_SPEAKER`（本地 MAX98357）与 `AUDIO_ROUTE_BT`（蓝牙 sink）二选一，由 UI 显式切换。
 
 ### 3.2 蓝牙音频（A2DP SOURCE）

@@ -169,3 +169,19 @@ void player_toggle(void);
 
 /* Stop playback and release the I2S bus. */
 void player_stop(void);
+
+/* --- Repeat mode -------------------------------------------------------
+ * How the player behaves when a track reaches its natural end. Default is
+ * list loop (advance to the next entry, wrapping at the end); single-track
+ * loop replays the current track. Toggled at runtime by the UI (Select key).
+ * Not persisted to NVS: each boot starts in list-loop mode. */
+typedef enum {
+    PLAYER_REPEAT_ALL = 0,   /* list loop: next track at end (default) */
+    PLAYER_REPEAT_ONE,       /* single-track loop: replay the current track */
+} player_repeat_t;
+
+/* Current repeat mode. */
+player_repeat_t player_repeat_mode(void);
+
+/* Toggle between list loop and single-track loop. */
+void player_repeat_toggle(void);

@@ -1637,15 +1637,22 @@ void ui_refresh(void)
             s_mp3_loading = false;
         }
         player_state_t st = player_state();
-        ui_label_set(s_ui.status,
-                     st == PLAYER_PLAYING ? ">>" : st == PLAYER_PAUSED ? "||" : "--");
+        /* Top-right status: playback symbol + repeat mode, e.g. ">>单曲" /
+         * "||列表" / "--列表", so the current loop mode is always visible. */
+        char stbuf[16];
+        snprintf(stbuf, sizeof(stbuf), "%s%s",
+                 st == PLAYER_PLAYING ? ">>" : st == PLAYER_PAUSED ? "||" : "--",
+                 player_repeat_mode() == PLAYER_REPEAT_ONE ? "单曲" : "列表");
+        ui_label_set(s_ui.status, stbuf);
         if (st == PLAYER_IDLE) {
             if (player_scan_busy()) {
                 ui_label_set(s_ui.pl_prog, "加载中...");
             }
             else {
                 ui_label_set(s_ui.pl_prog, s_mp3_count
-                             ? "循环:列表" : "无MP3文件");
+                             ? (player_repeat_mode() == PLAYER_REPEAT_ONE
+                                ? "循环:单曲" : "循环:列表")
+                             : "无MP3文件");
             }
         }
         else {
@@ -1658,13 +1665,13 @@ void ui_refresh(void)
             ui_label_set(s_ui.pl_prog, prog);
         }
         if (st == PLAYER_PLAYING) {
-            ui_set_hint("左/右切歌 上/下音量 A暂停 B来源");
+            ui_set_hint("左/右切歌 上/下音量 A暂停 Select循环");
         }
         else if (st == PLAYER_PAUSED) {
-            ui_set_hint("左/右切歌 上/下音量 A继续 B来源");
+            ui_set_hint("左/右切歌 上/下音量 A继续 Select循环");
         }
         else {
-            ui_set_hint("左/右切歌 上/下选择 A播放 B来源");
+            ui_set_hint("左/右切歌 上/下选择 A播放 Select循环");
         }
         break;
     }
@@ -2169,6 +2176,16 @@ static void ui_key_event_cb(lv_event_t *e)
         }
         else {
             ui_show_menu();
+        }
+        return;
+    }
+    if (key == LV_KEY_HOME) {
+        /* Select: switch the player's repeat mode (list loop ⇄ single-track
+         * loop). Only meaningful on the player page; ignored elsewhere. */
+        if (s_ui.page_id == UI_PAGE_PLAYER) {
+            player_repeat_toggle();
+            set_action(player_repeat_mode() == PLAYER_REPEAT_ONE
+                       ? "单曲循环" : "列表循环");
         }
         return;
     }

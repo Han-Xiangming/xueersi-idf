@@ -11,3 +11,5 @@ set(EXTRA_COMPONENT_DIRS
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(xiaomiao)
+
+idf_build_set_property(CXX_COMPILE_OPTIONS "-Wno-error=volatile" APPEND)

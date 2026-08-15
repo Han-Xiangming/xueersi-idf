@@ -29,6 +29,9 @@ static const char *TAG = "player";
 
 static TaskHandle_t s_task = NULL;
 static volatile player_state_t s_state = PLAYER_IDLE;
+/* Repeat mode at natural end of a track. Cross-task (UI toggles it, the
+ * decode task reads it), so volatile like the other control flags. */
+static volatile player_repeat_t s_repeat = PLAYER_REPEAT_ALL;
 
 static char s_path[PLAYER_PATH_LEN];        /* full path: /sdcard/Music/<name> */
 static char s_name[MP3_NAME_LEN];
@@ -505,9 +508,17 @@ static void decode_loop(void)
         if (s_stop_req) {
             break;      /* user stopped: end the loop */
         }
-        /* Natural end of track: list-loop mode. Advance to the next entry
-         * (wrapping at the end) and keep playing. If the current track isn't
-         * in the list (s_index < 0) or the list is empty, just stop. */
+        /* Natural end of track: advance per the repeat mode. List loop
+         * advances to the next entry (wrapping at the end); single-track loop
+         * replays the current track. If the current track isn't in the list
+         * (s_index < 0) or the list is empty, list loop just stops —
+         * single-track loop replays by path and needs no list at all. */
+        if (s_repeat == PLAYER_REPEAT_ONE) {
+            player_play(s_path);
+            /* player_play() set s_new_req + s_stop_req; the loop top will pick
+             * up the SAME track again. Re-run rather than break so it loops. */
+            continue;
+        }
         int cnt = s_playlist->count;
         if (cnt <= 0 || s_index < 0) {
             break;
@@ -686,6 +697,19 @@ void player_rescan(void)
 player_state_t player_state(void)
 {
     return s_state;
+}
+
+player_repeat_t player_repeat_mode(void)
+{
+    return s_repeat;
+}
+
+void player_repeat_toggle(void)
+{
+    s_repeat = (s_repeat == PLAYER_REPEAT_ALL) ? PLAYER_REPEAT_ONE
+                                               : PLAYER_REPEAT_ALL;
+    ESP_LOGI(TAG, "repeat mode -> %s",
+             s_repeat == PLAYER_REPEAT_ONE ? "单曲循环" : "列表循环");
 }
 
 const char *player_current_name(void)
