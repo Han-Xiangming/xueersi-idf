@@ -1,5 +1,5 @@
 /*
- * Hardware layer: I2S audio output driving a MAX98357 mono Class-D DAC.
+ * Hardware layer: I2S audio output driving a MAX98357 stereo Class-D DAC.
  *
  * Streams decoded MP3 PCM over I2S (BCLK/LRC/DIN); the MAX98357 derives its
  * own master clock from BCLK, so no MCLK is wired.

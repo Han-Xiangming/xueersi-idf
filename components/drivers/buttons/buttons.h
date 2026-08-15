@@ -1,5 +1,6 @@
 /*
- * Hardware layer: 6 active-low key buttons mapped to LVGL keypad keys.
+ * Hardware layer: 9 key buttons (UP/DOWN/LEFT/RIGHT/A/B/SELECT/START/MENU)
+ * mapped to LVGL keypad keys.
  *
  * Performs GPIO configuration and debounce; exposes the debounced read
  * callback consumed by LVGL's keypad input device.

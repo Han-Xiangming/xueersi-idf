@@ -1,6 +1,6 @@
 /*
  * Hardware layer: I2S audio output driving a MAX98357 Class-D DAC.
- * See hardware/audio.h.
+ * See audio.h.
  *
  * Wiring (from board_config.h):
  *   BCLK -> GPIO32, LRC(WS) -> GPIO15, DIN -> GPIO21, no MCLK.

@@ -1,6 +1,6 @@
 /*
  * Hardware layer: key button input.
- * See hardware/buttons.h.
+ * See buttons.h.
  */
 #include "board_config.h"
 #include "buttons.h"
@@ -15,8 +15,7 @@ typedef struct {
     uint32_t active_level;   /* 1 = high-active, 0 = low-active */
 } board_button_t;
 
-/* Most keys are low-active (press pulls the pin to GND with internal pull-up).
- * GPIO33 (Menu) is wired high-active on this board, so it uses a pull-down. */
+/* All keys are low-active (press pulls the pin to GND with internal pull-up). */
 static const board_button_t s_buttons[] = {
     {GPIO_NUM_2, LV_KEY_UP, "UP", 0},
     {GPIO_NUM_13, LV_KEY_DOWN, "DOWN", 0},

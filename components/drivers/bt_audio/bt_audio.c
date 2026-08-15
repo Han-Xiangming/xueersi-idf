@@ -1,6 +1,6 @@
 ﻿/*
  * Hardware layer: Bluetooth A2DP Source audio output.
- * See hardware/bt_audio.h.
+ * See bt_audio.h.
  *
  * Pipeline: decode task -> hw_audio_write_pcm() -> bt_audio_write_pcm() ->
  * PCM ring -> A2DP source data callback -> Bluedroid (SBC encode inside the

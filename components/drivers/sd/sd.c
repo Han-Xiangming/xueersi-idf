@@ -1,6 +1,6 @@
 /*
  * Hardware layer: SD card over SDSPI.
- * See hardware/sd.h.
+ * See sd.h.
  */
 #include <string.h>
 

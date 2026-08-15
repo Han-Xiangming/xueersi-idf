@@ -1,6 +1,6 @@
 /*
  * Hardware layer: ST7789 LCD driver and LVGL display binding.
- * See hardware/lcd.h.
+ * See lcd.h.
  */
 #include <assert.h>
 #include <sys/param.h>

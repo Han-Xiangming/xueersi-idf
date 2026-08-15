@@ -52,11 +52,6 @@
 
 /* Battery level sensing (ADC1 channel 3 = GPIO 39).
  *
- * A 2-resistor divider scales the single-cell Li-ion pack down into the
- * ESP32 ADC range:
- *
- *     V_bat --[R_top]-- GPIO39 --[R_bot]-- GND
- *
  * A 2-resistor divider (two 0.1 MΩ / "01D" parts, R_top = R_bot = 100 kΩ)
  * scales the single-cell Li-ion pack down into the ESP32 ADC range:
  *
