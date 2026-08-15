@@ -806,18 +806,22 @@ static void bt_conn_retry_cb(TimerHandle_t t)
     if (!s_conn_auto || s_connected || s_disabling || !s_initialized) {
         return;                             /* linked, disabled, or gone */
     }
+    if (s_conn_retries >= BT_CONNECT_MAX_RETRY) {
+        s_conn_auto = false;
+        s_pair_state = BT_PAIR_FAIL;        /* hand back to UI "A重试" */
+        return;
+    }
     if (s_pair_state == BT_PAIR_CONNECTING) {
         /* Previous dial-out still in flight (e.g. stuck in Page Timeout).
          * Don't keep piling on timers: kick a disconnect to force the link
          * back to a terminal state, then re-dial after the backoff. The
-         * disconnect is idempotent against an already-dead link. */
+         * disconnect is idempotent against an already-dead link. Count this
+         * as a failed attempt: the DISCONNECTED event re-arms the timer with
+         * the state stuck at CONNECTING, so without counting here a peer
+         * that never resolves would retry forever. */
+        s_conn_retries++;
         esp_a2d_source_disconnect(s_peer_bda);
         xTimerStart(s_conn_timer, 0);
-        return;
-    }
-    if (s_conn_retries >= BT_CONNECT_MAX_RETRY) {
-        s_conn_auto = false;
-        s_pair_state = BT_PAIR_FAIL;        /* hand back to UI "A重试" */
         return;
     }
     s_conn_retries++;

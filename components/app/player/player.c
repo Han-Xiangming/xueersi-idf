@@ -922,6 +922,15 @@ bool player_cache_exists(void)
 
 void player_scan_with_cache(void)
 {
+    /* A scan running (or queued) owns the work buffer: loading the cache
+     * into it here would write the same snapshot buffer the scan task is
+     * concurrently filling and double-publish it — corrupting the list.
+     * The scan publishes the same whole-card list anyway (and rewrites the
+     * cache), so skipping the cache load is safe; the UI shows "加载中"
+     * until the list lands. */
+    if (s_scan_busy || s_scan_pending) {
+        return;
+    }
     playlist_t *work = (s_playlist == &s_pl_a) ? &s_pl_b : &s_pl_a;
     int n = playlist_load_from_cache(work);
     if (n == 0) {

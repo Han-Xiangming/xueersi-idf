@@ -687,11 +687,16 @@ void ebook_close(void)
         fclose(s_reader.fp);
         s_reader.fp = NULL;
     }
+    /* s_book / s_open_gen / s_is_open are copied by the count task under the
+     * mutex; publish the reset under the same lock so it never observes a
+     * torn struct. Everything below is UI-task-private. */
+    portENTER_CRITICAL(&s_mux);
     memset(&s_book, 0, sizeof(s_book));
     s_is_open = false;
     s_open_gen++;
     s_page = 0;
     s_page_count = 0;
+    portEXIT_CRITICAL(&s_mux);
     s_cur_start = s_next_start = 0;
     s_hist_count = s_hist_head = 0;
     s_page_buf[0] = '\0';
@@ -711,36 +716,47 @@ bool ebook_open(int idx)
 
     ebook_close();
 
+    /* Build the source description in a local first, then publish it under
+     * the mutex in one go: the count task copies s_book atomically, so a
+     * torn struct (e.g. a garbage src.size) could otherwise send its
+     * page-count loop spinning forever at EOF. */
+    book_src_t src;
+    memset(&src, 0, sizeof(src));
+
     const bool embedded =
         (strncmp(name, EBOOK_ROM_PREFIX, strlen(EBOOK_ROM_PREFIX)) == 0);
-    memset(&s_book, 0, sizeof(s_book));
     if (embedded) {
-        s_book.embedded = true;
-        s_book.rom_start = _binary_Test_txt_start;
-        s_book.rom_size = (size_t)(_binary_Test_txt_end -
-                                   _binary_Test_txt_start);
-        s_book.size = s_book.rom_size;
+        src.embedded = true;
+        src.rom_start = _binary_Test_txt_start;
+        src.rom_size = (size_t)(_binary_Test_txt_end -
+                                _binary_Test_txt_start);
+        src.size = src.rom_size;
     }
     else {
-        snprintf(s_book.path, sizeof(s_book.path), "/sdcard/%s", name);
-        s_reader.fp = fopen(s_book.path, "rb");
-        if (s_reader.fp == NULL) {
-            ESP_LOGE(TAG, "open '%s' failed", s_book.path);
+        snprintf(src.path, sizeof(src.path), "/sdcard/%s", name);
+        FILE *fp = fopen(src.path, "rb");
+        if (fp == NULL) {
+            ESP_LOGE(TAG, "open '%s' failed", src.path);
             ebook_close();
             return false;
         }
-        fseeko(s_reader.fp, 0, SEEK_END);
-        s_book.size = (size_t)ftello(s_reader.fp);
-        fseeko(s_reader.fp, 0, SEEK_SET);
+        fseeko(fp, 0, SEEK_END);
+        src.size = (size_t)ftello(fp);
+        fseeko(fp, 0, SEEK_SET);
+        s_reader.fp = fp;                /* reader is UI-task-private */
     }
     s_reader.embedded = embedded;
-    s_reader.rom = s_book.rom_start;
-    s_reader.rom_size = s_book.rom_size;
+    s_reader.rom = src.rom_start;
+    s_reader.rom_size = src.rom_size;
     s_reader.base = 0;
     s_reader.len = 0;
 
+    portENTER_CRITICAL(&s_mux);
+    s_book = src;
     s_is_open = true;
     s_open_gen++;                        /* start the count fresh for this book */
+    portEXIT_CRITICAL(&s_mux);
+
     s_cur_start = 0;
     s_page = 1;
     s_next_start = layout_page(&s_reader, 0, s_page_buf, sizeof(s_page_buf));
@@ -748,7 +764,7 @@ bool ebook_open(int idx)
         xTaskNotifyGive(s_count_task);
     }
     ESP_LOGI(TAG, "open '%s' embedded=%d size=%u", name, embedded ? 1 : 0,
-             (unsigned)s_book.size);
+             (unsigned)src.size);
     return true;
 }
 

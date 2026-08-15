@@ -41,7 +41,13 @@ void hw_sd_try_mount(void)
 
     esp_vfs_fat_mount_config_t mount_config = VFS_FAT_MOUNT_DEFAULT_CONFIG();
     mount_config.format_if_mount_failed = false;
-    mount_config.max_files = 3;
+    /* Open-file budget: the player holds its track open, the ebook reader
+     * its book, and the ebook count task its own handle — that is already
+     * the old limit of 3, so any transient opendir/fopen("w") (scans, cache
+     * read/write) failed while playing + reading, breaking track changes.
+     * 8 keeps every long-lived handle plus all transient opens under the
+     * FATFS table limit. */
+    mount_config.max_files = 8;
 
     s_last_err = esp_vfs_fat_sdspi_mount("/sdcard",
                                          &host,
