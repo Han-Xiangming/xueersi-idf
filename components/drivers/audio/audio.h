@@ -63,10 +63,26 @@ void hw_audio_set_player_active(bool active);
  * stream opens cleanly at the new sample rate. */
 void hw_audio_flush(void);
 
+/* Result of a PCM write, so the caller can distinguish "enqueued" from
+ * "the pipeline is wedged" (feed task not consuming) vs "playback was
+ * deactivated mid-write" (pause/stop — not an error). */
+typedef enum {
+    AUDIO_WRITE_OK = 0,       /* enqueued into the ring (or BT) */
+    AUDIO_WRITE_STALLED,      /* ring stayed full for the whole bounded wait */
+    AUDIO_WRITE_ABANDONED,    /* player deactivated mid-write: nothing enqueued */
+} audio_write_result_t;
+
 /* Stream raw 16-bit stereo PCM (L,R interleaved). `frames` = number of
  * L/R pairs. Used by the MP3 player to output decoded audio. Samples are
- * filtered in place by the speaker-protection high-pass before enqueueing. */
-void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames);
+ * filtered in place by the speaker-protection high-pass before enqueueing.
+ * Never blocks for more than ~2 s: on a wedged pipeline it returns
+ * AUDIO_WRITE_STALLED so the caller can recover instead of hanging. */
+audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames);
+
+/* Pipeline recovery kick: discard all queued PCM and wake the feed task.
+ * Call after an AUDIO_WRITE_STALLED to drop the decoder's back-pressure and
+ * let the next frame restart the stream from a clean ring. */
+void hw_audio_kick(void);
 
 /* True only after I2S, PCM ring and the feed task are all up. Callers must
  * NOT start playback before this returns true (prevents decode deadlock when

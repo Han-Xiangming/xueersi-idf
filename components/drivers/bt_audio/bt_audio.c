@@ -59,6 +59,7 @@ static bt_conn_state_cb_t s_conn_state_cb;
  * the ONLY buffer absorbing decode jitter / SD stalls: 128 KB ~= 740 ms at
  * 44.1 kHz stereo 16-bit. Storage lives in PSRAM (no internal DRAM cost). */
 #define BT_PCM_RING_BYTES      (128 * 1024)
+#define BT_SEND_MAX_WAITS      40   /* bounded back-pressure: 40 x 50 ms = ~2 s */
 #define BT_INQ_LEN             10          /* inquiry duration, 1.28s units */
 
 /* Teardown safety. bt_audio_disable() defers the real stack deinit to the
@@ -872,17 +873,28 @@ const char *bt_audio_peer_name(void)
     return s_peer_name;
 }
 
-/* Blocking back-pressure send into the BT ring. The A2DP data callback
- * drains at exactly real time, which paces the decode task. Bail out if
- * streaming stops while waiting. */
-static void bt_ring_send(const void *data, size_t bytes)
+/* Bounded back-pressure send into the BT ring. The A2DP data callback
+ * drains at exactly real time, which paces the decode task. Returns false
+ * if the ring stays full for ~2 s while streaming — the sink is then
+ * stalled (RF drop / wedged controller), and the decode task must not be
+ * allowed to block on it forever: a permanent block would wedge the whole
+ * player (the stall watchdog can stop playback but cannot un-stick a task
+ * stuck in a kernel call). A normal stop/park bail-out is NOT an error. */
+static bool bt_ring_send(const void *data, size_t bytes)
 {
+    int waits = 0;
     while (xRingbufferSend(s_pcm_ring, data, bytes,
                            pdMS_TO_TICKS(50)) != pdPASS) {
         if (!s_streaming || !s_enabled || s_tx_stopped) {
-            return;
+            return true;   /* normal stop/park: just drop the frame */
+        }
+        if (++waits >= BT_SEND_MAX_WAITS) {
+            ESP_LOGE(TAG, "BT PCM ring full (%d x 50 ms): sink stalled",
+                     waits);
+            return false;
         }
     }
+    return true;
 }
 
 void bt_audio_set_sample_rate(uint32_t rate_hz)
@@ -898,16 +910,19 @@ void bt_audio_set_sample_rate(uint32_t rate_hz)
              (unsigned)rate_hz, BT_STREAM_RATE, (unsigned)s_rs_step);
 }
 
-void bt_audio_write_pcm(const int16_t *stereo_frames, size_t frames)
+/* Feed one decoded PCM chunk into the BT pipeline (resampled to the SBC
+ * stream rate). Returns false if the sink stalled (ring full for ~2 s) and
+ * the chunk was abandoned; the caller reports the pipeline error instead of
+ * faking normal playback. */
+bool bt_audio_write_pcm(const int16_t *stereo_frames, size_t frames)
 {
     if (!s_enabled || !s_streaming || s_pcm_ring == NULL || frames == 0) {
-        return;
+        return true;
     }
 
     /* Track already at the SBC stream rate: pass through untouched. */
     if (s_in_rate == BT_STREAM_RATE) {
-        bt_ring_send(stereo_frames, frames * 4);
-        return;
+        return bt_ring_send(stereo_frames, frames * 4);
     }
 
     /* Resample to 44.1 kHz with linear interpolation. Virtual input index 0
@@ -926,17 +941,20 @@ void bt_audio_write_pcm(const int16_t *stereo_frames, size_t frames)
         out[2 * out_n]     = (int16_t)(al + (((bl - al) * frac) >> 16));
         out[2 * out_n + 1] = (int16_t)(ar + (((br - ar) * frac) >> 16));
         if (++out_n == 256) {
-            bt_ring_send(out, sizeof(out));
+            if (!bt_ring_send(out, sizeof(out))) {
+                return false;   /* sink stalled: abandon the rest of the chunk */
+            }
             out_n = 0;
         }
         s_rs_phase += s_rs_step;
     }
-    if (out_n > 0) {
-        bt_ring_send(out, out_n * 4);
+    if (out_n > 0 && !bt_ring_send(out, out_n * 4)) {
+        return false;
     }
     s_rs_phase -= (uint32_t)frames << 16;   /* carry fraction to next call */
     s_rs_last_l = stereo_frames[2 * (frames - 1)];
     s_rs_last_r = stereo_frames[2 * (frames - 1) + 1];
+    return true;
 }
 
 #else /* Bluetooth / A2DP not compiled in */

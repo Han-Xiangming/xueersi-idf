@@ -93,8 +93,9 @@ uint32_t bt_audio_passkey(void);
 
 /* Feed one decoded stereo-PCM frame (L,R interleaved int16) into the BT
  * pipeline. Only enqueues while enabled, connected and actively streaming;
- * safe (no-op) to call otherwise. */
-void bt_audio_write_pcm(const int16_t *stereo_frames, size_t frames);
+ * safe (no-op) to call otherwise. Returns false if the sink stalled (ring
+ * full for ~2 s) and the frame was abandoned. */
+bool bt_audio_write_pcm(const int16_t *stereo_frames, size_t frames);
 
 /* Tell the BT pipeline the sample rate of the PCM fed above. The A2DP/SBC
  * stream always runs at 44.1 kHz, so any other input rate is resampled

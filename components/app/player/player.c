@@ -16,14 +16,36 @@
 
 #include "mp3dec.h"
 #include "esp_attr.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_log.h"
+#if defined(CONFIG_ESP_TASK_WDT_EN)
+#include "esp_task_wdt.h"
+#endif
 
 /* Read buffer for MP3 stream data. */
 #define MP3_READ_CHUNK  (4 * 1024)
 /* Worst-case decoded PCM: MPEG1 Layer III, 2 channels, 1152 samples/frame. */
 #define MP3_PCM_MAX     (2 * 1152 * 2)
+
+/* Consecutive decode failures that mark a track corrupt. Resyncing garbage
+ * one byte at a time is O(n^2) on a bad region; past this cap the track is
+ * aborted and the player advances to the next one (or stops) instead of
+ * spinning the CPU forever on a file that will never produce audio. */
+#define TRACK_MAX_DECODE_ERRS    512
+/* Consecutive AUDIO_WRITE_STALLED results that abort a track. Each stall is
+ * ~2 s of a full ring, which proves the feed task is not consuming; a few in
+ * a row mean the pipeline is wedged, not just momentarily slow. */
+#define TRACK_MAX_PIPELINE_STALLS 3
+/* Consecutive tracks that failed to play before the player gives up and
+ * stops (avoids cycling through a whole card of corrupt files forever). */
+#define TRACK_MAX_CONSEC_FAILS   8
+/* Decode-progress watchdog: while PLAYING, if no frame has been produced for
+ * this long, the decode task is stuck (SD read hang, BT send hang, ...) and
+ * the watchdog stops playback instead of faking an endless "playing" state. */
+#define PLAYER_STALL_MS          12000
 
 static const char *TAG = "player";
 
@@ -47,6 +69,31 @@ static uint32_t s_dbg_rate;            /* samplerate captured from 1st frame */
  * each new track; if it reaches the limit the track is aborted instead of
  * spinning forever on a corrupt/non-MP3 file. */
 static int s_no_sync_refills;
+/* Consecutive MP3Decode failures in the current track (reset on success).
+ * Guards against the byte-by-byte resync spinning forever on garbage. */
+static int s_track_errs;
+/* Consecutive AUDIO_WRITE_STALLED results in the current track. */
+static int s_pcm_stalls;
+/* Consecutive tracks that failed to play (open/decode/pipeline). */
+static int s_fail_count;
+/* Set when the current track is being aborted because of an error (as
+ * opposed to a natural EOF), so the end-of-track logic can auto-advance
+ * instead of replaying a broken track under REPEAT_ONE. */
+static bool s_track_errored;
+/* Last playback error, sticky until the next track decodes its first frame
+ * successfully. Read by the UI task, written by the player/watchdog tasks;
+ * single-word stores are atomic on Xtensa. */
+static volatile player_err_t s_last_err = PLAYER_ERR_NONE;
+/* Monotonic timestamp (ms, esp_timer) of the last decode progress. Read by
+ * the watchdog task while the player is PLAYING to detect a hung decode. */
+static volatile uint32_t s_decode_beat_ms;
+/* True while decode_loop() is running (including paused inside it). Lets
+ * player_play() distinguish a self-call (single-track replay / list
+ * auto-advance) from a UI call: a self-call must NOT set s_stop_req — the
+ * track has already ended, and setting it would let a user stop pressed in
+ * the tiny switch window be eaten by the loop top. (Single-task read/write:
+ * only the player task and the UI task touch it, and only via player_play.) */
+static volatile bool s_in_decode_loop;
 
 /* Abstract data source: a file on the SD card. */
 typedef struct {
@@ -66,6 +113,36 @@ static int s_bytes_left;
 static int s_consumed;
 static int16_t s_pcm[MP3_PCM_MAX];
 EXT_RAM_BSS_ATTR static int16_t s_stereo[MP3_PCM_MAX];
+
+/* --- Playback error reporting ------------------------------------------
+ * Errors are sticky: set when a track is aborted / a play request is
+ * rejected, cleared once a new track decodes its first frame successfully
+ * (real audio progress), so the UI can show why playback stopped. */
+const char *player_err_text(player_err_t err)
+{
+    switch (err) {
+    case PLAYER_ERR_OPEN:     return "打开失败";
+    case PLAYER_ERR_CORRUPT:  return "文件损坏";
+    case PLAYER_ERR_PIPELINE: return "音频卡住";
+    case PLAYER_ERR_STALL:    return "播放无响应";
+    case PLAYER_ERR_AUDIO:    return "音频不可用";
+    case PLAYER_ERR_NONE:
+    default:                  return "";
+    }
+}
+
+static void player_report_error(player_err_t err)
+{
+    if (err != s_last_err) {
+        s_last_err = err;
+        ESP_LOGE(TAG, "player error -> %s", player_err_text(err));
+    }
+}
+
+player_err_t player_last_error(void)
+{
+    return s_last_err;
+}
 
 /* --- Background playlist load ------------------------------------------
  * opendir/readdir over SDSPI is slow (tens of ms), so the track list is built
@@ -89,6 +166,7 @@ static uint32_t s_scan_version;   /* mirrored from s_playlist->version */
 static bool s_scan_busy;
 static bool s_scan_pending;
 static TaskHandle_t s_scan_task;
+static TaskHandle_t s_watch_task;   /* decode-stall watchdog (see player_watch_task) */
 
 /* Forward declaration: a completed real scan persists its result to the
  * on-card cache so the next player entry is instantaneous. Defined further
@@ -322,6 +400,8 @@ static bool open_track(void)
     s_bytes_left = 0;
     s_consumed = 0;
     s_no_sync_refills = 0;   /* fresh track: restart sync-word watchdog */
+    s_track_errs = 0;        /* fresh track: restart decode-error watchdog */
+    s_pcm_stalls = 0;        /* fresh track: restart pipeline-stall watchdog */
     return true;
 }
 
@@ -370,6 +450,8 @@ static bool decode_frame(bool *rate_set)
         s_bytes_left = 0;
         if (++s_no_sync_refills >= 64) {
             ESP_LOGE(TAG, "no MP3 sync word after 64 refills, aborting track");
+            s_track_errored = true;
+            player_report_error(PLAYER_ERR_CORRUPT);
             return false;
         }
         return true;
@@ -383,9 +465,19 @@ static bool decode_frame(bool *rate_set)
     s_consumed = (int)(p - s_readbuf);
 
     if (status != 0) {
-        /* Skip one byte and resync. */
+        /* Skip one byte and resync. Bounded: past TRACK_MAX_DECODE_ERRS the
+         * file is treated as corrupt instead of letting the byte-by-byte
+         * resync spin the CPU forever on garbage (which also keeps the
+         * task-WDT quiet — this is the graceful, fast path). */
         ESP_LOGD(TAG, "MP3Decode status=%d at consumed=%d, resyncing",
                  status, s_consumed);
+        if (++s_track_errs >= TRACK_MAX_DECODE_ERRS) {
+            ESP_LOGE(TAG, "track '%s' too many decode errors (%d), aborting",
+                     s_name, s_track_errs);
+            s_track_errored = true;
+            player_report_error(PLAYER_ERR_CORRUPT);
+            return false;
+        }
         if (s_consumed < MP3_READ_CHUNK - 1) {
             s_consumed++;
             s_bytes_left--;
@@ -396,6 +488,7 @@ static bool decode_frame(bool *rate_set)
         }
         return true;
     }
+    s_track_errs = 0;
 
     MP3FrameInfo info;
     MP3GetLastFrameInfo(s_dec, &info);
@@ -414,15 +507,36 @@ static bool decode_frame(bool *rate_set)
                  (unsigned)s_dbg_frames, s_consumed, info.outputSamps);
     }
 
+    audio_write_result_t wr;
     if (info.nChans == 2) {
-        hw_audio_write_pcm(s_pcm, (size_t)(info.outputSamps / 2));
+        wr = hw_audio_write_pcm(s_pcm, (size_t)(info.outputSamps / 2));
     }
     else {
         for (int i = 0; i < info.outputSamps; i++) {
             s_stereo[2 * i] = s_pcm[i];
             s_stereo[2 * i + 1] = s_pcm[i];
         }
-        hw_audio_write_pcm(s_stereo, (size_t)info.outputSamps);
+        wr = hw_audio_write_pcm(s_stereo, (size_t)info.outputSamps);
+    }
+    if (wr == AUDIO_WRITE_STALLED) {
+        /* The feed task is not consuming the ring (2 s of full ring proves
+         * it). Drop the backlog and re-wake it so the NEXT frame restarts
+         * the stream; give up on the track after a few consecutive stalls —
+         * the feed task is then wedged/dead, and the pipeline error is the
+         * honest outcome instead of silent playback forever. */
+        hw_audio_kick();
+        if (++s_pcm_stalls >= TRACK_MAX_PIPELINE_STALLS) {
+            ESP_LOGE(TAG, "audio pipeline stalled %d times, aborting track",
+                     s_pcm_stalls);
+            s_track_errored = true;
+            player_report_error(PLAYER_ERR_PIPELINE);
+            return false;
+        }
+    }
+    else if (wr == AUDIO_WRITE_OK && s_last_err != PLAYER_ERR_NONE) {
+        /* First real audio progress of the new track: clear any sticky
+         * error from a previously failed track/play request. */
+        player_report_error(PLAYER_ERR_NONE);
     }
 
     return true;
@@ -430,7 +544,15 @@ static bool decode_frame(bool *rate_set)
 
 static void decode_loop(void)
 {
+    s_in_decode_loop = true;
     for (;;) {
+#if defined(CONFIG_ESP_TASK_WDT_EN)
+        /* The task WDT only knows what we feed it (no auto-exemption for
+         * blocked tasks in this IDF): reset on every loop pass so a normal
+         * track/pause cycle never trips it, while a busy-hang (spinning
+         * decode, wedged driver) still fires it after the 5 s timeout. */
+        esp_task_wdt_reset();
+#endif
         if (s_new_req) {
             s_new_req = false;
             strncpy(s_path, s_new_path, sizeof(s_path) - 1);
@@ -448,66 +570,131 @@ static void decode_loop(void)
                     break;
                 }
             }
+            /* A pending user stop must survive: player_stop() clears
+             * s_new_req, so this block only runs when the request is real. */
             s_stop_req = false;
             s_pause_req = false;
         }
-
-        if (!open_track()) {
-            s_state = PLAYER_IDLE;
-            return;
+        /* Stop check BEFORE opening the track: a user stop pressed during a
+         * track-switch transition (s_new_req was just cleared by player_stop)
+         * must not be followed by a pointless open+play of the old request. */
+        if (s_stop_req) {
+            break;
         }
-        /* Drop any PCM left over from the previous track so the new stream
-         * never starts with stale samples at the wrong sample rate. */
-        hw_audio_flush();
-        ESP_LOGI(TAG, "start track '%s'", s_name);
 
-        bool rate_set = false;
-        int frame_cnt = 0;
-        s_dbg_frames = 0;                 /* reset debug frame counter */
-        /* player-active (feed task) is claimed AFTER the first decoded frame of
-         * THIS track has been enqueued. Reset it per track — including when we
-         * loop back via `continue` for a track switch — otherwise a switch would
-         * leave `s_feeding` false (close_track cleared it) and the feed task
-         * would never re-activate, filling the ring and wedging decode_loop
-         * forever in hw_audio_write_pcm (the "log hangs, no audio" symptom). */
-        bool started = false;
-        while (!s_stop_req) {
-            if (s_pause_req) {
-                ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-                s_pause_req = false;
-                if (s_stop_req) {
+        s_track_errored = false;
+        if (!open_track()) {
+            /* Failed to even open the file (deleted since the scan, card
+             * hiccup, ...): report and fall through to the shared
+             * end-of-track handling below, which auto-advances the list
+             * instead of stopping the whole session on one bad file. */
+            player_report_error(PLAYER_ERR_OPEN);
+            s_track_errored = true;
+        }
+        else {
+            /* Drop any PCM left over from the previous track so the new
+             * stream never starts with stale samples at the wrong rate. */
+            hw_audio_flush();
+            ESP_LOGI(TAG, "start track '%s'", s_name);
+
+            bool rate_set = false;
+            int frame_cnt = 0;
+            s_dbg_frames = 0;             /* reset debug frame counter */
+            /* player-active (feed task) is claimed AFTER the first decoded
+             * frame of THIS track has been enqueued. Reset it per track —
+             * including when we loop back via `continue` for a track switch —
+             * otherwise a switch would leave `s_feeding` false (close_track
+             * cleared it) and the feed task would never re-activate, filling
+             * the ring and wedging decode_loop forever in hw_audio_write_pcm
+             * (the "log hangs, no audio" symptom). */
+            bool started = false;
+            while (!s_stop_req && !s_new_req) {
+                /* Decode-progress heartbeat for the stall watchdog: this
+                 * runs once per frame, so while PLAYING a healthy pipeline
+                 * keeps it fresh and a task stuck inside decode_frame (SD
+                 * read, BT send, ...) lets it go stale. */
+                s_decode_beat_ms = (uint32_t)(esp_timer_get_time() / 1000);
+#if defined(CONFIG_ESP_TASK_WDT_EN)
+                esp_task_wdt_reset();
+#endif
+                if (s_pause_req) {
+                    /* Wait on the REQUEST FLAG, not on the notify alone:
+                     * player_play() called from inside this loop (single-track
+                     * replay / list auto-advance) self-notifies the task, and
+                     * a stale notification would make ulTaskNotifyTake return
+                     * pdTRUE instantly and eat the first pause after a track
+                     * switch — the player would keep decoding in silence
+                     * (frames abandoned) under a PAUSED UI. Consuming the
+                     * stale notify here is harmless; only a real resume
+                     * (player_toggle clears s_pause_req), a stop, or a new
+                     * track request (UI next/prev while paused) exits. The
+                     * 2 s timeout still lets the WDT feed run while paused. */
+                    while (s_pause_req && !s_stop_req && !s_new_req) {
+                        s_decode_beat_ms =
+                            (uint32_t)(esp_timer_get_time() / 1000);
+#if defined(CONFIG_ESP_TASK_WDT_EN)
+                        esp_task_wdt_reset();
+#endif
+                        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2000));
+                    }
+                    if (s_stop_req || s_new_req) {
+                        break;   /* stop or track switch: end this track */
+                    }
+                    continue;
+                }
+                if (!decode_frame(&rate_set)) {
                     break;
                 }
-                continue;
+                frame_cnt++;
+                if (!started) {
+                    /* Claim the I2S bus only AFTER the first decoded frame
+                     * has been enqueued and its sample rate applied. This
+                     * closes the window where the feed task would enable the
+                     * channel and stream an empty/stale ring (or reconfigure
+                     * the rate) before any real PCM arrived — which is what
+                     * made the next track silent. */
+                    hw_audio_set_player_active(true);
+                    started = true;
+                }
             }
-            if (!decode_frame(&rate_set)) {
-                break;
-            }
-            frame_cnt++;
-            if (!started) {
-                /* Claim the I2S bus only AFTER the first decoded frame has been
-                 * enqueued and its sample rate applied. This closes the window
-                 * where the feed task would enable the channel and stream an
-                 * empty/stale ring (or reconfigure the rate) before any real
-                 * PCM arrived — which is what made the next track silent. */
-                hw_audio_set_player_active(true);
-                started = true;
-            }
-        }
 
-        ESP_LOGI(TAG, "track ended: frames=%u (~%u ms est.), %s",
-                 (unsigned)frame_cnt,
-                 s_dbg_rate ? (unsigned)((uint64_t)frame_cnt * 1152 /
-                                         s_dbg_rate * 1000) : 0,
-                 s_stop_req ? "stopped by user" : "reached EOF");
-        close_track();
+            ESP_LOGI(TAG, "track ended: frames=%u (~%u ms est.), %s",
+                     (unsigned)frame_cnt,
+                     s_dbg_rate ? (unsigned)((uint64_t)frame_cnt * 1152 /
+                                             s_dbg_rate * 1000) : 0,
+                     s_stop_req ? "stopped by user"
+                                : s_track_errored ? "aborted (error)"
+                                                  : "reached EOF");
+            close_track();
+        }
 
         if (s_new_req) {
             continue;   /* switch to the newly requested track */
         }
         if (s_stop_req) {
-            break;      /* user stopped: end the loop */
+            break;      /* user stopped (or the watchdog stopped us): end loop */
         }
+        /* The track failed (open / corrupt / pipeline): auto-advance so a
+         * broken file never wedges the list, skipping the current track even
+         * under REPEAT_ONE (replaying a corrupt file would spin forever).
+         * Give up after too many consecutive failures so a card full of bad
+         * files ends in a visible error instead of a silent cycle. */
+        if (s_track_errored) {
+            if (++s_fail_count >= TRACK_MAX_CONSEC_FAILS) {
+                ESP_LOGE(TAG, "%d consecutive failed tracks, stopping",
+                         s_fail_count);
+                break;
+            }
+            int cnt = s_playlist->count;
+            if (cnt > 0 && s_index >= 0) {
+                int next = (s_index + 1) % cnt;
+                player_play(s_playlist->items[next].path);
+                continue;
+            }
+            break;   /* no list to advance to: stop with the error visible */
+        }
+        s_fail_count = 0;
+
         /* Natural end of track: advance per the repeat mode. List loop
          * advances to the next entry (wrapping at the end); single-track loop
          * replays the current track. If the current track isn't in the list
@@ -515,8 +702,9 @@ static void decode_loop(void)
          * single-track loop replays by path and needs no list at all. */
         if (s_repeat == PLAYER_REPEAT_ONE) {
             player_play(s_path);
-            /* player_play() set s_new_req + s_stop_req; the loop top will pick
-             * up the SAME track again. Re-run rather than break so it loops. */
+            /* Self-call: only s_new_req is set (no s_stop_req — the track has
+             * already ended), so the loop top picks up the SAME track again.
+             * Re-run rather than break so it loops. */
             continue;
         }
         int cnt = s_playlist->count;
@@ -525,22 +713,63 @@ static void decode_loop(void)
         }
         int next = (s_index + 1) % cnt;
         player_play(s_playlist->items[next].path);
-        /* player_play() set s_new_req + s_stop_req; the loop top will pick up
-         * the new track. Re-run rather than break so the next song starts. */
+        /* Self-call: only s_new_req is set; the loop top picks up the new
+         * track. Re-run rather than break so the next song starts. */
         continue;
     }
     s_state = PLAYER_IDLE;
+    s_in_decode_loop = false;
 }
 
 static void player_task(void *arg)
 {
     (void)arg;
     for (;;) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        /* Bounded idle wait: the task WDT needs a periodic feed while we sit
+         * here (it cannot be fed from a blocked task in this IDF), and a
+         * timeout is harmless — the notify that wakes real work comes
+         * immediately anyway. */
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2000));
+#if defined(CONFIG_ESP_TASK_WDT_EN)
+        esp_task_wdt_reset();
+#endif
         if (s_state == PLAYER_PLAYING) {
             decode_loop();
         }
         s_state = PLAYER_IDLE;
+    }
+}
+
+/* --- Decode stall watchdog --------------------------------------------
+ * The decode task can hang inside a blocking call the task WDT cannot see
+ * (SD read, Bluetooth send): it just sits there, state stuck at PLAYING,
+ * silence forever. This monitor polls the decode heartbeat and, once no
+ * frame has been produced for PLAYER_STALL_MS, stops playback cleanly and
+ * surfaces PLAYER_ERR_STALL — honest failure instead of a fake-playing
+ * device. The decode task itself may still be stuck in a kernel call; when
+ * it eventually returns it sees s_stop_req and tears down normally. */
+static void player_watch_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        if (s_state != PLAYER_PLAYING || s_decode_beat_ms == 0) {
+            continue;   /* nothing playing / no frame yet: nothing to watch */
+        }
+        const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        const uint32_t age = now_ms - s_decode_beat_ms; /* wraps safely */
+        if (age < PLAYER_STALL_MS) {
+            continue;
+        }
+        ESP_LOGE(TAG, "[WATCHDOG] decode stalled %u ms, stopping playback",
+                 (unsigned)age);
+        player_report_error(PLAYER_ERR_STALL);
+        s_stop_req = true;
+        hw_audio_set_player_active(false);   /* release I2S: no fake silence */
+        s_state = PLAYER_IDLE;
+        if (s_task != NULL) {
+            xTaskNotifyGive(s_task);   /* wake the decode loop if it can be */
+        }
     }
 }
 
@@ -560,7 +789,25 @@ void player_init(void)
         ESP_LOGE(TAG, "[ERROR] scan task create FAILED");
         s_scan_task = NULL;
     }
-    ESP_LOGI(TAG, "[PLAYER] player + scan tasks started");
+    if (xTaskCreate(player_watch_task, "mp3_watch", 4 * 1024, NULL, 2,
+                    &s_watch_task) != pdPASS) {
+        ESP_LOGE(TAG, "[ERROR] player watchdog task create FAILED");
+    }
+#if defined(CONFIG_ESP_TASK_WDT_EN)
+    /* Last-resort backstop: a decode task busy-hung for 5 s trips the task
+     * WDT (it logs the hung task and, depending on config, reboots). The
+     * decode loop feeds it on every frame; blocked waits are bounded so a
+     * paused player keeps feeding too. The stall watchdog above is the
+     * actual recovery path — the WDT only catches what it cannot. */
+    if (s_task != NULL) {
+        esp_err_t werr = esp_task_wdt_add(s_task);
+        if (werr != ESP_OK) {
+            ESP_LOGW(TAG, "task WDT subscribe failed: %s",
+                     esp_err_to_name(werr));
+        }
+    }
+#endif
+    ESP_LOGI(TAG, "[PLAYER] player + scan + watchdog tasks started");
     /* Pre-warm the list (SD is mounted by app_main before player_init). Prefer
      * the on-card cache so a re-entered player shows the list instantly; only
      * fall back to a real scan (which rewrites the cache) when no cache exists.
@@ -720,10 +967,19 @@ const char *player_current_name(void)
 void player_play(const char *path)
 {
     /* 原则3：audio 未 ready 时不接受播放请求，避免 feed task 不存在导致
-     * decode 卡死（"同一次开机随机失败"的根因之一）。 */
+     * decode 卡死（"同一次开机随机失败"的根因之一）。上报错误而不是静默
+     * 忽略，UI 才能告诉用户为什么按播放没反应。 */
     if (!hw_audio_is_ready()) {
         ESP_LOGE(TAG, "[ERROR] play requested but audio not ready, ignored");
+        player_report_error(PLAYER_ERR_AUDIO);
         return;
+    }
+    /* A fresh play from idle is a new attempt by the user: reset the
+     * consecutive-failure streak so a recovered player does not immediately
+     * give up again. (Auto-advance calls this while PLAYING and must NOT
+     * reset the streak — the cap is what stops a corrupt-list cycle.) */
+    if (s_state == PLAYER_IDLE) {
+        s_fail_count = 0;
     }
     /* `path` is absolute if it begins with '/', else it's a legacy basename
      * resolved under PLAYER_ROOT. Either way the full path is what we open. */
@@ -744,7 +1000,16 @@ void player_play(const char *path)
     s_new_name[blen] = '\0';
 
     s_new_req = true;
-    s_stop_req = true;          /* ask any current decode to stop */
+    /* Interrupt a running track only from outside the decode loop. A
+     * self-call (single-track replay / list auto-advance) runs after the
+     * track already ended, so it must NOT set s_stop_req: if it did, a user
+     * stop pressed in the tiny switch window would be silently cleared by
+     * the loop top (player_stop() clears s_new_req, so the pending stop
+     * then wins at the loop top's early break). The notify below is ALWAYS
+     * sent: it is what wakes a decode loop blocked in the pause wait. */
+    if (!s_in_decode_loop) {
+        s_stop_req = true;          /* ask any current decode to stop */
+    }
     /* Drop the previous track's queued PCM immediately. Without this, the feed
      * task would keep playing the old ring's tail (up to ~1 s) after we park
      * the bus in close_track(), so a track switch would audibly bleed the
@@ -807,6 +1072,10 @@ void player_stop(void)
      */
     hw_audio_set_player_active(false);
     s_stop_req = true;
+    /* A stop is authoritative: cancel any pending play request so a track
+     * queued during the stop (e.g. a single-track replay racing the button
+     * press) cannot start afterwards. */
+    s_new_req = false;
     if (s_task != NULL) {
         xTaskNotifyGive(s_task);
     }

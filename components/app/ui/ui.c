@@ -1673,6 +1673,13 @@ void ui_refresh(void)
         else {
             ui_set_hint("左/右切歌 上/下选择 A播放 Select循环");
         }
+        /* Sticky playback-error toast: while an error is set and nothing is
+         * playing, re-arm the toast every refresh so the hint row keeps
+         * showing it (e.g. "文件损坏") instead of the normal hint, until the
+         * next successful play clears it. */
+        if (st == PLAYER_IDLE && player_last_error() != PLAYER_ERR_NONE) {
+            set_action(player_err_text(player_last_error()));
+        }
         break;
     }
     case UI_PAGE_BT: {
@@ -2181,11 +2188,12 @@ static void ui_key_event_cb(lv_event_t *e)
     }
     if (key == LV_KEY_HOME) {
         /* Select: switch the player's repeat mode (list loop ⇄ single-track
-         * loop). Only meaningful on the player page; ignored elsewhere. */
+         * loop). Only meaningful on the player page; ignored elsewhere.
+         * No toast — the mode is already shown in the top-right status
+         * (">>单曲" / ">>列表"), so a bottom hint would be redundant. */
         if (s_ui.page_id == UI_PAGE_PLAYER) {
+            ui_mark_dirty();   /* repaint the top-right status */
             player_repeat_toggle();
-            set_action(player_repeat_mode() == PLAYER_REPEAT_ONE
-                       ? "单曲循环" : "列表循环");
         }
         return;
     }

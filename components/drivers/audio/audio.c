@@ -768,6 +768,19 @@ void hw_audio_flush(void)
     ESP_LOGD(TAG, "pcm ring flushed");
 }
 
+/* Pipeline recovery kick: the caller has just hit AUDIO_WRITE_STALLED, so
+ * the feed task is provably not consuming the ring. Dropping the backlog
+ * releases the decoder's back-pressure instantly, and the explicit notify
+ * re-wakes the feed in case it merely missed a wake-up (or is wedged in a
+ * short driver call that will return). Safe to call from the player task. */
+void hw_audio_kick(void)
+{
+    hw_audio_flush();
+    if (s_feed_task != NULL) {
+        xTaskNotifyGive(s_feed_task);
+    }
+}
+
 /* Mark/unmark the MP3 player as the owner of the I2S bus. */
 void hw_audio_set_player_active(bool active)
 {
@@ -816,7 +829,9 @@ bool hw_audio_is_ready(void)
 }
 
 /* Enqueue decoded 16-bit stereo PCM (L,R interleaved). `frames` = number of
- * L/R pairs.
+ * L/R pairs. Returns the write result so the player can tell a wedged
+ * pipeline (AUDIO_WRITE_STALLED) from a clean pause/stop
+ * (AUDIO_WRITE_ABANDONED) and recover instead of playing silence forever.
  *
  * Output routing (like a phone): while a Bluetooth sink is linked, audio goes
  * to the headphones ONLY — full band (no speaker high-pass, headphones can
@@ -830,10 +845,10 @@ bool hw_audio_is_ready(void)
  * the loudness bass shelf, the master volume and the soft limiter.
  * Back-pressure blocks until there is room (PCM is never dropped); if
  * playback stops meanwhile we abandon the rest. */
-void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
+audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
 {
     if (!s_ready || s_pcm_ring == NULL || !s_player_active || frames == 0) {
-        return;
+        return AUDIO_WRITE_ABANDONED;
     }
 
     /* Route is a single explicit decision held in s_route (set only via
@@ -849,14 +864,17 @@ void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
         /* Bluetooth route: volume only, full band. The blocking send inside
          * bt_audio_write_pcm() paces the decoder; the speaker feed is parked by
          * the feed task (see audio_route_is_bt) so the I2S path is truly silent,
-         * not just starved. */
+         * not just starved. The send is now BOUNDED (~2 s): a stalled BT sink
+         * surfaces as AUDIO_WRITE_STALLED here, which the player counts and
+         * turns into a visible pipeline error — the decode task is never left
+         * blocked inside this call forever. */
         for (size_t i = 0; i < n; i++) {
             g += ((g_target - g) * VOL_SMOOTH_A_Q15) >> 15;
             stereo_frames[i] = (int16_t)(((int32_t)stereo_frames[i] * g) >> 15);
         }
         s_vol_gain_sm = g;
-        bt_audio_write_pcm(stereo_frames, frames);
-        return;
+        bool bt_ok = bt_audio_write_pcm(stereo_frames, frames);
+        return bt_ok ? AUDIO_WRITE_OK : AUDIO_WRITE_STALLED;
     }
 
     /* Speaker route: high-pass -> loudness bass shelf -> master volume
@@ -922,16 +940,17 @@ void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
     int waits = 0;
     /* 有限重试：ring 满时最多等 ~2s。若 feed task 未运行（pipeline 卡死），
      * 这里必须退出并返回，而不是永久阻塞 decode task（否则日志卡死、
-     * 设备再也无法播放）。原则2：禁止无超时永久阻塞。 */
+     * 设备再也无法播放）。原则2：禁止无超时永久阻塞。返回 STALLED 让上层
+     * 计数并恢复（清环 + 重踢 feed），而不是把卡死伪装成正常播放。 */
     const int PCM_SEND_MAX_WAITS = 40;   /* 40 * 50ms = ~2s */
     while (xRingbufferSend(s_pcm_ring, stereo_frames, bytes,
                            pdMS_TO_TICKS(50)) != pdPASS) {
         if (!s_player_active) {
-            return;
+            return AUDIO_WRITE_ABANDONED;
         }
         if (++waits >= PCM_SEND_MAX_WAITS) {
             ESP_LOGE(TAG, "[ERROR] PCM buffer full timeout (AUDIO PIPELINE STALLED)");
-            return;
+            return AUDIO_WRITE_STALLED;
         }
     }
     if (waits > 0) {
@@ -943,5 +962,6 @@ void hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
          * out its 100 ms receive timeout (startup / post-underrun latency). */
         xTaskNotifyGive(s_feed_task);
     }
+    return AUDIO_WRITE_OK;
 }
 

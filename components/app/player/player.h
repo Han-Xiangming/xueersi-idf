@@ -47,8 +47,29 @@ typedef enum {
     PLAYER_PAUSED,
 } player_state_t;
 
-/* Create the player task and the background scan task. Call once at startup. */
+/* Create the player task, the background scan task and the stall watchdog
+ * task. Call once at startup. */
 void player_init(void);
+
+/* --- Playback errors ---------------------------------------------------
+ * The player reports WHY a track/playback failed instead of failing silent.
+ * The error is sticky: it is set when a track is aborted (corrupt file,
+ * pipeline stall, ...) and cleared automatically once a NEW track decodes
+ * its first frame successfully. The UI surfaces it as a toast. */
+typedef enum {
+    PLAYER_ERR_NONE = 0,   /* all good */
+    PLAYER_ERR_OPEN,       /* track file open / decoder init failed */
+    PLAYER_ERR_CORRUPT,    /* aborted: no MP3 sync word / too many decode errors */
+    PLAYER_ERR_PIPELINE,   /* audio pipeline stalled repeatedly (feed task wedged) */
+    PLAYER_ERR_STALL,      /* decode made no progress for a long time (SD/BT hang) */
+    PLAYER_ERR_AUDIO,      /* play requested while the audio pipeline is not ready */
+} player_err_t;
+
+/* Last playback error (PLAYER_ERR_NONE when everything is fine). */
+player_err_t player_last_error(void);
+
+/* Short Chinese description of an error code, for the UI toast. */
+const char *player_err_text(player_err_t err);
 
 /* --- Playlist (background load) ---------------------------------------
  * The playlist is an IMMUTABLE ordered snapshot. Walking the FATFS tree is
