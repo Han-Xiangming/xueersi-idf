@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <sys/param.h>
 
 #include "board_config.h"
@@ -68,11 +70,57 @@ typedef enum {
     SETTING_BACKLIGHT,
     SETTING_BTOUT,
     SETTING_STANDBY,
+    SETTING_RESCAN,
     SETTING_RESET,
     SETTING_COUNT,
 } setting_item_t;
 
-static const int s_setting_y[SETTING_COUNT] = {34, 66, 98, 130, 162};
+/* Match the playlist row spacing (26px, starting at y=38) so the two
+ * list-style pages line up visually. */
+static const int s_setting_y[SETTING_COUNT] = {38, 64, 90, 116, 142, 168};
+
+/* Cache-existence state shown by the "重建列表" settings item. We must NOT
+ * call player_cache_exists() (a FATFS stat()) every refresh — it runs on
+ * every frame while the action toast is up, and stat() on a busy SD card
+ * stalls the refresh loop enough to make the settings list feel laggy when
+ * scrolling. Instead we cache the result and only re-query when the playlist
+ * scan version changes (i.e. a real scan/rescan/hotplug happened). */
+static bool     s_cache_present;
+static uint32_t s_cache_queried_ver;
+
+/* ----- Table-driven settings --------------------------------------- */
+/* Forward declarations for the per-item callbacks/value getters. */
+static const char *ui_set_vol_text(void);
+static const char *ui_set_bl_text(void);
+static const char *ui_set_bt_text(void);
+static const char *ui_set_sleep_text(void);
+static const char *ui_set_rescan_text(void);
+static const char *ui_set_reset_text(void);
+static void ui_set_vol_lr(int dir);
+static void ui_set_bl_lr(int dir);
+static void ui_set_bt_lr(int dir);
+static void ui_set_sleep_lr(int dir);
+static void ui_set_rescan_enter(void);
+static void ui_set_reset_enter(void);
+static void ui_set_bt_enter(void);
+
+/* A single settings row descriptor. Adding a setting = appending one row to
+ * s_settings_table (and the matching SETTING_* enum). No switch/loop edits. */
+typedef struct {
+    const char *label;                  /* left-side label */
+    const char *(*value_fn)(void);      /* right-side live value text */
+    void (*on_lr)(int dir);             /* LEFT/RIGHT adjust (dir: -1/+1) */
+    void (*on_enter)(void);             /* A press (NULL = not actionable) */
+} setting_entry_t;
+
+static const setting_entry_t s_settings_table[SETTING_COUNT] = {
+    [SETTING_VOLUME]  = {"音量",          ui_set_vol_text,   ui_set_vol_lr,   NULL},
+    [SETTING_BACKLIGHT] = {"背光",        ui_set_bl_text,    ui_set_bl_lr,    NULL},
+    [SETTING_BTOUT]   = {"蓝牙",          ui_set_bt_text,    ui_set_bt_lr,    ui_set_bt_enter},
+    [SETTING_STANDBY] = {"息屏",          ui_set_sleep_text, ui_set_sleep_lr, NULL},
+    [SETTING_RESCAN]  = {"重建播放列表",  ui_set_rescan_text, NULL,           ui_set_rescan_enter},
+    [SETTING_RESET]   = {"重置NVS",       ui_set_reset_text, NULL,           ui_set_reset_enter},
+};
 
 /* Backlight brightness (0..100 %), driven via PWM on PIN_NUM_LCD_BL.
  * Persisted to NVS; restored at boot. */
@@ -249,6 +297,34 @@ static char     s_bt_list_name[BT_MAX_DEVICES][BT_DEV_NAME_LEN];
  * not compete with the Bluetooth stack for internal DRAM. */
 static int s_mp3_count;
 static int s_mp3_sel;
+/* True from the moment we leave the source picker to load a (sub)folder until
+ * that specific load finishes. While set, the track list deliberately shows a
+ * "loading" placeholder instead of whatever stale playlist s_playlist still
+ * holds — otherwise we'd flash the *previous* folder's contents for one frame
+ * before the background scan publishes the new list. Cleared when the load
+ * completes (player_scan_busy() goes false). */
+static bool s_mp3_loading;
+
+/* Playlist "source" picker: before showing the track list, the user picks a
+ * source — <ALL> (whole card) or one top-level folder on the SD card. The
+ * chosen source determines which directory player_load() scans. The track
+ * ORDER within a source is fixed (sorted name) and cannot be changed at
+ * runtime — there is deliberately no reorder UI; only a fresh load may change
+ * it (by rescanning the filesystem). */
+typedef enum {
+    PV_SOURCE = 0,   /* picking a source: <ALL> + folders */
+    PV_LIST,         /* browsing/playing the loaded playlist */
+} player_view_t;
+
+#define SRC_MAX 48
+/* UI-only source list data (~28 KB): keep it in external PSRAM (EXT_RAM_BSS)
+ * so it does not compete with the Bluetooth stack for internal DRAM. */
+EXT_RAM_BSS_ATTR static char s_src_list[SRC_MAX][MP3_NAME_LEN];  /* folder names; [0]="" => <ALL> */
+EXT_RAM_BSS_ATTR static char s_src_path[SRC_MAX][PLAYER_PATH_LEN];/* absolute dir path per entry */
+static int      s_src_count;
+static int      s_src_sel;
+static player_view_t s_pv = PV_SOURCE;
+static int      s_paint_src_sel = -1;
 
 /* Marquee (scrolling) state for the selected list row. Only the highlighted
  * row scrolls when its name is wider than the line; others stay clipped. */
@@ -548,26 +624,6 @@ static void ui_volume_step(int dir, int coarse)
     hw_audio_set_volume((uint8_t)MAX(0, MIN(v, 100)));
 }
 
-static const char *short_err(esp_err_t err)
-{
-    switch (err) {
-    case ESP_OK:
-        return "OK";
-    case ESP_ERR_TIMEOUT:
-        return "TIMEOUT";
-    case ESP_ERR_NOT_FOUND:
-        return "NOT FOUND";
-    case ESP_ERR_INVALID_STATE:
-        return "STATE";
-    case ESP_ERR_INVALID_ARG:
-        return "ARG";
-    case ESP_FAIL:
-        return "FAIL";
-    default:
-        return "ERR";
-    }
-}
-
 static lv_obj_t *ui_label(lv_obj_t *parent,
                           const char *text,
                           int y,
@@ -612,13 +668,6 @@ static lv_obj_t *ui_bar(lv_obj_t *parent, int value)
     return bar;
 }
 
-static void ui_set_bar(int value)
-{
-    if (s_ui.bar) {
-        lv_bar_set_value(s_ui.bar, MAX(0, MIN(value, 100)), LV_ANIM_ON);
-    }
-}
-
 static void ui_set_hint(const char *normal)
 {
     if (!s_ui.hint) {
@@ -644,10 +693,162 @@ static void ui_set_hint(const char *normal)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Settings table callbacks                                           */
+/* ------------------------------------------------------------------ */
+/* Forward declaration: ui_enter_page is defined further below. */
+static void ui_enter_page(ui_page_t page);
+
+/* Each entry's live value text. Returned strings live in function-local
+ * static buffers — safe because the UI is driven by a single task. */
+
+static const char *ui_set_vol_text(void)
+{
+    static char buf[24];
+    snprintf(buf, sizeof(buf), "%u%%", (unsigned)hw_audio_get_volume());
+    return buf;
+}
+
+static const char *ui_set_bl_text(void)
+{
+    static char buf[24];
+    snprintf(buf, sizeof(buf), "%u%%", (unsigned)s_backlight);
+    return buf;
+}
+
+static const char *ui_set_bt_text(void)
+{
+    static char buf[24];
+    /* Live status: fully off, on (not linked), or linked. The persisted
+     * master switch is s_bt_on; the linked state is read live so the row
+     * reflects reality after a connect. */
+    if (!s_bt_on) {
+        snprintf(buf, sizeof(buf), "关");
+    } else if (bt_audio_is_connected()) {
+        snprintf(buf, sizeof(buf), "已连接");
+    } else {
+        snprintf(buf, sizeof(buf), "开");
+    }
+    return buf;
+}
+
+static const char *ui_set_sleep_text(void)
+{
+    static char buf[24];
+    if (s_standby_opt == STANDBY_OPT_NEVER) {
+        snprintf(buf, sizeof(buf), "永不");
+    } else {
+        snprintf(buf, sizeof(buf), "%u秒",
+                 (unsigned)s_standby_opts[s_standby_opt]);
+    }
+    return buf;
+}
+
+static const char *ui_set_rescan_text(void)
+{
+    static char buf[24];
+    /* Action item: show whether a cache is currently present so the user
+     * knows if the list is being served from it. Pressing A forces a fresh
+     * full-card scan that rewrites the cache. s_cache_present is refreshed
+     * only when the scan version changes (in the refresh loop), never
+     * per-frame. */
+    snprintf(buf, sizeof(buf), s_cache_present ? "有缓存" : "无缓存");
+    return buf;
+}
+
+static const char *ui_set_reset_text(void)
+{
+    return "按A还原";
+}
+
+/* Left/right adjust callbacks. Each owns its dirty-mark + set_action. */
+
+static void ui_set_vol_lr(int dir)
+{
+    /* 1% steps below 10% for fine control, else 10%. */
+    ui_volume_step(dir, 10);
+    ui_settings_mark_dirty(SETTINGS_DIRTY_VOLUME);
+    set_action(ui_set_vol_text());
+}
+
+static void ui_set_bl_lr(int dir)
+{
+    /* Same stepping as volume: 1% steps at/below 10% (down), else 10%. */
+    int v = (int)s_backlight;
+    int step = (v < 10 || (v == 10 && dir < 0)) ? 1 : 10;
+    v += dir * step;
+    /* Snap coarse upward moves onto multiples of 10 once out of the fine
+     * zone (9% + coarse -> 10%), keeping the scale tidy like volume. */
+    if (step == 1 && dir > 0 && v > 10) {
+        v = 10;
+    }
+    s_backlight = (uint8_t)MAX(0, MIN(v, 100));
+    hw_lcd_set_backlight(s_backlight);
+    ui_settings_mark_dirty(SETTINGS_DIRTY_BACKL);
+    set_action(ui_set_bl_text());
+}
+
+static void ui_set_bt_lr(int dir)
+{
+    /* Left = off, right = on. Toggling applies the routing gate and is
+     * persisted to NVS on the next flush. Switching OFF also powers the
+     * Bluetooth controller fully down (if it was up) to save power. */
+    s_bt_on = (dir > 0);
+    bt_audio_set_enabled(s_bt_on);
+    if (!s_bt_on) {
+        bt_audio_disable();
+    }
+    ui_settings_mark_dirty(SETTINGS_DIRTY_BT);
+    set_action(s_bt_on ? "蓝牙开" : "蓝牙关");
+}
+
+static void ui_set_sleep_lr(int dir)
+{
+    int opt = (int)s_standby_opt + dir;
+    opt = MAX(0, MIN(opt, (int)STANDBY_OPT_COUNT - 1));
+    s_standby_opt = (standby_opt_t)opt;
+    hw_lcd_set_standby_timeout((uint32_t)s_standby_opts[s_standby_opt] * 1000);
+    ui_settings_mark_dirty(SETTINGS_DIRTY_STBY);
+    set_action(ui_set_sleep_text());
+}
+
+/* A-press (enter) callbacks. */
+
+static void ui_set_bt_enter(void)
+{
+    /* Managing a sink needs the radio, so entering it implies BT ON — set the
+     * master switch and power the controller up lazily. This keeps the
+     * SETTING_BTOUT row (关/开/已连接) consistent with the live state. */
+    if (!s_bt_on) {
+        s_bt_on = true;
+        bt_audio_set_enabled(true);
+        ui_settings_mark_dirty(SETTINGS_DIRTY_BT);
+    }
+    ui_enter_page(UI_PAGE_BT);
+}
+
+static void ui_set_rescan_enter(void)
+{
+    /* Drop the on-card playlist cache and rebuild it from a fresh, full-card
+     * scan. The scan is asynchronous; the player falls back to a real scan
+     * whenever the cache is absent, so this is safe even while playing. */
+    player_rescan();
+    set_action("重建中...");
+}
+
+static void ui_set_reset_enter(void)
+{
+    /* Restore NVS to factory defaults: wipe the whole NVS partition and
+     * reboot. Boot will re-create every setting at its default. */
+    set_action("重置中...");
+    ui_refresh();
+    nvs_flash_erase();
+    esp_restart();
+}
+
 static void ui_build_settings(lv_obj_t *page)
 {
     s_setting_sel = 0;
-    static const char *const labels[SETTING_COUNT] = {"音量", "背光", "蓝牙", "息屏", "重置NVS"};
 
     for (int i = 0; i < SETTING_COUNT; i++) {
         lv_obj_t *cur = lv_label_create(page);
@@ -661,7 +862,7 @@ static void ui_build_settings(lv_obj_t *page)
          * (set_value) so items with different label lengths still line up
          * regardless of the (non-monospaced) byte width of the UTF-8 text. */
         lv_obj_t *txt = lv_label_create(page);
-        lv_label_set_text(txt, labels[i]);
+        lv_label_set_text(txt, s_settings_table[i].label);
         lv_obj_set_pos(txt, 18, s_setting_y[i]);
         lv_obj_set_style_text_font(txt, &lv_font_cn_16, 0);
         lv_obj_set_style_text_color(txt, lv_color_hex(UI_GRAY), 0);
@@ -681,11 +882,57 @@ static void ui_build_settings(lv_obj_t *page)
                          UI_GRAY, &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
 }
 
+/* Music root: playlist sources are the FOLDERS directly under /sdcard/Music.
+ * Each becomes one selectable source; <ALL> scans the whole Music tree. */
+#define MUSIC_ROOT PLAYER_ROOT "/Music"
+
+/* Discover playlist sources: <ALL> (every .mp3 under /sdcard/Music, recursive)
+ * plus each sub-directory directly under /sdcard/Music (one source each).
+ * Fills s_src_list[] / s_src_path[]; entry 0 is the whole-Music pseudo-source.
+ * Re-run each time the player page is (re)built so a newly added folder shows
+ * up. */
+static void ui_discover_sources(void)
+{
+    s_src_count = 0;
+    /* Entry 0: all of /sdcard/Music (recursive). */
+    s_src_list[0][0] = '\0';                 /* empty name => render as "<ALL>" */
+    snprintf(s_src_path[0], sizeof(s_src_path[0]), "%s", MUSIC_ROOT);
+
+    DIR *d = opendir(MUSIC_ROOT);
+    if (d != NULL) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL && s_src_count < SRC_MAX - 1) {
+            const char *fn = e->d_name;
+            if (fn[0] == '.') {
+                continue;
+            }
+            char child[PLAYER_PATH_LEN];
+            snprintf(child, sizeof(child), "%s/%s", MUSIC_ROOT, fn);
+            struct stat st;
+            if (stat(child, &st) != 0 || !S_ISDIR(st.st_mode)) {
+                continue;                    /* only sub-directories are sources */
+            }
+            int idx = s_src_count + 1;
+            /* snprintf (not strncpy) so the buffer is always NUL-terminated and
+             * GCC's -Wstringop-truncation stays quiet (fn is d_name, 255 bytes). */
+            snprintf(s_src_list[idx], sizeof(s_src_list[idx]), "%s", fn);
+            snprintf(s_src_path[idx], sizeof(s_src_path[idx]), "%s", child);
+            s_src_count = idx;
+        }
+        closedir(d);
+    }
+    s_src_count = (s_src_count == 0) ? 1 : s_src_count + 1;  /* ensure <ALL> present */
+    if (s_src_sel >= s_src_count) {
+        s_src_sel = 0;
+    }
+}
+
 static void ui_build_player(lv_obj_t *page)
 {
     s_mp3_sel = 0;
-    s_mp3_count = player_scan_count();
-    player_scan_start();   /* refresh the list in the background */
+    s_src_sel = 0;
+    s_pv = PV_SOURCE;
+    ui_discover_sources();
 
     for (int i = 0; i < MP3_LIST_ROWS; i++) {
         lv_obj_t *cur = lv_label_create(page);
@@ -704,8 +951,8 @@ static void ui_build_player(lv_obj_t *page)
         s_ui.pl_text[i] = txt;
     }
 
-    s_ui.pl_prog = ui_label(page, "空闲", 196, UI_GRAY, &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
-    s_ui.hint = ui_label(page, "上/下选择 A播放 B返回", 214, UI_GRAY, &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
+    s_ui.pl_prog = ui_label(page, "选择来源", 196, UI_GRAY, &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
+    s_ui.hint = ui_label(page, "上/下选 A进入 B返回", 214, UI_GRAY, &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
 }
 
 /* Bluetooth page: entering it kicks off a scan; the list fills live. */
@@ -965,6 +1212,24 @@ static void ui_enter_page(ui_page_t page)
         s_ui.page = NULL;
     }
     s_ui.page_id = page;
+    /* Entering the settings page: force a fresh cache-existence query on the
+     * next refresh (the cached value may be stale from a previous visit). */
+    if (page == UI_PAGE_SETTINGS) {
+        s_cache_queried_ver = 0;
+    }
+    /* Entering the Music Player: prefer the on-card playlist cache so the list
+     * shows instantly. Only falls back to a real scan (which rewrites the
+     * cache) when no cache exists — never blocks the UI on the FATFS walk. */
+    if (page == UI_PAGE_PLAYER) {
+        player_scan_with_cache();
+        /* If the cache was missing, a background scan is now in flight.
+         * Suppress any stale list in the track view until it publishes, so we
+         * don't flash the previous folder's contents. (The source picker is
+         * unaffected; s_mp3_loading only gates the PV_LIST rows.) */
+        if (player_scan_busy()) {
+            s_mp3_loading = true;
+        }
+    }
     /* Bring the Bluetooth stack up only when the user actually opens the
      * BLUETOOTH page (it is deferred from boot). Idempotent. */
     if (page == UI_PAGE_BT) {
@@ -1018,7 +1283,19 @@ static bool ui_external_changed(void)
     bool mnt = hw_sd_is_mounted();
     if (mnt != s_ext_sd_mounted) {
         s_ext_sd_mounted = mnt;
-        player_scan_start();   /* list may have appeared / disappeared */
+        /* Re-discover sources and refresh the current load so the picker and
+         * the track list reflect the new card state. */
+        if (s_ui.page_id == UI_PAGE_PLAYER) {
+            ui_discover_sources();
+            s_paint_src_sel = -1;
+        }
+        player_scan_with_cache();   /* prefer cache; scan only if absent */
+        /* A background scan may now be running; if we're showing the track
+         * list, suppress the stale rows until it publishes (same guard as
+         * entering a sub-folder). */
+        if (s_pv == PV_LIST && player_scan_busy()) {
+            s_mp3_loading = true;
+        }
         changed = true;
     }
 
@@ -1199,66 +1476,85 @@ void ui_refresh(void)
 
     switch (s_ui.page_id) {
     case UI_PAGE_SETTINGS: {
-        char buf[24];
         const bool sel_changed = (s_setting_sel != s_paint_set_sel);
+        /* Re-query cache existence only when the playlist scan version
+         * changes, not every frame — avoids hammering FATFS stat() while the
+         * toast is showing and makes scrolling feel responsive. */
+        const uint32_t scan_ver = player_scan_version();
+        if (scan_ver != s_cache_queried_ver) {
+            s_cache_present = player_cache_exists();
+            s_cache_queried_ver = scan_ver;
+        }
         for (int i = 0; i < SETTING_COUNT; i++) {
             const int sel = (i == s_setting_sel);
             ui_label_set(s_ui.set_cursor[i], sel ? ">" : " ");
-            if (sel_changed) {
-                lv_obj_set_style_text_color(s_ui.set_cursor[i], lv_color_hex(UI_CYAN), 0);
-                lv_obj_set_style_text_color(s_ui.set_text[i],
-                                            lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
-                lv_obj_set_style_text_color(s_ui.set_value[i],
-                                            lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
-            }
-            switch (i) {
-            case SETTING_VOLUME:
-                snprintf(buf, sizeof(buf), "%u%%", (unsigned)hw_audio_get_volume());
-                break;
-            case SETTING_BTOUT:
-                /* Live status: fully off, on (not linked), or linked. The
-                 * persisted master switch is s_bt_on; the linked state is
-                 * read live so the row reflects reality after a connect. */
-                if (!s_bt_on) {
-                    snprintf(buf, sizeof(buf), "关");
-                }
-                else if (bt_audio_is_connected()) {
-                    snprintf(buf, sizeof(buf), "已连接");
-                }
-                else {
-                    snprintf(buf, sizeof(buf), "开");
-                }
-                break;
-            case SETTING_BACKLIGHT:
-                snprintf(buf, sizeof(buf), "%u%%", (unsigned)s_backlight);
-                break;
-            case SETTING_STANDBY:
-                if (s_standby_opt == STANDBY_OPT_NEVER) {
-                    snprintf(buf, sizeof(buf), "永不");
-                } else {
-                    snprintf(buf, sizeof(buf), "%u秒",
-                             (unsigned)s_standby_opts[s_standby_opt]);
-                }
-                break;
-            case SETTING_RESET:
-                /* Action item: no value to show, just a hint to press A. */
-                snprintf(buf, sizeof(buf), "按A重置");
-                break;
-            default:
-                buf[0] = '\0';
-                break;
-            }
-            ui_label_set(s_ui.set_value[i], buf);
+            /* Set the highlight color every frame (not just on sel_changed):
+             * the list can be refreshed/rebuilt underneath us (e.g. cache load
+             * on player entry) and a sel_changed-gated repaint leaves a stale
+             * CYAN highlight on the wrong row. Cheap for a handful of rows. */
+            lv_obj_set_style_text_color(s_ui.set_cursor[i], lv_color_hex(UI_CYAN), 0);
+            lv_obj_set_style_text_color(s_ui.set_text[i],
+                                        lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
+            lv_obj_set_style_text_color(s_ui.set_value[i],
+                                        lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
+            const setting_entry_t *e = &s_settings_table[i];
+            const char *txt = e->value_fn ? e->value_fn() : "";
+            ui_label_set(s_ui.set_value[i], txt);
         }
         if (sel_changed) {
             s_paint_set_sel = s_setting_sel;
         }
-        ui_set_hint("上/下选 A进入 左/右设 B返回");
+        ui_set_hint("上/下选 A进入 B返回");
         break;
     }
     case UI_PAGE_PLAYER: {
-        /* The list is published by the background scan; re-fetch each pass so
-         * a completed scan shows up without a page rebuild. */
+        if (s_pv == PV_SOURCE) {
+            /* Source picker: <ALL> (whole card) + top-level folders. */
+            int top = s_src_sel - 1;
+            if (top < 0) {
+                top = 0;
+            }
+            if (top > s_src_count - MP3_LIST_ROWS) {
+                top = MAX(0, s_src_count - MP3_LIST_ROWS);
+            }
+            const bool sel_changed = (s_src_sel != s_paint_src_sel)
+                                   || (top != s_paint_mp3_top);
+            for (int i = 0; i < MP3_LIST_ROWS; i++) {
+                int idx = top + i;
+                const int sel = (idx == s_src_sel);
+                if (idx < s_src_count) {
+                    static char s_src_buf[MP3_NAME_LEN];
+                    const char *label = (s_src_list[idx][0] == '\0')
+                                      ? "<ALL>" : s_src_list[idx];
+                    copy_utf8_clipped(s_src_buf, sizeof(s_src_buf), label);
+                    ui_label_set(s_ui.pl_cursor[i], sel ? ">" : " ");
+                    /* Repaint the highlight every frame: the source/cache list
+                     * can change underneath us (player entry loads the cache
+                     * synchronously), and a sel_changed-gated repaint would
+                     * leave a stale CYAN highlight on the wrong row. */
+                    lv_obj_set_style_text_color(s_ui.pl_cursor[i],
+                                                lv_color_hex(UI_CYAN), 0);
+                    lv_obj_set_style_text_color(s_ui.pl_text[i],
+                        lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
+                    ui_label_set(s_ui.pl_text[i], s_src_buf);
+                }
+                else {
+                    ui_label_set(s_ui.pl_cursor[i], " ");
+                    ui_label_set(s_ui.pl_text[i], "");
+                }
+            }
+            if (sel_changed) {
+                s_paint_src_sel = s_src_sel;
+                s_paint_mp3_top = top;
+            }
+            ui_label_set(s_ui.status, "--");
+            ui_label_set(s_ui.pl_prog, "选择播放来源");
+            ui_set_hint("上/下选 A进入 B返回");
+            break;
+        }
+
+        /* PV_LIST: the track list (published by the background load). Re-fetch
+         * each pass so a completed load shows up without a page rebuild. */
         s_mp3_count = player_scan_count();
         if (s_mp3_sel >= s_mp3_count) {
             s_mp3_sel = s_mp3_count > 0 ? s_mp3_count - 1 : 0;
@@ -1272,10 +1568,14 @@ void ui_refresh(void)
         }
         const bool sel_changed = (s_mp3_sel != s_paint_mp3_sel)
                                  || (top != s_paint_mp3_top);
+        /* While a (sub)folder load is in flight, s_playlist still holds the
+         * previous folder's contents. Suppress drawing it so we don't flash
+         * the old list for a frame before the scan publishes the new one. */
+        const bool loading = s_mp3_loading && player_scan_busy();
         for (int i = 0; i < MP3_LIST_ROWS; i++) {
             int idx = top + i;
             const int sel = (idx == s_mp3_sel);
-            if (idx < s_mp3_count) {
+            if (!loading && idx < s_mp3_count) {
                 /* Static scratch buffer: this runs every UI refresh (16 ms). The
                  * lvgl task stack is only 10 KB, so a 256-byte stack array here
                  * overflows it under load (BT+SDSPI IRQs) and corrupts adjacent
@@ -1306,11 +1606,13 @@ void ui_refresh(void)
                      * the (selected) name fits the line. */
                 }
                 ui_label_set(s_ui.pl_cursor[i], sel ? ">" : " ");
-                if (sel_changed) {
-                    lv_obj_set_style_text_color(s_ui.pl_cursor[i], lv_color_hex(UI_CYAN), 0);
-                    lv_obj_set_style_text_color(s_ui.pl_text[i],
-                                                lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
-                }
+                /* Repaint the highlight every frame: the track list can be
+                 * refreshed/rebuilt underneath us (cache load on player entry,
+                 * or a live scan), and a sel_changed-gated repaint leaves a
+                 * stale CYAN highlight on the wrong row. */
+                lv_obj_set_style_text_color(s_ui.pl_cursor[i], lv_color_hex(UI_CYAN), 0);
+                lv_obj_set_style_text_color(s_ui.pl_text[i],
+                                            lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
                 ui_label_set(s_ui.pl_text[i], s_pl_name_buf);
             }
             else {
@@ -1322,32 +1624,40 @@ void ui_refresh(void)
             s_paint_mp3_sel = s_mp3_sel;
             s_paint_mp3_top = top;
         }
+        /* The folder load we armed on entering this view has now published its
+         * list (busy cleared) — stop suppressing the track rows. */
+        if (s_mp3_loading && !player_scan_busy()) {
+            s_mp3_loading = false;
+        }
         player_state_t st = player_state();
         ui_label_set(s_ui.status,
                      st == PLAYER_PLAYING ? ">>" : st == PLAYER_PAUSED ? "||" : "--");
         if (st == PLAYER_IDLE) {
             if (player_scan_busy()) {
-                ui_label_set(s_ui.pl_prog, "扫描中...");
+                ui_label_set(s_ui.pl_prog, "加载中...");
             }
             else {
-                ui_label_set(s_ui.pl_prog, s_mp3_count ? "空闲" : "无MP3文件");
+                ui_label_set(s_ui.pl_prog, s_mp3_count
+                             ? "循环:列表" : "无MP3文件");
             }
         }
         else {
-            /* Now-playing line: just the track name (no extension). */
+            /* Now-playing line: source name + track name (no extension). */
             char prog[28];
-            snprintf(prog, sizeof(prog), "%s", strip_ext(player_current_name()));
+            snprintf(prog, sizeof(prog), "[%s]%s",
+                     player_current_src_name(),
+                     strip_ext(player_current_name()));
             prog[27] = '\0';
             ui_label_set(s_ui.pl_prog, prog);
         }
         if (st == PLAYER_PLAYING) {
-            ui_set_hint("左/右切歌 上/下音量 A暂停 B停止");
+            ui_set_hint("左/右切歌 上/下音量 A暂停 B来源");
         }
         else if (st == PLAYER_PAUSED) {
-            ui_set_hint("左/右切歌 上/下音量 A继续 B停止");
+            ui_set_hint("左/右切歌 上/下音量 A继续 B来源");
         }
         else {
-            ui_set_hint("左/右切歌 上/下选择 A播放 B返回");
+            ui_set_hint("左/右切歌 上/下选择 A播放 B来源");
         }
         break;
     }
@@ -1569,8 +1879,23 @@ static void ui_action(void)
     ui_mark_dirty();                   /* an action may change visible state */
     switch (s_ui.page_id) {
     case UI_PAGE_PLAYER:
+        if (s_pv == PV_SOURCE) {
+            /* Enter the highlighted source: kick off a background load of that
+             * directory, then switch to the track-list view. The order is fixed
+             * by the filesystem + sort and cannot be reordered at runtime. */
+            if (s_src_count == 0) {
+                break;
+            }
+            player_load(PL_SRC_FOLDER, s_src_path[s_src_sel]);
+            s_pv = PV_LIST;
+            s_mp3_sel = 0;
+            s_paint_mp3_sel = -1;   /* force list repaint */
+            s_mp3_loading = true;   /* hide stale list until this load finishes */
+            set_action("加载中");
+            break;
+        }
         if (s_mp3_count == 0) {
-            set_action(player_scan_busy() ? "扫描中..." : "无MP3文件");
+            set_action(player_scan_busy() ? "加载中..." : "无MP3文件");
             break;
         }
         if (player_state() == PLAYER_PLAYING || player_state() == PLAYER_PAUSED) {
@@ -1581,7 +1906,7 @@ static void ui_action(void)
         }
         else {
             set_action("播放中");
-            player_play(player_scan_name(s_mp3_sel));
+            player_play(player_scan_path(s_mp3_sel));
         }
         break;
     case UI_PAGE_BT:
@@ -1603,28 +1928,16 @@ static void ui_action(void)
             bt_audio_scan_start();
         }
         break;
-    case UI_PAGE_SETTINGS:
-        /* The 蓝牙 item opens the Bluetooth management screen. Managing a
-         * sink needs the radio, so entering it implies BT ON — set the
-         * master switch and power the controller up lazily. This keeps the
-         * SETTING_BTOUT row (关/开/已连接) consistent with the live state. */
-        if (s_setting_sel == SETTING_BTOUT) {
-            if (!s_bt_on) {
-                s_bt_on = true;
-                bt_audio_set_enabled(true);
-                ui_settings_mark_dirty(SETTINGS_DIRTY_BT);
-            }
-            ui_enter_page(UI_PAGE_BT);
-        }
-        else if (s_setting_sel == SETTING_RESET) {
-            /* Restore NVS to factory defaults: wipe the whole NVS partition
-             * and reboot. Boot will re-create every setting at its default. */
-            set_action("重置中...");
-            ui_refresh();
-            nvs_flash_erase();
-            esp_restart();
+    case UI_PAGE_SETTINGS: {
+        /* A press dispatches to the selected item's on_enter callback. Action
+         * items (重建列表 / 重置NVS) do their work there; the 蓝牙 item opens
+         * the Bluetooth management screen. Items with no on_enter are inert. */
+        const setting_entry_t *e = &s_settings_table[s_setting_sel];
+        if (e->on_enter) {
+            e->on_enter();
         }
         break;
+    }
     case UI_PAGE_EBOOK_LIST:
         if (ebook_scan_count() == 0) {
             set_action("无TXT文件");
@@ -1661,9 +1974,14 @@ static void ui_adjust(int step)
     switch (s_ui.page_id) {
     case UI_PAGE_SETTINGS:
         s_setting_sel = (s_setting_sel - step + SETTING_COUNT) % SETTING_COUNT;
-        set_action("选择");
         break;
     case UI_PAGE_PLAYER:
+        if (s_pv == PV_SOURCE) {
+            if (s_src_count > 0) {
+                s_src_sel = (s_src_sel - step + s_src_count) % s_src_count;
+            }
+            break;
+        }
         if (player_state() == PLAYER_PLAYING ||
             player_state() == PLAYER_PAUSED) {
             /* While a track plays, up/down adjusts the output volume
@@ -1677,14 +1995,12 @@ static void ui_adjust(int step)
         }
         else if (s_mp3_count > 0) {
             s_mp3_sel = (s_mp3_sel - step + s_mp3_count) % s_mp3_count;
-            set_action("选择");
         }
         break;
     case UI_PAGE_BT: {
         int count = bt_audio_device_count();
         if (count > 0) {
             s_bt_sel = (s_bt_sel - step + count) % count;
-            set_action("选择");
         }
         break;
     }
@@ -1692,14 +2008,15 @@ static void ui_adjust(int step)
         int count = ebook_scan_count();
         if (count > 0) {
             s_eb_sel = (s_eb_sel - step + count) % count;
-            set_action("选择");
         }
         break;
     }
     default:
         return;
     }
-    ui_refresh();
+    /* No synchronous ui_refresh(): the 60Hz main loop repaints from
+     * s_ui_dirty, so rapid key repeats are never blocked by a redraw inside
+     * the input callback. */
 }
 
 /* Left/right changes the value of the selected settings item (or flips the
@@ -1715,6 +2032,9 @@ static void ui_adjust_lr(int dir)
      * - dir < 0: previous track (wraps to the last at the boundary)
      * - dir > 0: next track (wraps to the first at the boundary) */
     if (s_ui.page_id == UI_PAGE_PLAYER) {
+        if (s_pv == PV_SOURCE) {
+            return;   /* source picker: left/right are no-ops */
+        }
         int count = player_scan_count();
         if (count == 0) {
             set_action(player_scan_busy() ? "扫描中..." : "无MP3文件");
@@ -1765,66 +2085,11 @@ static void ui_adjust_lr(int dir)
     if (s_ui.page_id != UI_PAGE_SETTINGS) {
         return;
     }
-    switch (s_setting_sel) {
-    case SETTING_VOLUME: {
-        /* 1% steps below 10% for fine control, else 10%. */
-        ui_volume_step(dir, 10);
-        ui_settings_mark_dirty(SETTINGS_DIRTY_VOLUME);
-        char buf[24];
-        snprintf(buf, sizeof(buf), "VOL %u%%", (unsigned)hw_audio_get_volume());
-        set_action(buf);
-        break;
+    const setting_entry_t *e = &s_settings_table[s_setting_sel];
+    if (e->on_lr) {
+        e->on_lr(dir);          /* callback owns dirty-marking + set_action */
+        ui_refresh();
     }
-    case SETTING_BTOUT:
-        /* Left = off, right = on. Toggling applies the routing gate and is
-         * persisted to NVS on the next flush. Switching OFF also powers the
-         * Bluetooth controller fully down (if it was up) to save power. */
-        s_bt_on = (dir > 0);
-        bt_audio_set_enabled(s_bt_on);
-        if (!s_bt_on) {
-            bt_audio_disable();
-        }
-        ui_settings_mark_dirty(SETTINGS_DIRTY_BT);
-        set_action(s_bt_on ? "蓝牙开" : "蓝牙关");
-        break;
-    case SETTING_BACKLIGHT: {
-        /* Same stepping as volume: 1% steps at/below 10% (down), else 10%. */
-        int v = (int)s_backlight;
-        int step = (v < 10 || (v == 10 && dir < 0)) ? 1 : 10;
-        v += dir * step;
-        /* Snap coarse upward moves onto multiples of 10 once out of the fine
-         * zone (9% + coarse -> 10%), keeping the scale tidy like volume. */
-        if (step == 1 && dir > 0 && v > 10) {
-            v = 10;
-        }
-        s_backlight = (uint8_t)MAX(0, MIN(v, 100));
-        hw_lcd_set_backlight(s_backlight);
-        ui_settings_mark_dirty(SETTINGS_DIRTY_BACKL);
-        char buf[24];
-        snprintf(buf, sizeof(buf), "背光 %u%%", (unsigned)s_backlight);
-        set_action(buf);
-        break;
-    }
-    case SETTING_STANDBY: {
-        int opt = (int)s_standby_opt + dir;
-        opt = MAX(0, MIN(opt, (int)STANDBY_OPT_COUNT - 1));
-        s_standby_opt = (standby_opt_t)opt;
-        hw_lcd_set_standby_timeout((uint32_t)s_standby_opts[s_standby_opt] * 1000);
-        ui_settings_mark_dirty(SETTINGS_DIRTY_STBY);
-        char buf[24];
-        if (s_standby_opt == STANDBY_OPT_NEVER) {
-            snprintf(buf, sizeof(buf), "息屏 永不");
-        } else {
-            snprintf(buf, sizeof(buf), "息屏 %u秒",
-                     (unsigned)s_standby_opts[s_standby_opt]);
-        }
-        set_action(buf);
-        break;
-    }
-    default:
-        return;
-    }
-    ui_refresh();
 }
 
 static void ui_key_event_cb(lv_event_t *e)
@@ -1867,12 +2132,25 @@ static void ui_key_event_cb(lv_event_t *e)
     if (key == LV_KEY_ESC) {
         ui_settings_flush();   /* commit any pending change before leaving */
         if (s_ui.page_id == UI_PAGE_PLAYER) {
-            /* B while playing = stop but stay on the page; while idle it
-             * falls through to leave back to the menu. */
+            if (s_pv == PV_SOURCE) {
+                /* On the source picker: B returns to the main menu. */
+                ui_show_menu();
+                return;
+            }
+            /* PV_LIST: B while playing/paused = stop but stay; while idle,
+             * return up one level to the source picker (not the menu). */
             if (player_state() != PLAYER_IDLE) {
                 player_stop();
                 return;
             }
+            s_pv = PV_SOURCE;
+            s_src_sel = 0;
+            s_paint_src_sel = -1;   /* force source picker repaint */
+            ui_mark_dirty();        /* ensure ui_refresh() actually repaints,
+                                       otherwise the stale PV_LIST stays on
+                                       screen until the next B press */
+            ui_refresh();
+            return;
         }
         if (s_ui.page_id == UI_PAGE_BT) {
             /* Return to Settings, the screen this sub-page was opened from. */

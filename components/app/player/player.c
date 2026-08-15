@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <dirent.h>
 
 #include "mp3dec.h"
@@ -62,55 +64,152 @@ static int s_consumed;
 static int16_t s_pcm[MP3_PCM_MAX];
 EXT_RAM_BSS_ATTR static int16_t s_stereo[MP3_PCM_MAX];
 
-/* --- Background SD scan -------------------------------------------------
+/* --- Background playlist load ------------------------------------------
  * opendir/readdir over SDSPI is slow (tens of ms), so the track list is built
- * on its own task. The result is published as a snapshot: the work buffer is
- * filled, then copied into the live array and the version counter bumped.
- * The UI polls the version at its 16 ms cadence, so it never blocks on the
- * scan. EXT_RAM_BSS keeps the two 4 KB lists out of internal DRAM. */
+ * on its own task. The result is published as an IMMUTABLE snapshot via
+ * double buffering: a loader fills one playlist_t buffer, then atomically
+ * swaps the s_playlist pointer, so readers (UI / decode loop) always see a
+ * complete, consistent list and never a half-written one. The UI polls
+ * s_playlist->version at its 16 ms cadence, so it never blocks on the load.
+ * EXT_RAM_BSS keeps the two playlist buffers out of internal DRAM. */
 #define PLAYER_SCAN_MAX 64
 
-EXT_RAM_BSS_ATTR static char s_scan_work[PLAYER_SCAN_MAX][MP3_NAME_LEN];
-EXT_RAM_BSS_ATTR static char s_scan_names[PLAYER_SCAN_MAX][MP3_NAME_LEN];
-static int s_scan_count;
-static uint32_t s_scan_version;
+/* Double buffer: loaders write one, readers see the other via s_playlist. */
+EXT_RAM_BSS_ATTR static playlist_t s_pl_a;
+EXT_RAM_BSS_ATTR static playlist_t s_pl_b;
+/* The live, published snapshot. Swapped atomically (32-bit Xtensa word
+ * store is atomic) after a buffer is fully filled. READ-ONLY after publish. */
+static playlist_t *volatile s_playlist = &s_pl_a;
+
+static int s_scan_count;          /* mirrored from s_playlist->count for the compat shell */
+static uint32_t s_scan_version;   /* mirrored from s_playlist->version */
 static bool s_scan_busy;
 static bool s_scan_pending;
 static TaskHandle_t s_scan_task;
 
-static int scan_name_cmp(const void *a, const void *b)
+/* Forward declaration: a completed real scan persists its result to the
+ * on-card cache so the next player entry is instantaneous. Defined further
+ * down with the cache read/parse helpers. */
+static void playlist_cache_write(const playlist_t *pl);
+
+/* Compare two entries by name, case-insensitive, for a stable folder order. */
+static int playlist_entry_cmp(const void *a, const void *b)
 {
-    return strcasecmp((const char *)a, (const char *)b);
+    return strcasecmp(((const playlist_entry_t *)a)->name,
+                      ((const playlist_entry_t *)b)->name);
 }
 
-/* One directory walk; fills s_scan_work and publishes the snapshot. */
-static void scan_do(void)
+/* Publish a filled work buffer as the new live snapshot (atomic pointer
+ * swap). `work` must be one of s_pl_a / s_pl_b NOT currently live. */
+static void playlist_publish(playlist_t *work, int n, playlist_src_t src)
 {
-    int n = 0;
-    DIR *d = opendir(PLAYER_ROOT);
-    if (d != NULL) {
-        struct dirent *e;
-        while ((e = readdir(d)) != NULL && n < PLAYER_SCAN_MAX - 1) {
-            const char *fn = e->d_name;
+    work->count = n;
+    work->src = src;
+    work->version = s_scan_version + 1;   /* monotonic; UI sees a fresh list */
+    s_playlist = work;                    /* atomic swap: readers now see it */
+    s_scan_count = n;
+    s_scan_version = work->version;
+}
+
+/* Recursively collect .mp3 files under `dir` into `work`, in-place. `depth`
+ * bounds recursion so a pathological symlink/cycle can't overflow the stack.
+ * Returns the running total; stops early once PLAYER_SCAN_MAX is reached. */
+static int playlist_collect_dir(playlist_t *work, int n, const char *dir,
+                                int depth)
+{
+    if (depth > 16 || n >= PLAYER_SCAN_MAX) {
+        return n;
+    }
+    DIR *d = opendir(dir);
+    if (d == NULL) {
+        return n;
+    }
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && n < PLAYER_SCAN_MAX) {
+        const char *fn = e->d_name;
+        if (fn[0] == '.') {                 /* skip ".", "..", hidden */
+            continue;
+        }
+        char child[PLAYER_PATH_LEN];
+        snprintf(child, sizeof(child), "%s/%s", dir, fn);
+
+        /* Decide file vs directory without relying on d_type (unreliable on
+         * FATFS): stat the entry. A directory is recursed into; a regular
+         * file ending in .mp3 is added. */
+        struct stat st;
+        if (stat(child, &st) != 0) {
+            continue;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            n = playlist_collect_dir(work, n, child, depth + 1);
+        } else if (S_ISREG(st.st_mode)) {
             int len = (int)strlen(fn);
             if (len > 4 && strcasecmp(fn + len - 4, ".mp3") == 0) {
-                strncpy(s_scan_work[n], fn, MP3_NAME_LEN - 1);
-                s_scan_work[n][MP3_NAME_LEN - 1] = '\0';
+                snprintf(work->items[n].path, sizeof(work->items[n].path),
+                         "%s", child);
+                /* snprintf (not strncpy): always NUL-terminated, and quiet
+                 * under -Wstringop-truncation. */
+                snprintf(work->items[n].name, sizeof(work->items[n].name),
+                         "%s", fn);
                 n++;
             }
         }
-        closedir(d);
     }
-    /* readdir order is arbitrary; sort so the list is stable across scans. */
-    if (n > 1) {
-        qsort(s_scan_work, (size_t)n, MP3_NAME_LEN, scan_name_cmp);
-    }
-    /* Publish: names first, then count, then version (the UI fetches count
-     * before indexing, so it either sees the old list or the new one). */
-    memcpy(s_scan_names, s_scan_work, (size_t)n * MP3_NAME_LEN);
-    s_scan_count = n;
-    s_scan_version++;
+    closedir(d);
+    return n;
 }
+
+/* Load the playlist from a folder source: a recursive scan of the WHOLE SD
+ * card. Fills the idle buffer and publishes it. A future playlist-file source
+ * would fill the SAME entry array (keeping file order) and call
+ * playlist_publish() — the playback layer is unchanged. */
+/* Name of the source currently loaded, for the UI. "整卡" when the root is
+ * the whole card, else the folder's basename. */
+static char s_src_name[MP3_NAME_LEN];
+
+static void player_load_folder(const char *root)
+{
+    playlist_t *work = (s_playlist == &s_pl_a) ? &s_pl_b : &s_pl_a;
+    int n = playlist_collect_dir(work, 0, root, 0);
+    /* readdir/stat order is arbitrary across directories; sort by name so the
+     * list is stable across reloads. Folder source only — a playlist-file
+     * source keeps its file order and would skip this sort. */
+    if (n > 1) {
+        qsort(work->items, (size_t)n, sizeof(playlist_entry_t),
+              playlist_entry_cmp);
+    }
+    /* Remember the display name: the whole-Music source -> "整卡", else the
+     * selected sub-folder's basename. Bounded copy so GCC's
+     * -Wformat-truncation stays quiet (root can be up to PLAYER_PATH_LEN
+     * bytes; FATFS leaf names cap at 255). */
+    const char *b = strrchr(root, '/');
+    const char *base = (b != NULL) ? b + 1 : root;
+    if (strcasecmp(base, "Music") == 0) {
+        snprintf(s_src_name, sizeof(s_src_name), "整卡");
+    } else {
+        size_t blen = strnlen(base, MP3_NAME_LEN - 1);
+        memcpy(s_src_name, base, blen);
+        s_src_name[blen] = '\0';
+    }
+    playlist_publish(work, n, PL_SRC_FOLDER);
+    /* The on-card cache represents the WHOLE-CARD list only. A sub-folder
+     * browse must NOT overwrite it, or the next player entry (which always
+     * loads the cache as "整卡") would show the wrong list. Persist the
+     * cache solely when scanning the whole card. */
+    if (strcmp(root, PLAYER_ROOT) == 0) {
+        playlist_cache_write(work);
+    }
+}
+
+const char *player_current_src_name(void)
+{
+    return s_src_name;
+}
+
+/* The directory the next/last folder load scans. Defaults to the whole card
+ * (PLAYER_ROOT). Set by player_load(); read by scan_task. Declared at file
+ * scope (before scan_task) so the loader task can see it. */
+static char s_load_root[PLAYER_PATH_LEN] = PLAYER_ROOT;
 
 static void scan_task(void *arg)
 {
@@ -120,14 +219,23 @@ static void scan_task(void *arg)
         s_scan_busy = true;
         do {
             s_scan_pending = false;
-            scan_do();
-        } while (s_scan_pending);   /* a request landed mid-scan: redo */
+            player_load_folder(s_load_root);
+        } while (s_scan_pending);   /* a request landed mid-load: redo */
         s_scan_busy = false;
     }
 }
 
-void player_scan_start(void)
+void player_load(playlist_src_t src, const char *root)
 {
+    /* Only the folder source is implemented; ignore unknown sources. A future
+     * PL_SRC_M3U would dispatch to a player_load_m3u() here without any change
+     * to the playback/loop logic. */
+    if (src != PL_SRC_FOLDER) {
+        ESP_LOGW(TAG, "playlist source %d not implemented", src);
+        return;
+    }
+    strncpy(s_load_root, root ? root : PLAYER_ROOT, sizeof(s_load_root) - 1);
+    s_load_root[sizeof(s_load_root) - 1] = '\0';
     s_scan_pending = true;
     if (s_scan_task != NULL) {
         xTaskNotifyGive(s_scan_task);
@@ -154,7 +262,15 @@ const char *player_scan_name(int i)
     if (i < 0 || i >= s_scan_count) {
         return "";
     }
-    return s_scan_names[i];
+    return s_playlist->items[i].name;
+}
+
+const char *player_scan_path(int i)
+{
+    if (i < 0 || i >= s_scan_count) {
+        return "";
+    }
+    return s_playlist->items[i].path;
 }
 
 /* Skip an ID3v2 tag at the head of the open file so the MP3 decoder doesn't
@@ -318,12 +434,13 @@ static void decode_loop(void)
             s_path[sizeof(s_path) - 1] = '\0';
             strncpy(s_name, s_new_name, sizeof(s_name) - 1);
             s_name[sizeof(s_name) - 1] = '\0';
-            /* Resolve the loaded name back to its list index so the UI can
-             * drive next/prev. A name missing from the (possibly stale) scan
-             * list yields -1, which is harmless for index-based navigation. */
+            /* Resolve the loaded path back to its list index so the UI can
+             * drive next/prev and list-loop works. A path missing from the
+             * (possibly stale) list yields -1, which is harmless for
+             * index-based navigation and just disables auto-advance. */
             s_index = -1;
-            for (int k = 0; k < s_scan_count; k++) {
-                if (strncmp(s_scan_names[k], s_name, MP3_NAME_LEN - 1) == 0) {
+            for (int k = 0; k < s_playlist->count; k++) {
+                if (strcmp(s_playlist->items[k].path, s_path) == 0) {
                     s_index = k;
                     break;
                 }
@@ -385,7 +502,21 @@ static void decode_loop(void)
         if (s_new_req) {
             continue;   /* switch to the newly requested track */
         }
-        break;
+        if (s_stop_req) {
+            break;      /* user stopped: end the loop */
+        }
+        /* Natural end of track: list-loop mode. Advance to the next entry
+         * (wrapping at the end) and keep playing. If the current track isn't
+         * in the list (s_index < 0) or the list is empty, just stop. */
+        int cnt = s_playlist->count;
+        if (cnt <= 0 || s_index < 0) {
+            break;
+        }
+        int next = (s_index + 1) % cnt;
+        player_play(s_playlist->items[next].path);
+        /* player_play() set s_new_req + s_stop_req; the loop top will pick up
+         * the new track. Re-run rather than break so the next song starts. */
+        continue;
     }
     s_state = PLAYER_IDLE;
 }
@@ -419,9 +550,137 @@ void player_init(void)
         s_scan_task = NULL;
     }
     ESP_LOGI(TAG, "[PLAYER] player + scan tasks started");
-    /* Pre-warm the list (SD is mounted by app_main before player_init). The
-     * UI re-requests scans on page entry / SD hotplug. */
-    player_scan_start();
+    /* Pre-warm the list (SD is mounted by app_main before player_init). Prefer
+     * the on-card cache so a re-entered player shows the list instantly; only
+     * fall back to a real scan (which rewrites the cache) when no cache exists.
+     * The UI can also force a rebuild via player_rescan(). */
+    player_scan_with_cache();
+}
+
+/* --- On-card playlist cache -------------------------------------------
+ * A flat text file (PLAYER_CACHE_FILE) of TAB-separated records:
+ *     <src> <TAB> <title> <TAB> <path> <LF>
+ * This avoids pulling in a JSON parser for a list that can be a few hundred
+ * entries. Loading the cache is O(n) line reads and is effectively
+ * instantaneous versus the FATFS walk that a real scan requires. */
+
+/* Append one entry to the cache file (already open in append mode). */
+static void playlist_cache_write_entry(FILE *f, const playlist_entry_t *e)
+{
+    fprintf(f, "%s\t%s\n", e->name, e->path);
+}
+
+/* Serialize the just-published snapshot to the cache file. Called from the
+ * scan task after a real scan completes, so a re-entry reads instantly. */
+static void playlist_cache_write(const playlist_t *pl)
+{
+    FILE *f = fopen(PLAYER_CACHE_FILE, "w");
+    if (f == NULL) {
+        ESP_LOGW(TAG, "cache write failed (open %s)", PLAYER_CACHE_FILE);
+        return;
+    }
+    for (int i = 0; i < pl->count; i++) {
+        playlist_cache_write_entry(f, &pl->items[i]);
+    }
+    fclose(f);
+    ESP_LOGI(TAG, "wrote %d entries to cache %s", pl->count, PLAYER_CACHE_FILE);
+}
+
+/* Parse one cache line into `e`. Returns true on success. `line` is mutated
+ * (NUL-terminated at field boundaries). Any malformed line fails the load so
+ * a corrupt cache degrades to a real scan instead of a broken list. */
+static bool playlist_cache_parse_line(char *line, playlist_entry_t *e)
+{
+    /* Strip trailing CR/LF. */
+    size_t len = strlen(line);
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+        line[--len] = '\0';
+    }
+    if (len == 0) {
+        return false;
+    }
+    char *p_title = line;
+    char *p_path = strchr(p_title, '\t');
+    if (p_path == NULL) {
+        return false;
+    }
+    *p_path++ = '\0';
+
+    size_t title_len = strlen(p_title);
+    if (title_len == 0 || title_len >= MP3_NAME_LEN) {
+        return false;
+    }
+    size_t path_len = strlen(p_path);
+    if (path_len == 0 || path_len >= PLAYER_PATH_LEN) {
+        return false;
+    }
+    memcpy(e->name, p_title, title_len + 1);
+    memcpy(e->path, p_path, path_len + 1);
+    return true;
+}
+
+/* Load the playlist from the cache file into `work` and publish it. Returns
+ * the entry count, or 0 (and publishes an empty list) if the cache is
+ * missing/corrupt. A 0-return *may* mean a legitimately empty card, so the
+ * caller still triggers a real scan to confirm and (re)write the cache. */
+static int playlist_load_from_cache(playlist_t *work)
+{
+    FILE *f = fopen(PLAYER_CACHE_FILE, "r");
+    if (f == NULL) {
+        return 0;   /* no cache: caller will scan + write */
+    }
+    int n = 0;
+    char line[PLAYER_PATH_LEN + MP3_NAME_LEN + 32];
+    bool corrupt = false;
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (n >= PLAYER_SCAN_MAX) {
+            break;   /* cache larger than we keep: trust count, skip rest */
+        }
+        if (!playlist_cache_parse_line(line, &work->items[n])) {
+            corrupt = true;
+            break;
+        }
+        n++;
+    }
+    fclose(f);
+    if (corrupt) {
+        ESP_LOGW(TAG, "cache corrupt, dropping it");
+        unlink(PLAYER_CACHE_FILE);
+        return 0;
+    }
+    /* Cache order is already the sorted order captured at write time; no
+     * re-sort needed. Publish as the whole-card folder source. */
+    snprintf(s_src_name, sizeof(s_src_name), "整卡");
+    playlist_publish(work, n, PL_SRC_FOLDER);
+    ESP_LOGI(TAG, "loaded %d entries from cache %s", n, PLAYER_CACHE_FILE);
+    return n;
+}
+
+bool player_cache_exists(void)
+{
+    struct stat st;
+    return stat(PLAYER_CACHE_FILE, &st) == 0;
+}
+
+void player_scan_with_cache(void)
+{
+    playlist_t *work = (s_playlist == &s_pl_a) ? &s_pl_b : &s_pl_a;
+    int n = playlist_load_from_cache(work);
+    if (n == 0) {
+        /* No usable cache: do a real background scan; scan_task writes the
+         * cache on completion. Use the whole-card root. */
+        ESP_LOGI(TAG, "no cache, scanning SD");
+        player_load(PL_SRC_FOLDER, PLAYER_ROOT);
+    }
+    /* Else: cache published instantly; nothing else to do. */
+}
+
+void player_rescan(void)
+{
+    /* Drop any stale cache first, then force a real scan which rewrites it. */
+    unlink(PLAYER_CACHE_FILE);
+    ESP_LOGI(TAG, "forced rescan of SD");
+    player_load(PL_SRC_FOLDER, PLAYER_ROOT);
 }
 
 player_state_t player_state(void)
@@ -434,7 +693,7 @@ const char *player_current_name(void)
     return s_name;
 }
 
-void player_play(const char *name)
+void player_play(const char *path)
 {
     /* 原则3：audio 未 ready 时不接受播放请求，避免 feed task 不存在导致
      * decode 卡死（"同一次开机随机失败"的根因之一）。 */
@@ -442,16 +701,23 @@ void player_play(const char *name)
         ESP_LOGE(TAG, "[ERROR] play requested but audio not ready, ignored");
         return;
     }
-    /* Paths and names use one shared upper bound (MP3_NAME_LEN == 256, the
-     * FATFS LFN limit) so PLAYER_ROOT "/<name>" can never exceed PLAYER_PATH_LEN.
-     * We only warn/truncate past that bound — multi-byte titles stay intact. */
-    size_t nlen = strnlen(name, MP3_NAME_LEN + 1);
-    if (nlen > MP3_NAME_LEN) {
-        ESP_LOGW(TAG, "name too long (%u), truncating", (unsigned)nlen);
+    /* `path` is absolute if it begins with '/', else it's a legacy basename
+     * resolved under PLAYER_ROOT. Either way the full path is what we open. */
+    char full[PLAYER_PATH_LEN];
+    if (path[0] == '/') {
+        snprintf(full, sizeof(full), "%s", path);
+    } else {
+        snprintf(full, sizeof(full), PLAYER_ROOT "/%s", path);
     }
-    strncpy(s_new_name, name, sizeof(s_new_name) - 1);
-    s_new_name[sizeof(s_new_name) - 1] = '\0';
-    snprintf(s_new_path, sizeof(s_new_path), PLAYER_ROOT "/%s", s_new_name);
+    snprintf(s_new_path, sizeof(s_new_path), "%s", full);
+
+    /* Display name = basename of the path. Bounded copy (FATFS LFN caps the
+     * leaf name at 255 bytes) so GCC's -Wformat-truncation stays quiet. */
+    const char *base = strrchr(full, '/');
+    base = (base != NULL) ? base + 1 : full;
+    size_t blen = strnlen(base, MP3_NAME_LEN - 1);
+    memcpy(s_new_name, base, blen);
+    s_new_name[blen] = '\0';
 
     s_new_req = true;
     s_stop_req = true;          /* ask any current decode to stop */
@@ -471,7 +737,10 @@ void player_play_index(int i)
     if (i < 0 || i >= player_scan_count()) {
         return;
     }
-    player_play(player_scan_name(i));
+    /* Play by absolute path from the (immutable) playlist snapshot. The index
+     * itself is read-only here — callers may only SELECT an entry, never
+     * reorder the list. */
+    player_play(player_scan_path(i));
 }
 
 int player_current_index(void)
@@ -518,4 +787,8 @@ void player_stop(void)
         xTaskNotifyGive(s_task);
     }
     s_state = PLAYER_IDLE;
+    /* Forget which track we were on so index-based next/prev (driven from the
+     * UI list cursor) starts from a clean base after a stop, instead of the
+     * stale whole-card index when we later open a small sub-folder. */
+    s_index = -1;
 }
