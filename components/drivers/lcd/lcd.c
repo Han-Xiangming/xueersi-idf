@@ -53,13 +53,25 @@ static volatile bool s_lcd_first_flush_done;
 static bool s_bl_inited;
 static uint8_t s_bl_percent = 100;   /* last set brightness, for hw_lcd_get_backlight */
 
-/* Guards lv_display_flush_ready so it is signalled exactly once per flush:
- * on the success path it is signalled from the asynchronous DMA tx-done
- * callback (lcd_flush_ready_cb), while on the error path (where no DMA
- * transfer completes) it is signalled inline. Without this guard the
- * success path would call it twice — once here and again from the tx-done
- * callback — which corrupts LVGL's flush state and can deadlock rendering. */
-static bool s_flush_ready_pending = false;
+/* Flush completion tracking. lvgl_flush_cb() queues one tx_color per row
+ * (see below); every queued transfer produces one lcd_flush_ready_cb() from
+ * the SPI ISR. s_flush_pending counts how many row transfers are still in
+ * flight, and lv_display_flush_ready() is signalled exactly once per flush —
+ * when the LAST row's DMA completes (success path) or after the drain in
+ * lcd_flush_abort() (error path, where no DMA completes). Signalling early
+ * (e.g. after the first row, as a plain "pending" bool would) lets LVGL
+ * reuse the draw buffer while the remaining rows are still being DMA-read
+ * out of px_map, which tears the panel.
+ *
+ * Both counters are touched from the SPI ISR and from the LVGL render task,
+ * so every access goes through the s_flush_mux critical section. The counter
+ * is ADDITIVE at flush start (s_flush_pending += rows, not an overwrite): a
+ * late completion callback from a previous flush can overlap the start of the
+ * next flush, and an overwrite would drop that row so the next flush would
+ * release LVGL one row too early. */
+static portMUX_TYPE s_flush_mux = portMUX_INITIALIZER_UNLOCKED;
+static volatile int32_t s_flush_pending = 0;    /* row DMA transfers in flight */
+static volatile bool s_flush_ready_sent = false; /* lv_display_flush_ready() delivered */
 
 /* ---- Auto screen-off (standby) ----
  * Idle timer: after s_standby_timeout_ms of no activity the backlight is
@@ -151,26 +163,74 @@ static bool lcd_flush_ready_cb(esp_lcd_panel_io_handle_t panel_io,
     (void)panel_io;
     (void)edata;
 
+    /* Runs in the SPI ISR: one call per queued tx_color DMA transfer. The
+     * last in-flight transfer of a flush brings the counter to 0, and only
+     * then is LVGL released. The s_flush_ready_sent guard keeps the release
+     * to exactly once even if an abort drain races this callback. */
     lv_display_t *display = (lv_display_t *)user_ctx;
-    if (s_flush_ready_pending) {
-        s_flush_ready_pending = false;
+    bool signal_ready = false;
+    portENTER_CRITICAL_ISR(&s_flush_mux);
+    if (--s_flush_pending <= 0 && !s_flush_ready_sent) {
+        s_flush_ready_sent = true;
         s_lcd_first_flush_done = true;
+        signal_ready = true;
+    }
+    portEXIT_CRITICAL_ISR(&s_flush_mux);
+    if (signal_ready) {
         lv_display_flush_ready(display);
     }
     return false;
+}
+
+/* Error path for lvgl_flush_cb: rows that were never queued will never get a
+ * completion callback, so drop them from the counter first, then drain-wait
+ * for the in-flight transfers before releasing LVGL exactly once. Skipping
+ * the drain would let a late callback corrupt the next flush's count and
+ * release LVGL too early. */
+static void lcd_flush_abort(lv_display_t *display, int rows_total, int rows_queued)
+{
+    portENTER_CRITICAL(&s_flush_mux);
+    s_flush_pending -= (rows_total - rows_queued);
+    portEXIT_CRITICAL(&s_flush_mux);
+
+    int wait = 0;
+    while (s_flush_pending > 0 && wait++ < 200) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    if (wait >= 200) {
+        ESP_LOGW(TAG, "flush abort: %d row transfers still pending", (int)s_flush_pending);
+    }
+
+    portENTER_CRITICAL(&s_flush_mux);
+    const bool needs_signal = !s_flush_ready_sent;
+    if (needs_signal) {
+        s_flush_ready_sent = true;
+        s_lcd_first_flush_done = true;
+    }
+    portEXIT_CRITICAL(&s_flush_mux);
+    if (needs_signal) {
+        lv_display_flush_ready(display);
+    }
 }
 
 static void lvgl_flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t *px_map)
 {
     esp_lcd_panel_io_handle_t io_handle = lv_display_get_user_data(display);
     const int width = area->x2 - area->x1 + 1;
-    /* The flush is now in flight. It will be signalled "ready" exactly once:
-     * either from lcd_flush_ready_cb when the final async tx_color DMA
-     * completes (success path), or inline below on a transfer error (where
-     * no DMA completes and the callback will never fire). */
-    s_flush_ready_pending = true;
+    const int rows = area->y2 - area->y1 + 1;
     const size_t line_bytes = (size_t)width * sizeof(uint16_t);
     const uint8_t *line = px_map;
+
+    /* Arm the completion counter for this flush: every row that queues a
+     * tx_color below will later produce one lcd_flush_ready_cb() from the
+     * SPI ISR, and LVGL is released only when the last of them completes.
+     * Additive, so a late callback from the previous flush (one that started
+     * before this arm) is still counted against that flush, not this one. */
+    portENTER_CRITICAL(&s_flush_mux);
+    s_flush_pending += rows;
+    s_flush_ready_sent = false;
+    portEXIT_CRITICAL(&s_flush_mux);
+    int rows_queued = 0;
 
     /* Send the dirty rectangle one row at a time instead of as a single big
      * block. esp_lcd_panel_io_tx_color() allocates a private DMA "TX buffer"
@@ -195,43 +255,33 @@ static void lvgl_flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t 
         esp_err_t err = esp_lcd_panel_io_tx_param(io_handle, ST7789_CASET, caset, sizeof(caset));
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "flush caset failed: %s", esp_err_to_name(err));
-            /* No DMA will complete for this frame, so signal ready inline.
-             * The guard ensures it happens at most once. */
-            if (s_flush_ready_pending) {
-                s_flush_ready_pending = false;
-                lv_display_flush_ready(display);
-            }
+            lcd_flush_abort(display, rows, rows_queued);
             return;
         }
         err = esp_lcd_panel_io_tx_param(io_handle, ST7789_RASET, raset, sizeof(raset));
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "flush raset failed: %s", esp_err_to_name(err));
-            if (s_flush_ready_pending) {
-                s_flush_ready_pending = false;
-                lv_display_flush_ready(display);
-            }
+            lcd_flush_abort(display, rows, rows_queued);
             return;
         }
         err = esp_lcd_panel_io_tx_color(io_handle, ST7789_RAMWR, line, line_bytes);
         if (err != ESP_OK) {
             /* Never abort on a transient transfer error: just unlock the
              * display so LVGL can retry next frame instead of deadlocking or
-             * crashing the whole firmware. No DMA completes here either, so
-             * signal ready inline (guarded against a duplicate call). */
+             * crashing the whole firmware. */
             ESP_LOGW(TAG, "flush line %d failed: %s", y, esp_err_to_name(err));
-            if (s_flush_ready_pending) {
-                s_flush_ready_pending = false;
-                lv_display_flush_ready(display);
-            }
+            lcd_flush_abort(display, rows, rows_queued);
             return;
         }
+        rows_queued++;
         line += line_bytes;
     }
 
-    /* Success path: the last tx_color above is asynchronous (DMA). Its
-     * completion triggers lcd_flush_ready_cb, which will signal LVGL exactly
-     * once via the s_flush_ready_pending guard. Do NOT call
-     * lv_display_flush_ready() here — doing so would signal it twice. */
+    /* Success path: every tx_color above is asynchronous (DMA). The last
+     * one's completion brings s_flush_pending to 0 in lcd_flush_ready_cb,
+     * which signals LVGL exactly once. Do NOT call lv_display_flush_ready()
+     * here — that would release the draw buffers while rows are still in
+     * flight. */
 }
 
 /* Forward declaration so hw_lcd_init() can call it before its definition. */

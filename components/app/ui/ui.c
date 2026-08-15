@@ -1070,9 +1070,16 @@ static void ui_build_ebook_read(lv_obj_t *page)
 static void ui_build_page_content(lv_obj_t *page)
 {
     s_ui.title = ui_label(page, s_page_names[s_ui.page_id], 2, UI_TITLE, &lv_font_cn_16, LV_TEXT_ALIGN_LEFT);
+    /* Header row sits 2px left of the default so the whole top bar reads as
+     * one unit, clear of the battery overlay. */
+    lv_obj_set_pos(s_ui.title, 6, 2);
     /* Top-right status label. Secondary pages leave it empty; the Player page
-     * fills it with the playback state (>> / || / --) in ui_refresh(). */
+     * fills it with the playback state (>> / || / --) in ui_refresh(). The
+     * top-right corner (x >= 250) is claimed by the persistent battery gauge
+     * drawn above the page container, so the status text must end before it:
+     * cap the width at 238 (right edge x=246, 4px clear of the battery). */
     s_ui.status = ui_label(page, "", 2, UI_GRAY, &lv_font_cn_16, LV_TEXT_ALIGN_RIGHT);
+    lv_obj_set_width(s_ui.status, 238);
 
     /* Header separator, matching the main-menu style. */
     lv_obj_t *sep = lv_obj_create(page);
@@ -2216,14 +2223,19 @@ void ui_create(lv_group_t *group)
     /* Persistent battery gauge in the top-right corner, above every page.
      * Layout: a 5-segment battery icon + "100%" text, anchored with absolute
      * screen coordinates (no clipping container), vertically centered with the
-     * text. Style mirrors the reference look (cyan outline, 5 fill cells). */
+     * text. Style mirrors the reference look (cyan outline, 5 fill cells).
+     * Parented to the ACTIVE SCREEN (sibling of the s_ui.screen container)
+     * so it is drawn after the whole page/menu subtree and stays on top
+     * regardless of when pages are (re)built. Pages must keep their content
+     * clear of x >= 250 in the title row (status label is capped at width
+     * 238 for this reason). */
     const lv_color_t bat_color = lv_color_hex(0x00FFFF); /* cyan */
     const int base_x = 250;
-    const int base_y = 4;                       /* top of the percent text */
+    const int base_y = 2;                       /* top of the percent text */
     const int icon_h = 12;                      /* battery body height */
 
     /* Percent label first, so we can center the icon against its height. */
-    s_ui.bat_text = lv_label_create(s_ui.screen);
+    s_ui.bat_text = lv_label_create(lv_screen_active());
     lv_label_set_text(s_ui.bat_text, "--%");
     lv_obj_set_pos(s_ui.bat_text, base_x + 28, base_y);
     lv_obj_set_style_text_font(s_ui.bat_text, &lv_font_cn_16, 0);
@@ -2234,7 +2246,7 @@ void ui_create(lv_group_t *group)
     const int bat_y = base_y + text_h / 2 - icon_h / 2;
 
     /* Body outline (24x12, 1px border), transparent interior. */
-    lv_obj_t *body = lv_obj_create(s_ui.screen);
+    lv_obj_t *body = lv_obj_create(lv_screen_active());
     lv_obj_remove_style_all(body);
     lv_obj_set_size(body, 24, icon_h);
     lv_obj_set_pos(body, base_x, bat_y);
@@ -2245,7 +2257,7 @@ void ui_create(lv_group_t *group)
     s_ui.battery = body;   /* existence flag */
 
     /* Positive terminal cap (2x5 px). */
-    lv_obj_t *cap = lv_obj_create(s_ui.screen);
+    lv_obj_t *cap = lv_obj_create(lv_screen_active());
     lv_obj_remove_style_all(cap);
     lv_obj_set_size(cap, 2, 5);
     lv_obj_set_pos(cap, base_x + 24, bat_y + (icon_h - 5) / 2);
@@ -2256,7 +2268,7 @@ void ui_create(lv_group_t *group)
 
     /* 5 fill segments: 3 px wide, 6 px tall, 1 px gap; live inside the body. */
     for (int i = 0; i < 5; ++i) {
-        lv_obj_t *seg = lv_obj_create(s_ui.screen);
+        lv_obj_t *seg = lv_obj_create(lv_screen_active());
         lv_obj_remove_style_all(seg);
         lv_obj_set_size(seg, 3, 6);
         lv_obj_set_pos(seg, base_x + 3 + i * 4, bat_y + (icon_h - 6) / 2);
