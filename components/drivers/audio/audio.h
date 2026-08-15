@@ -52,6 +52,12 @@ uint8_t hw_audio_get_bt_volume(void);
  * route (the remote is a Bluetooth peer) and updates the percent view. */
 void hw_audio_set_avrc_volume(uint8_t volume_0_127);
 
+/* Per-track loudness gain in dB (ReplayGain 2.0, from the file's ID3 tags
+ * written by tools like loudgain). Applied before the master volume on the
+ * active route with ~5 ms smoothing; 0 dB = flat. Call once at each track
+ * start (untagged tracks: 0 dB). */
+void hw_audio_set_track_gain_db(float gain_db);
+
 /* Reconfigure the I2S sample rate (e.g. to match an MP3 file's rate). */
 void hw_audio_set_sample_rate(uint32_t sample_rate_hz);
 
@@ -74,7 +80,8 @@ typedef enum {
 
 /* Stream raw 16-bit stereo PCM (L,R interleaved). `frames` = number of
  * L/R pairs. Used by the MP3 player to output decoded audio. Samples are
- * filtered in place by the speaker-protection high-pass before enqueueing.
+ * filtered in place (per-track ReplayGain + speaker-protection high-pass +
+ * loudness shelf + volume + limiter, see the driver docs) before enqueueing.
  * Never blocks for more than ~2 s: on a wedged pipeline it returns
  * AUDIO_WRITE_STALLED so the caller can recover instead of hanging. */
 audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames);

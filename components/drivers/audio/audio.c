@@ -347,6 +347,19 @@ static void audio_set_loudness_coeff(uint32_t rate)
 static int32_t s_lim_env;             /* peak envelope */
 static int32_t s_lim_gain;            /* smoothed limiter gain, Q15 */
 
+/* --- Per-track loudness gain (ReplayGain) -------------------------------
+ * Different sources are mastered at wildly different levels; a per-track
+ * gain computed from the file's ReplayGain 2.0 tags (written by PC tools
+ * like loudgain) brings them to a common loudness. The player sets it at
+ * each track start via hw_audio_set_track_gain_db(); it is smoothed like
+ * the volume, so a gain step at a track boundary never clicks. Applied
+ * BEFORE the master volume on BOTH routes, so it scales the whole signal
+ * the way a mastering gain would — the soft limiter below still caps the
+ * peaks, which is exactly what ReplayGain assumes (limiting at 0 dBFS). */
+#define RG_GAIN_MAX_DB 12.0f   /* clamp; loudgain values are normally ±6 dB */
+static int32_t s_track_gain;    /* target Q15 per-track gain (32768 = 0 dB) */
+static int32_t s_track_gain_sm; /* smoothed gain actually applied */
+
 /* Clear all per-track DSP history (call when a track starts or the route
  * switches). The limiter resets to flat gain so the first samples of a new
  * track are never ducked by the previous track's peak envelope. */
@@ -631,6 +644,7 @@ void hw_audio_init(void)
     audio_update_vol_gain();
     s_vol_gain_sm = s_vol_gain;       /* start settled: no fade-in from zero */
     s_loud_boost_sm = s_loud_boost;   /* shelf boost settled too */
+    s_track_gain = s_track_gain_sm = 32768;   /* 0 dB per-track gain */
     s_lim_gain = 32768;               /* limiter flat until audio starts */
     BaseType_t feed_ret = xTaskCreate(audio_feed_task, "audio_feed",
                                       6 * 1024, NULL, 6, &s_feed_task);
@@ -738,6 +752,26 @@ void hw_audio_set_avrc_volume(uint8_t volume_0_127)
     audio_update_loudness_boost();
 }
 
+/* Per-track loudness gain (ReplayGain), dB. 0 = flat; clamped to ±12 dB and
+ * converted to a Q15 gain the DSP chain applies before the master volume.
+ * Called by the player at each track start (0 dB when the file is
+ * untagged). The smoothing ramps to it over ~5 ms, so no click at the
+ * boundary. */
+void hw_audio_set_track_gain_db(float gain_db)
+{
+    if (gain_db > RG_GAIN_MAX_DB) {
+        gain_db = RG_GAIN_MAX_DB;
+    }
+    else if (gain_db < -RG_GAIN_MAX_DB) {
+        gain_db = -RG_GAIN_MAX_DB;
+    }
+    s_track_gain = (int32_t)(powf(10.0f, gain_db / 20.0f) * 32768.0f + 0.5f);
+    if (gain_db != 0.0f) {
+        ESP_LOGI(TAG, "track gain %.2f dB (Q15=%d)", gain_db,
+                 (int)s_track_gain);
+    }
+}
+
 /* Request an I2S sample-rate change; the feed task applies it (serialized).
  * The Bluetooth pipeline is only told when Bluetooth is the active route, so a
  * speaker session never touches the BT resampler (and stays silent on the BT
@@ -842,7 +876,10 @@ bool hw_audio_is_ready(void)
  * them periodically drains one of the rings and causes dropouts.
  *
  * Without Bluetooth, the speaker path applies the protection high-pass,
- * the loudness bass shelf, the master volume and the soft limiter.
+ * the loudness bass shelf, the per-track ReplayGain, the master volume and
+ * the soft limiter. The Bluetooth path applies the per-track gain and the
+ * master volume only (headphones reproduce full band, and the sink's own
+ * limiting handles hot peaks).
  * Back-pressure blocks until there is room (PCM is never dropped); if
  * playback stops meanwhile we abandon the rest. */
 audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
@@ -869,16 +906,27 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
          * turns into a visible pipeline error — the decode task is never left
          * blocked inside this call forever. */
         for (size_t i = 0; i < n; i++) {
+            /* Per-track ReplayGain first (clamped to 16-bit: the BT path has
+             * no limiter to catch over-boosted peaks). */
+            s_track_gain_sm += ((s_track_gain - s_track_gain_sm) * VOL_SMOOTH_A_Q15) >> 15;
+            int32_t t = (int32_t)(((int64_t)stereo_frames[i] * s_track_gain_sm) >> 15);
+            if (t > 32767) {
+                t = 32767;
+            }
+            else if (t < -32768) {
+                t = -32768;
+            }
             g += ((g_target - g) * VOL_SMOOTH_A_Q15) >> 15;
-            stereo_frames[i] = (int16_t)(((int32_t)stereo_frames[i] * g) >> 15);
+            stereo_frames[i] = (int16_t)((t * g) >> 15);
         }
         s_vol_gain_sm = g;
         bool bt_ok = bt_audio_write_pcm(stereo_frames, frames);
         return bt_ok ? AUDIO_WRITE_OK : AUDIO_WRITE_STALLED;
     }
 
-    /* Speaker route: high-pass -> loudness bass shelf -> master volume
-     * -> soft limiter, all per sample (L = even index, R = odd index). */
+    /* Speaker route: high-pass -> loudness bass shelf -> per-track gain
+     * -> master volume -> soft limiter, all per sample (L = even index,
+     * R = odd index). */
     for (size_t i = 0; i < n; i++) {
         int ch = (int)(i & 1);
         int32_t x = stereo_frames[i];
@@ -900,6 +948,18 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
         s_lp_state[ch] = lp;
         s_loud_boost_sm += ((s_loud_boost - s_loud_boost_sm) * VOL_SMOOTH_A_Q15) >> 15;
         y = y + ((s_loud_boost_sm * lp) >> 15);
+        if (y > 32767) {
+            y = 32767;
+        }
+        else if (y < -32768) {
+            y = -32768;
+        }
+
+        /* Per-track ReplayGain (pre-master-gain, so it scales the whole
+         * signal; the limiter below still bounds the peaks). 64-bit
+         * multiply: the gain can exceed 1.0 (up to +12 dB). */
+        s_track_gain_sm += ((s_track_gain - s_track_gain_sm) * VOL_SMOOTH_A_Q15) >> 15;
+        y = (int32_t)(((int64_t)y * s_track_gain_sm) >> 15);
         if (y > 32767) {
             y = 32767;
         }

@@ -354,31 +354,205 @@ const char *player_scan_path(int i)
     return s_playlist->items[i].path;
 }
 
-/* Skip an ID3v2 tag at the head of the open file so the MP3 decoder doesn't
- * mistake tag bytes for audio frame headers. An ID3v2 tag starts with the
- * magic "ID3" followed by 7 bytes of header; the 4 size bytes are
- * "syncsafe" (top bit always 0), so the real tag length is:
- *   (b0<<21)|(b1<<14)|(b2<<7)|b3   + 10 header bytes.
- * Without this, MP3FindSyncWord can lock onto a 0xFFEx sequence inside the
- * tag and report a bogus sample rate, wrecking pitch/speed for the track. */
-static void skip_id3v2(void)
+/* --- ID3v2 skipping + ReplayGain ---------------------------------------
+ * The MP3 decoder must never see the ID3v2 tag at the head of the file (its
+ * bytes can lock MP3FindSyncWord onto a bogus 0xFFEx frame header and wreck
+ * the sample rate), so the tag is skipped. While we are there the tag's
+ * frames are scanned for ReplayGain 2.0 metadata (written by PC tools like
+ * loudgain): TXXX frames "REPLAYGAIN_TRACK_GAIN" / "REPLAYGAIN_ALBUM_GAIN"
+ * (ID3v2.3 / v2.4) or RVA2 frames (ID3v2.4). The gain is pushed into the
+ * audio DSP chain as a per-track gain so quiet and loud sources come out at
+ * a comparable level (see hw_audio_set_track_gain_db). Parsing is
+ * best-effort: any malformed tag simply yields 0 dB. An ID3v2 tag starts
+ * with the magic "ID3" + 7 header bytes; the 4 size bytes are "syncsafe"
+ * (top bit always 0), so the tag length is (b0<<21)|(b1<<14)|(b2<<7)|b3
+ * + 10 header bytes. */
+
+static long id3_big32(const unsigned char *b)
 {
+    return ((long)b[0] << 24) | ((long)b[1] << 16) |
+           ((long)b[2] << 8)  | (long)b[3];
+}
+
+static long id3_syncsafe32(const unsigned char *b)
+{
+    return ((long)(b[0] & 0x7f) << 21) | ((long)(b[1] & 0x7f) << 14) |
+           ((long)(b[2] & 0x7f) << 7)  | (long)(b[3] & 0x7f);
+}
+
+/* Match `ascii` against a TXXX description that may be ISO-8859-1 / UTF-8
+ * (1 byte/char) or UTF-16 (chars interleaved with NUL bytes). Skipping NUL
+ * bytes makes the comparison encoding-agnostic. */
+static bool id3_desc_matches(const unsigned char *d, size_t n,
+                             const char *ascii)
+{
+    size_t k = 0;
+    for (size_t i = 0; i < n && ascii[k] != '\0'; i++) {
+        if (d[i] == 0x00) {
+            continue;   /* UTF-16 interleave */
+        }
+        if (d[i] != (unsigned char)ascii[k]) {
+            return false;
+        }
+        k++;
+    }
+    return ascii[k] == '\0';
+}
+
+/* Parse a dB value from the tail of a text frame, skipping UTF-16 NUL
+ * interleave and BOM bytes, stopping at the first non-number character
+ * ("-6.23 dB" -> -6.23). */
+static bool id3_parse_db(const unsigned char *d, size_t n, float *out)
+{
+    char buf[32];
+    size_t k = 0;
+    bool started = false;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = d[i];
+        if (c == 0x00 || c == 0xFF || c == 0xFE) {
+            continue;   /* UTF-16 interleave / BOM bytes */
+        }
+        if (!started) {
+            if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.') {
+                started = true;
+                buf[k++] = (char)c;
+            }
+            continue;   /* skip junk before the number */
+        }
+        if ((c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E') {
+            buf[k++] = (char)c;
+        }
+        else {
+            break;      /* e.g. the " dB" suffix */
+        }
+        if (k + 1 >= sizeof(buf)) {
+            break;
+        }
+    }
+    if (!started) {
+        return false;
+    }
+    buf[k] = '\0';
+    *out = strtof(buf, NULL);
+    return true;
+}
+
+/* Skip the ID3v2 tag (if any) at the head of the open file past the
+ * decoder, and extract ReplayGain metadata into the audio DSP. */
+static void parse_id3v2(void)
+{
+    float track_gain = 0.0f;
+    float album_gain = 0.0f;
+    bool has_track = false;
+    bool has_album = false;
     unsigned char hdr[10];
     long base = ftell(s_src.fp);
-    if (fread(hdr, 1, sizeof(hdr), s_src.fp) != sizeof(hdr)) {
-        fseek(s_src.fp, base, SEEK_SET);
-        return;
-    }
-    if (hdr[0] != 'I' || hdr[1] != 'D' || hdr[2] != '3') {
+    if (fread(hdr, 1, sizeof(hdr), s_src.fp) != sizeof(hdr) ||
+        hdr[0] != 'I' || hdr[1] != 'D' || hdr[2] != '3') {
         fseek(s_src.fp, base, SEEK_SET);   /* not an ID3v2 tag: rewind */
+        hw_audio_set_track_gain_db(0.0f);
         return;
     }
-    long size = ((long)(hdr[6] & 0x7f) << 21) |
-                ((long)(hdr[7] & 0x7f) << 14) |
-                ((long)(hdr[8] & 0x7f) << 7)  |
-                ((long)(hdr[9] & 0x7f));
-    fseek(s_src.fp, base + 10 + size, SEEK_SET);
-    ESP_LOGD(TAG, "skipped ID3v2 tag (%ld bytes)", 10L + size);
+    long tag_size = id3_syncsafe32(hdr + 6);
+    if (hdr[3] < 3) {
+        /* ID3v2.2 and older: 3-byte frame IDs, never carries ReplayGain. */
+        fseek(s_src.fp, base + 10 + tag_size, SEEK_SET);
+        hw_audio_set_track_gain_db(0.0f);
+        return;
+    }
+    long tag_end = base + 10 + tag_size;
+    long pos = base + 10;
+    if (hdr[5] & 0x40) {
+        /* Extended header (flag 0x40). Its size field excludes itself in
+         * v2.4 (syncsafe) but includes itself in v2.3 (plain big-endian). */
+        unsigned char eh[4];
+        if (fseek(s_src.fp, pos, SEEK_SET) == 0 &&
+            fread(eh, 1, sizeof(eh), s_src.fp) == sizeof(eh)) {
+            pos += (hdr[3] >= 4) ? id3_syncsafe32(eh) : id3_big32(eh);
+        }
+        else {
+            pos = tag_end;   /* header unreadable: no frames to scan */
+        }
+    }
+
+    while (pos + 10 <= tag_end) {
+        unsigned char fh[10];
+        if (fseek(s_src.fp, pos, SEEK_SET) != 0 ||
+            fread(fh, 1, sizeof(fh), s_src.fp) != sizeof(fh)) {
+            break;
+        }
+        long fsz = (hdr[3] >= 4) ? id3_syncsafe32(fh + 4) : id3_big32(fh + 4);
+        if (fh[0] == 0x00 || fsz <= 0) {
+            break;   /* padding (or corrupt): done */
+        }
+        if (memcmp(fh, "TXXX", 4) == 0) {
+            unsigned char d[96];
+            size_t rd = (fsz < (long)sizeof(d)) ? (size_t)fsz : sizeof(d);
+            if (fread(d, 1, rd, s_src.fp) == rd && rd >= 3) {
+                int enc = d[0];
+                size_t de = 1;   /* description terminator: first NUL (pair) */
+                if (enc == 1 || enc == 2) {
+                    while (de + 1 < rd &&
+                           !(d[de] == 0x00 && d[de + 1] == 0x00)) {
+                        de++;
+                    }
+                }
+                else {
+                    while (de < rd && d[de] != 0x00) {
+                        de++;
+                    }
+                }
+                size_t vs = de + ((enc == 1 || enc == 2) ? 2 : 1);
+                if (de > 1 && vs < rd) {
+                    if (id3_desc_matches(d + 1, de - 1,
+                                         "REPLAYGAIN_TRACK_GAIN")) {
+                        has_track = id3_parse_db(d + vs, rd - vs, &track_gain);
+                    }
+                    else if (id3_desc_matches(d + 1, de - 1,
+                                              "REPLAYGAIN_ALBUM_GAIN")) {
+                        has_album = id3_parse_db(d + vs, rd - vs, &album_gain);
+                    }
+                }
+            }
+        }
+        else if (memcmp(fh, "RVA2", 4) == 0) {
+            /* identification (NUL-terminated Latin-1) + channel type byte
+             * (1=right, 2=left, 3=both) + 16-bit signed gain in 0.01 dB
+             * steps + peak field (ignored). */
+            unsigned char d[128];
+            size_t rd = (fsz < (long)sizeof(d)) ? (size_t)fsz : sizeof(d);
+            if (fread(d, 1, rd, s_src.fp) == rd && rd >= 6) {
+                size_t idlen = 0;
+                while (idlen < rd && d[idlen] != 0x00) {
+                    idlen++;
+                }
+                bool is_track = (idlen == 5 && memcmp(d, "track", 5) == 0);
+                bool is_album  = (idlen == 5 && memcmp(d, "album", 5) == 0);
+                if ((is_track || is_album) && idlen + 4 <= rd) {
+                    int chan = d[idlen + 1];
+                    int g = (int16_t)(((int)d[idlen + 2] << 8) | d[idlen + 3]);
+                    if (chan == 1 || chan == 2 || chan == 3) {
+                        if (is_track) {
+                            has_track = true;
+                            track_gain = (float)g / 100.0f;
+                        }
+                        else {
+                            has_album = true;
+                            album_gain = (float)g / 100.0f;
+                        }
+                    }
+                }
+            }
+        }
+        pos += 10 + fsz;   /* loop top fseeks anyway; this bounds the walk */
+    }
+
+    fseek(s_src.fp, base + 10 + tag_size, SEEK_SET);
+    ESP_LOGD(TAG, "ID3v2 tag (%ld bytes): track %.2f dB, album %.2f dB",
+             tag_size, track_gain, album_gain);
+    /* ReplayGain 2.0 rule: track gain wins, album gain is the fallback. */
+    float gain = has_track ? track_gain : (has_album ? album_gain : 0.0f);
+    hw_audio_set_track_gain_db(gain);
 }
 
 static bool open_track(void)
@@ -396,7 +570,7 @@ static bool open_track(void)
         s_src.fp = NULL;
         return false;
     }
-    skip_id3v2();   /* the decoder must only see real audio frames */
+    parse_id3v2();   /* skip the tag past the decoder + pick up ReplayGain */
     s_bytes_left = 0;
     s_consumed = 0;
     s_no_sync_refills = 0;   /* fresh track: restart sync-word watchdog */
