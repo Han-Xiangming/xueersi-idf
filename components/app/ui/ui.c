@@ -2142,34 +2142,31 @@ static void ui_key_event_cb(lv_event_t *e)
             ui_enter_page(s_menu_pages[s_menu_sel]);
         }
         /* B (ESC) is a no-op while already on the main menu. */
-        return;
     }
-
     /* Inside a detail page. */
-    if (key == LV_KEY_ESC) {
+    else if (key == LV_KEY_ESC) {
         ui_settings_flush();   /* commit any pending change before leaving */
         if (s_ui.page_id == UI_PAGE_PLAYER) {
             if (s_pv == PV_SOURCE) {
                 /* On the source picker: B returns to the main menu. */
                 ui_show_menu();
-                return;
             }
             /* PV_LIST: B while playing/paused = stop but stay; while idle,
              * return up one level to the source picker (not the menu). */
-            if (player_state() != PLAYER_IDLE) {
+            else if (player_state() != PLAYER_IDLE) {
                 player_stop();
-                return;
             }
-            s_pv = PV_SOURCE;
-            s_src_sel = 0;
-            s_paint_src_sel = -1;   /* force source picker repaint */
-            ui_mark_dirty();        /* ensure ui_refresh() actually repaints,
-                                       otherwise the stale PV_LIST stays on
-                                       screen until the next B press */
-            ui_refresh();
-            return;
+            else {
+                s_pv = PV_SOURCE;
+                s_src_sel = 0;
+                s_paint_src_sel = -1;   /* force source picker repaint */
+                ui_mark_dirty();        /* ensure ui_refresh() actually repaints,
+                                           otherwise the stale PV_LIST stays on
+                                           screen until the next B press */
+                ui_refresh();
+            }
         }
-        if (s_ui.page_id == UI_PAGE_BT) {
+        else if (s_ui.page_id == UI_PAGE_BT) {
             /* Return to Settings, the screen this sub-page was opened from. */
             ui_enter_page(UI_PAGE_SETTINGS);
         }
@@ -2180,9 +2177,8 @@ static void ui_key_event_cb(lv_event_t *e)
         else {
             ui_show_menu();
         }
-        return;
     }
-    if (key == LV_KEY_HOME) {
+    else if (key == LV_KEY_HOME) {
         /* Select: switch the player's repeat mode (list loop ⇄ single-track
          * loop). Only meaningful on the player page; ignored elsewhere.
          * No toast — the mode is already shown in the top-right status
@@ -2191,28 +2187,33 @@ static void ui_key_event_cb(lv_event_t *e)
             ui_mark_dirty();   /* repaint the top-right status */
             player_repeat_toggle();
         }
-        return;
     }
-    if (key == LV_KEY_ENTER) {
+    else if (key == LV_KEY_ENTER) {
         ui_action();
-        return;
     }
-    if (key == LV_KEY_UP) {
+    else if (key == LV_KEY_UP) {
         ui_adjust(1);
-        return;
     }
-    if (key == LV_KEY_DOWN) {
+    else if (key == LV_KEY_DOWN) {
         ui_adjust(-1);
-        return;
     }
-    if (key == LV_KEY_LEFT) {
+    else if (key == LV_KEY_LEFT) {
         ui_adjust_lr(-1);
-        return;
     }
-    if (key == LV_KEY_RIGHT) {
+    else if (key == LV_KEY_RIGHT) {
         ui_adjust_lr(1);
-        return;
     }
+
+    /* Instant feedback: repaint the state just changed and force a
+     * synchronous render right here, so the press is visible on the panel in
+     * this tick instead of waiting for the next LVGL refresh pass. Dirty
+     * areas are small (a cursor row / a label), so the render + SPI flush
+     * completes in a few ms and the UI feels immediate. Safe to call from an
+     * event handler: lv_refr_now() pauses the refresh timer during the
+     * synchronous render, and later invalidations (LV_EVENT_REFR_REQUEST)
+     * resume the periodic 16 ms rendering. */
+    ui_refresh();
+    lv_refr_now(NULL);
 }
 
 void ui_create(lv_group_t *group)
@@ -2314,6 +2315,11 @@ lv_group_t *ui_input_init(lv_display_t *display)
     lv_indev_set_read_cb(indev, hw_buttons_read);
     lv_indev_set_long_press_time(indev, 360);
     lv_indev_set_long_press_repeat_time(indev, 130);
+    /* Poll the buttons faster than the default 16 ms LVGL refresh period so
+     * a press (plus the 10 ms debounce) reaches the UI within ~15 ms instead
+     * of ~40 ms. The read callback only scans 9 GPIOs, so the extra polls
+     * are negligible. */
+    lv_timer_set_period(lv_indev_get_read_timer(indev), BUTTON_POLL_PERIOD_MS);
 
     return group;
 }

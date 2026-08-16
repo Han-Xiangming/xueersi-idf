@@ -10,7 +10,13 @@
 #include "lvgl.h"
 
 #define BUTTON_ACTIVE_LEVEL         0
-#define BUTTON_DEBOUNCE_MS          25
+/* Press-debounce time. Kept short (10 ms) because the input is polled every
+ * BUTTON_POLL_PERIOD_MS; together they keep press-to-UI latency at ~10-15 ms
+ * instead of the ~40 ms a 25 ms debounce on a 16 ms poll would cost. */
+#define BUTTON_DEBOUNCE_MS          10
+/* LVGL keypad indev poll period: shorter than the 16 ms LVGL refresh period
+ * so a press is sampled promptly (applied in ui_input_init). */
+#define BUTTON_POLL_PERIOD_MS       5
 
 void hw_buttons_init(void);
 
