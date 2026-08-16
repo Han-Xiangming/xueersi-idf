@@ -25,11 +25,78 @@
 #include "ui.h"
 #include "player.h"
 #include "ebook.h"
+#include "rtc_wdt.h"
+#include "esp_attr.h"
+#include "hal/uart_ll.h"
 
 /* LVGL UI refresh cadence in the main loop (milliseconds). */
 #define UI_REFRESH_PERIOD_MS        16
 
 static const char *TAG = "xiaomiao_dash";
+
+/* --- Non-blocking console log sink --------------------------------------
+ * The default console path (VFS -> uart driver) can BLOCK the caller for a
+ * long time, and it must never be called from inside a vprintf hook (the
+ * driver's internal ESP_RETURN_* / ESP_LOG* macros re-enter the log
+ * subsystem -> recursive lock -> assert). This sink talks to the UART0
+ * hardware FIFO DIRECTLY through the HAL LL layer: no driver, no esp_log,
+ * no ISR, no blocking. If the TX FIFO does not drain (wedged UART,
+ * disconnected USB-serial), the line is dropped after a short bounded
+ * spin instead of hanging the caller. Logging can therefore never wedge a
+ * task again, which is the mechanism behind the "logs freeze, only reboot
+ * recovers, screen still alive" crashes. */
+#define XM_LOG_BUF      512
+#define XM_TX_SPIN_MAX  2000   /* ~µs-scale bounded spin per byte */
+
+static int IRAM_ATTR xm_console_vprintf(const char *fmt, va_list ap)
+{
+    static char buf[XM_LOG_BUF];
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    if (n < 0) {
+        return 0;
+    }
+    if (n > (int)sizeof(buf) - 1) {
+        n = (int)sizeof(buf) - 1;
+    }
+    uart_dev_t *hw = UART_LL_GET_HW(UART_NUM_0);
+    for (int i = 0; i < n; i++) {
+        int spins = 0;
+        while (uart_ll_get_txfifo_len(hw) == 0) {
+            if (++spins >= XM_TX_SPIN_MAX) {
+                return i;   /* TX wedged: drop the rest of the line */
+            }
+        }
+        uart_ll_write_txfifo(hw, (const uint8_t *)&buf[i], 1);
+    }
+    return n;
+}
+
+/* --- Last-resort RTC watchdog -------------------------------------------
+ * The task WDT and the interrupt WDT both need the CPU to actually run
+ * interrupt handlers, so a total CPU freeze — a PSRAM bus stall while the
+ * flash cache is disabled during a concurrent flash write, or an SDSPI
+ * hardware hang — leaves the device dead until a manual power cycle (the
+ * user-visible "logs stop, only reboot recovers" crash). The RTC watchdog
+ * runs on its own RTC clock, independent of the CPU and its interrupts:
+ * when fed stops for RTC_WDT_TIMEOUT_MS, it resets the system on its own.
+ * The boot log then prints both CPUs' PCs at the moment of the reset,
+ * which pinpoints the exact freeze site. The player watchdog task feeds it
+ * every 2 s in every healthy state, so nothing normal can trip it. */
+#define RTC_WDT_TIMEOUT_MS 30000
+
+static void rtc_wdt_arm(void)
+{
+    rtc_wdt_protect_off();
+    rtc_wdt_disable();
+    rtc_wdt_set_length_of_reset_signal(RTC_WDT_SYS_RESET_SIG,
+                                       RTC_WDT_LENGTH_3_2us);
+    rtc_wdt_set_stage(RTC_WDT_STAGE0, RTC_WDT_STAGE_ACTION_RESET_SYSTEM);
+    rtc_wdt_set_time(RTC_WDT_STAGE0, RTC_WDT_TIMEOUT_MS);
+    rtc_wdt_enable();
+    rtc_wdt_protect_on();
+    ESP_LOGI(TAG, "RTC WDT armed (%u s system-reset backstop)",
+             (unsigned)(RTC_WDT_TIMEOUT_MS / 1000));
+}
 
 /* Remote AVRCP command from a paired headset/speaker drives local playback. */
 static void xiaomiao_avrc_cmd(bt_avrc_cmd_t cmd)
@@ -121,6 +188,15 @@ static void lvgl_task(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "Xiaomiao LVGL 9.5 dashboard boot");
+
+    /* Non-blocking console: a wedged UART must never freeze a task that
+     * logs (see xm_console_vprintf). Installed before any subsystem logs. */
+    esp_log_set_vprintf(xm_console_vprintf);
+
+    /* Arm the last-resort RTC watchdog before anything that can stall the
+     * CPU (see rtc_wdt_arm above). Fed every 2 s by the player watchdog
+     * task once it starts. */
+    rtc_wdt_arm();
 
     /* Bluedroid L2CAP floods "is_cong_cback_context" errors while the sink
      * is congested (known stack issue, espressif/esp-idf#7923, still present

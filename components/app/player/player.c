@@ -19,6 +19,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "rtc_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #if defined(CONFIG_ESP_TASK_WDT_EN)
@@ -969,6 +970,11 @@ static void player_watch_task(void *arg)
     (void)arg;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(2000));
+        /* Feed the RTC watchdog (see main.c rtc_wdt_arm). This task never
+         * blocks on anything but the delay, so while the system is healthy
+         * the 30 s reset backstop can never trip; a total CPU freeze (PSRAM
+         * bus stall, SD hardware hang) stops the feed and auto-resets. */
+        rtc_wdt_feed();
         if (s_state != PLAYER_PLAYING || s_decode_beat_ms == 0) {
             continue;   /* nothing playing / no frame yet: nothing to watch */
         }
@@ -977,8 +983,10 @@ static void player_watch_task(void *arg)
         if (age < PLAYER_STALL_MS) {
             continue;
         }
-        ESP_LOGE(TAG, "[WATCHDOG] decode stalled %u ms, stopping playback",
-                 (unsigned)age);
+        /* Recovery FIRST, log LAST: if the console UART itself is wedged,
+         * an ESP_LOG* call blocks forever and the recovery below would never
+         * run. The state changes are plain memory stores + one notify, so
+         * they always land even when logging is dead. */
         player_report_error(PLAYER_ERR_STALL);
         s_stop_req = true;
         hw_audio_set_player_active(false);   /* release I2S: no fake silence */
@@ -986,6 +994,8 @@ static void player_watch_task(void *arg)
         if (s_task != NULL) {
             xTaskNotifyGive(s_task);   /* wake the decode loop if it can be */
         }
+        ESP_LOGE(TAG, "[WATCHDOG] decode stalled %u ms, stopping playback",
+                 (unsigned)age);
     }
 }
 

@@ -6,6 +6,7 @@ idf_component_register(
                   bt_audio
                   buttons
                   ebook
+                  esp_hal_uart
                   fonts
                   lcd
                   lvgl
