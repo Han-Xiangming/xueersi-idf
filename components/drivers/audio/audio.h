@@ -16,6 +16,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "esp_err.h"
+
 /* Audio output route: a single, explicit either/or switch. Exactly ONE
  * destination is active at any time and only hw_audio_set_route() changes it.
  * Bluetooth connection state does NOT touch the route — the caller (UI) must
@@ -64,6 +66,14 @@ void hw_audio_set_avrc_volume(uint8_t volume_0_127);
  * start (untagged tracks: 0 dB). */
 void hw_audio_set_track_gain_db(float gain_db);
 
+/* Global master gain in dB (user preamp, -12..+12, 0 = flat): a whole-signal
+ * offset applied to BOTH routes right after the per-track gain and before
+ * the master volume, so it works like a preamp knob — quiet sources can be
+ * pushed past what the volume knob reaches at 100%, hot ones tamed. Smoothed
+ * like the volume, so a change never clicks. Persisted by the UI. */
+void hw_audio_set_master_gain_db(float gain_db);
+float hw_audio_get_master_gain_db(void);
+
 /* Reconfigure the I2S sample rate (e.g. to match an MP3 file's rate).
  * Applied immediately from the calling task; a running channel is parked
  * for the reconfig and re-enabled by the next PCM write, so the new clock
@@ -87,11 +97,23 @@ typedef enum {
 
 /* Stream raw 16-bit stereo PCM (L,R interleaved). `frames` = number of
  * L/R pairs. Used by the MP3 player to output decoded audio. Samples are
- * filtered in place (per-track ReplayGain + speaker-protection high-pass +
- * loudness shelf + volume + limiter, see the driver docs) before a bounded
- * direct write to the I2S DMA, which paces the caller by back-pressure. */
+ * filtered in place (per-track ReplayGain + user master gain + speaker-
+ * protection high-pass + loudness shelf + volume + limiter, see the driver
+ * docs) before a bounded direct write to the I2S DMA, which paces the caller
+ * by back-pressure. */
 audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames);
 
 /* True only after the I2S channel and the IO mutex are up. Callers must
  * NOT start playback before this returns true. */
 bool hw_audio_is_ready(void);
+
+/* Troubleshooting: tear down and re-create the I2S channel from scratch
+ * (DMA descriptors, std-mode init, pins), recompute the DSP coefficients
+ * for the current sample rate and reset the filter history, leaving the
+ * channel parked. Recovers a wedged pipeline (stuck DMA / write stalls)
+ * without a reboot — and can also bring the channel up after a boot-time
+ * init failure. Call only while the player is stopped: the caller must
+ * release the bus first (hw_audio_set_player_active(false) / player_stop),
+ * otherwise ESP_ERR_INVALID_STATE is returned. Serialized by the IO mutex
+ * like every channel operation. */
+esp_err_t hw_audio_rebuild_i2s(void);

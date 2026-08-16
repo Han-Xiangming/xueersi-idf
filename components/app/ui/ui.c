@@ -67,6 +67,7 @@ static const ui_page_t s_menu_pages[] = {
  * Add new options here and they appear automatically in the list. */
 typedef enum {
     SETTING_VOLUME = 0,
+    SETTING_MASTER_GAIN,
     SETTING_BACKLIGHT,
     SETTING_BTOUT,
     SETTING_STANDBY,
@@ -76,8 +77,9 @@ typedef enum {
 } setting_item_t;
 
 /* Match the playlist row spacing (26px, starting at y=38) so the two
- * list-style pages line up visually. */
-static const int s_setting_y[SETTING_COUNT] = {38, 64, 90, 116, 142, 168};
+ * list-style pages line up visually. Seven rows: spacing compressed to
+ * 24px so the last row (y=182, glyph ends ~198) clears the y=204 hint. */
+static const int s_setting_y[SETTING_COUNT] = {38, 62, 86, 110, 134, 158, 182};
 
 /* Cache-existence state shown by the "重建列表" settings item. We must NOT
  * call player_cache_exists() (a FATFS stat()) every refresh — it runs on
@@ -91,12 +93,14 @@ static uint32_t s_cache_queried_ver;
 /* ----- Table-driven settings --------------------------------------- */
 /* Forward declarations for the per-item callbacks/value getters. */
 static const char *ui_set_vol_text(void);
+static const char *ui_set_gain_text(void);
 static const char *ui_set_bl_text(void);
 static const char *ui_set_bt_text(void);
 static const char *ui_set_sleep_text(void);
 static const char *ui_set_rescan_text(void);
 static const char *ui_set_reset_text(void);
 static void ui_set_vol_lr(int dir);
+static void ui_set_gain_lr(int dir);
 static void ui_set_bl_lr(int dir);
 static void ui_set_bt_lr(int dir);
 static void ui_set_sleep_lr(int dir);
@@ -114,12 +118,13 @@ typedef struct {
 } setting_entry_t;
 
 static const setting_entry_t s_settings_table[SETTING_COUNT] = {
-    [SETTING_VOLUME]  = {"音量",          ui_set_vol_text,   ui_set_vol_lr,   NULL},
-    [SETTING_BACKLIGHT] = {"背光",        ui_set_bl_text,    ui_set_bl_lr,    NULL},
-    [SETTING_BTOUT]   = {"蓝牙",          ui_set_bt_text,    ui_set_bt_lr,    ui_set_bt_enter},
-    [SETTING_STANDBY] = {"息屏",          ui_set_sleep_text, ui_set_sleep_lr, NULL},
-    [SETTING_RESCAN]  = {"重建播放列表",  ui_set_rescan_text, NULL,           ui_set_rescan_enter},
-    [SETTING_RESET]   = {"重置NVS",       ui_set_reset_text, NULL,           ui_set_reset_enter},
+    [SETTING_VOLUME]      = {"音量",    ui_set_vol_text,   ui_set_vol_lr,   NULL},
+    [SETTING_MASTER_GAIN] = {"总增益",  ui_set_gain_text,  ui_set_gain_lr,  NULL},
+    [SETTING_BACKLIGHT]   = {"背光",    ui_set_bl_text,    ui_set_bl_lr,    NULL},
+    [SETTING_BTOUT]       = {"蓝牙",    ui_set_bt_text,    ui_set_bt_lr,    ui_set_bt_enter},
+    [SETTING_STANDBY]     = {"息屏",    ui_set_sleep_text, ui_set_sleep_lr, NULL},
+    [SETTING_RESCAN]      = {"重建播放列表", ui_set_rescan_text, NULL,       ui_set_rescan_enter},
+    [SETTING_RESET]       = {"重置NVS", ui_set_reset_text, NULL,             ui_set_reset_enter},
 };
 
 /* Backlight brightness (0..100 %), driven via PWM on PIN_NUM_LCD_BL.
@@ -154,6 +159,7 @@ static standby_opt_t s_standby_opt = STANDBY_OPT_30S;  /* default 30 s */
 #define UI_NVS_NS      "ui_cfg"
 #define UI_NVS_VOLUME  "volume"
 #define UI_NVS_VOLBT   "vol_bt"
+#define UI_NVS_GAIN    "gain_db"
 #define UI_NVS_BT      "bt_on"
 #define UI_NVS_BACKL   "backlight"
 #define UI_NVS_STBY    "standby_s"
@@ -175,6 +181,13 @@ static void ui_settings_load(void)
         hw_audio_set_bt_volume((uint8_t)v);
     } else {
         hw_audio_set_bt_volume(30);        /* default BT volume 30% */
+    }
+    v = -1;
+    if (nvs_get_i32(h, UI_NVS_GAIN, &v) == ESP_OK &&
+        v >= -120 && v <= 120) {
+        hw_audio_set_master_gain_db((float)v / 10.0f);
+    } else {
+        hw_audio_set_master_gain_db(0.0f); /* default master gain 0 dB */
     }
     int32_t bt = 0;
     if (nvs_get_i32(h, UI_NVS_BT, &bt) == ESP_OK) {
@@ -203,6 +216,19 @@ static void ui_settings_save_volume(void)
     if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_i32(h, UI_NVS_VOLUME, (int32_t)hw_audio_get_speaker_volume());
         nvs_set_i32(h, UI_NVS_VOLBT, (int32_t)hw_audio_get_bt_volume());
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static void ui_settings_save_gain(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        /* dB x10, rounded (the UI always sets whole dB, so this is exact). */
+        float db = hw_audio_get_master_gain_db();
+        nvs_set_i32(h, UI_NVS_GAIN,
+                    (int32_t)(db * 10.0f + (db >= 0.0f ? 0.5f : -0.5f)));
         nvs_commit(h);
         nvs_close(h);
     }
@@ -242,9 +268,10 @@ static void ui_settings_save_standby(void)
  * timer; ui_settings_flush() (called every refresh) commits once the user
  * stops tweaking, folding long-press repeats into a single NVS write. */
 #define SETTINGS_DIRTY_VOLUME   (1u << 0)
-#define SETTINGS_DIRTY_BT       (1u << 1)
-#define SETTINGS_DIRTY_BACKL    (1u << 2)
-#define SETTINGS_DIRTY_STBY     (1u << 3)
+#define SETTINGS_DIRTY_GAIN     (1u << 1)
+#define SETTINGS_DIRTY_BT       (1u << 2)
+#define SETTINGS_DIRTY_BACKL    (1u << 3)
+#define SETTINGS_DIRTY_STBY     (1u << 4)
 
 static uint32_t s_save_pending;
 static uint32_t s_save_at_ms;
@@ -265,6 +292,9 @@ static void ui_settings_flush(void)
     }
     if (s_save_pending & SETTINGS_DIRTY_VOLUME) {
         ui_settings_save_volume();
+    }
+    if (s_save_pending & SETTINGS_DIRTY_GAIN) {
+        ui_settings_save_gain();
     }
     if (s_save_pending & SETTINGS_DIRTY_BT) {
         ui_settings_save_bt();
@@ -709,6 +739,15 @@ static const char *ui_set_vol_text(void)
     return buf;
 }
 
+static const char *ui_set_gain_text(void)
+{
+    static char buf[24];
+    /* Signed dB: "+6dB" / "0dB" / "-3dB". */
+    int db = (int)hw_audio_get_master_gain_db();
+    snprintf(buf, sizeof(buf), db > 0 ? "+%ddB" : "%ddB", db);
+    return buf;
+}
+
 static const char *ui_set_bl_text(void)
 {
     static char buf[24];
@@ -769,6 +808,16 @@ static void ui_set_vol_lr(int dir)
     ui_volume_step(dir, 10);
     ui_settings_mark_dirty(SETTINGS_DIRTY_VOLUME);
     set_action(ui_set_vol_text());
+}
+
+static void ui_set_gain_lr(int dir)
+{
+    /* Whole dB steps over the preamp range ±12 dB. */
+    int db = (int)hw_audio_get_master_gain_db() + dir;
+    db = MAX(-12, MIN(db, 12));
+    hw_audio_set_master_gain_db((float)db);
+    ui_settings_mark_dirty(SETTINGS_DIRTY_GAIN);
+    set_action(ui_set_gain_text());
 }
 
 static void ui_set_bl_lr(int dir)

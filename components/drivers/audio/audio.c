@@ -358,6 +358,18 @@ static int32_t s_lim_gain;            /* smoothed limiter gain, Q15 */
 static int32_t s_track_gain;    /* target Q15 per-track gain (32768 = 0 dB) */
 static int32_t s_track_gain_sm; /* smoothed gain actually applied */
 
+/* --- Master gain (user preamp) ------------------------------------------
+ * A global -12..+12 dB gain applied to BOTH routes right after the per-track
+ * ReplayGain and before the master volume (and, on the speaker route, before
+ * the soft limiter, so hot peaks stay bounded). It shifts the whole signal
+ * like a preamp knob: quiet sources can be pushed past what the volume knob
+ * reaches at 100%, hot ones tamed. Persisted by the UI; smoothed like the
+ * volume, so a change never clicks. */
+#define MASTER_GAIN_MAX_DB 12.0f
+static float    s_master_gain_db;   /* last set value, dB */
+static int32_t  s_master_gain;      /* target Q15 gain (32768 = 0 dB) */
+static int32_t  s_master_gain_sm;   /* smoothed gain actually applied */
+
 /* Clear all per-track DSP history (call when a track starts or the route
  * switches). The limiter resets to flat gain so the first samples of a new
  * track are never ducked by the previous track's peak envelope. */
@@ -413,14 +425,13 @@ bool hw_audio_is_ready(void)
     return s_ready && (s_tx != NULL) && (s_io_lock != NULL);
 }
 
-void hw_audio_init(void)
+/* Create and validate the I2S channel: std-mode init on the board pins,
+ * then an enable -> park cycle to prove the config works. Leaves the
+ * channel disabled (parked) so no BCLK is generated while idle (the
+ * MAX98357 powers down when its clock stops). Shared by boot init and the
+ * rebuild path. */
+static esp_err_t audio_create_channel(void)
 {
-    s_io_lock = xSemaphoreCreateMutex();
-    if (s_io_lock == NULL) {
-        ESP_LOGE(TAG, "[AUDIO] io mutex create FAILED -> audio unusable");
-        return;
-    }
-
     i2s_chan_config_t chan_cfg = {
         .id = I2S_NUM_0,
         .role = I2S_ROLE_MASTER,
@@ -431,7 +442,7 @@ void hw_audio_init(void)
     esp_err_t err = i2s_new_channel(&chan_cfg, &s_tx, NULL);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "I2S channel init failed: %s", esp_err_to_name(err));
-        return;
+        return err;
     }
 
     i2s_std_config_t std_cfg = {
@@ -449,23 +460,35 @@ void hw_audio_init(void)
     err = i2s_channel_init_std_mode(s_tx, &std_cfg);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "I2S std init failed: %s", esp_err_to_name(err));
-        return;
+        return err;
     }
-    /* Validate the config once at boot (enable -> park). From here the
-     * channel stays parked until the first PCM write of a speaker session,
-     * so no BCLK is generated while the device idles at the menu (the
-     * MAX98357 powers down when its clock stops). */
+    /* Validate the config once (enable -> park). From here the channel stays
+     * parked until the first PCM write of a speaker session. */
     err = i2s_channel_enable(s_tx);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "I2S channel enable failed: %s", esp_err_to_name(err));
-        return;
+        return err;
     }
     err = i2s_channel_disable(s_tx);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "I2S channel park failed: %s", esp_err_to_name(err));
-        return;
+        return err;
     }
     s_i2s_enabled = false;
+    return ESP_OK;
+}
+
+void hw_audio_init(void)
+{
+    s_io_lock = xSemaphoreCreateMutex();
+    if (s_io_lock == NULL) {
+        ESP_LOGE(TAG, "[AUDIO] io mutex create FAILED -> audio unusable");
+        return;
+    }
+
+    if (audio_create_channel() != ESP_OK) {
+        return;
+    }
 
     audio_set_hpf_coeff(s_rate);      /* default-rate HPF coefficient */
     audio_set_loudness_coeff(s_rate); /* default-rate loudness shelf coeff */
@@ -474,6 +497,7 @@ void hw_audio_init(void)
     s_vol_gain_sm = s_vol_gain;       /* start settled: no fade-in from zero */
     s_loud_boost_sm = s_loud_boost;   /* shelf boost settled too */
     s_track_gain = s_track_gain_sm = 32768;   /* 0 dB per-track gain */
+    s_master_gain = s_master_gain_sm = 32768; /* 0 dB master gain, settled */
     s_lim_gain = 32768;               /* limiter flat until audio starts */
 
     s_ready = true;
@@ -487,6 +511,67 @@ void hw_audio_init(void)
      * so a speaker session resumes without waiting for the user to poll. */
     s_route = AUDIO_ROUTE_SPEAKER;
     bt_audio_set_conn_state_cb(hw_audio_on_bt_conn_state);
+}
+
+/* Troubleshooting: rebuild the I2S channel from scratch (see audio.h).
+ *
+ * Safety: the caller must have stopped the player first (s_player_active
+ * false), otherwise the decode task could write to a channel we are tearing
+ * down. All channel operations are serialized by s_io_lock; a write in
+ * flight from the player task holds that lock, so acquiring it here also
+ * proves no write is pending. A boot-time init failure leaves s_tx NULL,
+ * and this path can still bring the channel up. */
+esp_err_t hw_audio_rebuild_i2s(void)
+{
+    if (!s_ready || s_io_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_player_active) {
+        ESP_LOGW(TAG, "rebuild refused: player still owns the bus");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_io_lock, pdMS_TO_TICKS(250)) != pdTRUE) {
+        ESP_LOGW(TAG, "i2s lock busy, rebuild skipped");
+        return ESP_ERR_TIMEOUT;
+    }
+    /* Park the old channel (if any) before tearing it down. A wedged DMA
+     * surfaces as a timed-out write that already released the lock, so the
+     * driver-side disable below is safe. */
+    if (s_tx != NULL) {
+        if (s_i2s_enabled) {
+            if (i2s_channel_disable(s_tx) != ESP_OK) {
+                ESP_LOGW(TAG, "I2S park failed before rebuild");
+            }
+            s_i2s_enabled = false;
+            s_last_write_us = 0;
+        }
+        esp_err_t e = i2s_del_channel(s_tx);
+        if (e != ESP_OK) {
+            ESP_LOGE(TAG, "I2S channel delete failed: %s",
+                     esp_err_to_name(e));
+        }
+        s_tx = NULL;
+    }
+    esp_err_t e = audio_create_channel();
+    if (e != ESP_OK) {
+        s_ready = false;              /* bus gone: block playback */
+        xSemaphoreGive(s_io_lock);
+        return e;
+    }
+    /* Recompute everything that depends on the (possibly changed) sample
+     * rate and start the DSP history clean, settled at the current gains
+     * (no fade-in on the first track after the rebuild). */
+    audio_set_hpf_coeff(s_rate);
+    audio_set_loudness_coeff(s_rate);
+    audio_dsp_reset();
+    s_vol_gain_sm = s_vol_gain;
+    s_loud_boost_sm = s_loud_boost;
+    s_track_gain_sm = s_track_gain;
+    s_master_gain_sm = s_master_gain;
+    s_wr_errs = 0;
+    xSemaphoreGive(s_io_lock);
+    ESP_LOGI(TAG, "I2S channel rebuilt (rate %u Hz)", (unsigned)s_rate);
+    return ESP_OK;
 }
 
 /* Bluetooth link callback. On a drop (remote power-off / out of range / failed
@@ -596,6 +681,28 @@ void hw_audio_set_track_gain_db(float gain_db)
     }
 }
 
+/* Global master gain (user preamp), dB. Clamped to ±12 dB and converted to a
+ * Q15 gain the DSP chain applies right after the per-track ReplayGain, on
+ * both routes. The smoothing ramps to it over ~5 ms, so a change never
+ * clicks. Set by the UI (settings page) at any time, even mid-playback. */
+void hw_audio_set_master_gain_db(float gain_db)
+{
+    if (gain_db > MASTER_GAIN_MAX_DB) {
+        gain_db = MASTER_GAIN_MAX_DB;
+    }
+    else if (gain_db < -MASTER_GAIN_MAX_DB) {
+        gain_db = -MASTER_GAIN_MAX_DB;
+    }
+    s_master_gain_db = gain_db;
+    s_master_gain = (int32_t)(powf(10.0f, gain_db / 20.0f) * 32768.0f + 0.5f);
+    ESP_LOGI(TAG, "master gain %+.1f dB (Q15=%d)", gain_db, (int)s_master_gain);
+}
+
+float hw_audio_get_master_gain_db(void)
+{
+    return s_master_gain_db;
+}
+
 /* Reconfigure the I2S sample rate. Applied IMMEDIATELY from the calling task
  * (the MP3 player's decode task — the only user), so the new clock is in
  * place before the first PCM of a track reaches the DMA; there is no
@@ -663,9 +770,10 @@ void hw_audio_set_sample_rate(uint32_t sample_rate_hz)
  * only pacer of the decode task (via the blocking send into the BT ring).
  *
  * Without Bluetooth, the speaker path applies the protection high-pass,
- * the loudness bass shelf, the per-track ReplayGain, the master volume and
- * the soft limiter. The Bluetooth path applies the per-track gain and the
- * master volume only (headphones reproduce full band, and the sink's own
+ * the loudness bass shelf, the per-track ReplayGain, the user master gain,
+ * the master volume and the soft limiter. The Bluetooth path applies the
+ * per-track gain, the user master gain and the master volume only
+ * (headphones reproduce full band, and the sink's own
  * limiting handles hot peaks).
  *
  * Speaker output goes DIRECTLY to the I2S DMA (no ring buffer): the bounded
@@ -705,10 +813,19 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
          * which the player counts and turns into a visible pipeline error —
          * the decode task is never left blocked inside this call forever. */
         for (size_t i = 0; i < n; i++) {
-            /* Per-track ReplayGain first (clamped to 16-bit: the BT path has
-             * no limiter to catch over-boosted peaks). */
+            /* Per-track ReplayGain first, then the user master gain (both
+             * clamped to 16-bit: the BT path has no limiter to catch
+             * over-boosted peaks). */
             s_track_gain_sm += ((s_track_gain - s_track_gain_sm) * VOL_SMOOTH_A_Q15) >> 15;
             int32_t t = (int32_t)(((int64_t)stereo_frames[i] * s_track_gain_sm) >> 15);
+            if (t > 32767) {
+                t = 32767;
+            }
+            else if (t < -32768) {
+                t = -32768;
+            }
+            s_master_gain_sm += ((s_master_gain - s_master_gain_sm) * VOL_SMOOTH_A_Q15) >> 15;
+            t = (int32_t)(((int64_t)t * s_master_gain_sm) >> 15);
             if (t > 32767) {
                 t = 32767;
             }
@@ -724,8 +841,8 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
     }
 
     /* Speaker route: high-pass -> loudness bass shelf -> per-track gain
-     * -> master volume -> soft limiter, all per sample (L = even index,
-     * R = odd index). */
+     * -> user master gain -> master volume -> soft limiter, all per sample
+     * (L = even index, R = odd index). */
     for (size_t i = 0; i < n; i++) {
         int ch = (int)(i & 1);
         int32_t x = stereo_frames[i];
@@ -759,6 +876,18 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
          * multiply: the gain can exceed 1.0 (up to +12 dB). */
         s_track_gain_sm += ((s_track_gain - s_track_gain_sm) * VOL_SMOOTH_A_Q15) >> 15;
         y = (int32_t)(((int64_t)y * s_track_gain_sm) >> 15);
+        if (y > 32767) {
+            y = 32767;
+        }
+        else if (y < -32768) {
+            y = -32768;
+        }
+
+        /* User master gain (preamp offset, pre-volume; the soft limiter
+         * below still bounds the peaks). Same 64-bit multiply: ±12 dB can
+         * scale by up to ~4x. */
+        s_master_gain_sm += ((s_master_gain - s_master_gain_sm) * VOL_SMOOTH_A_Q15) >> 15;
+        y = (int32_t)(((int64_t)y * s_master_gain_sm) >> 15);
         if (y > 32767) {
             y = 32767;
         }
