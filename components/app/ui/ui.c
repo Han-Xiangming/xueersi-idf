@@ -2060,22 +2060,18 @@ static void ui_adjust_lr(int dir)
         if (count == 0) {
             set_action(player_scan_busy() ? "扫描中..." : "无MP3文件");
         }
-        else {
-            int cur = player_current_index();
-            if (cur < 0) {
-                cur = s_mp3_sel;                       /* idle: start from list */
-            }
-            int next = (cur + dir + count) % count;
+        else if (player_state() != PLAYER_IDLE) {
+            /* Switch tracks while playing/paused: the player owns the index
+             * math (wraps at the list ends, relative to the loaded track) and
+             * starts the new track immediately. */
+            int next = (dir < 0) ? player_prev() : player_next();
             s_mp3_sel = next;
-            if (player_state() != PLAYER_IDLE) {
-                /* Switch tracks while playing/paused: load and play the new one. */
-                player_play_index(next);
-                set_action(dir < 0 ? "上一首" : "下一首");
-            }
-            else {
-                /* Idle: just move the cursor, like up/down does. */
-                set_action("选择");
-            }
+            set_action(dir < 0 ? "上一首" : "下一首");
+        }
+        else {
+            /* Idle: just move the cursor, like up/down does. */
+            s_mp3_sel = (s_mp3_sel + dir + count) % count;
+            set_action("选择");
         }
         ui_refresh();
         return;

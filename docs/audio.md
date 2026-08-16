@@ -7,14 +7,15 @@
 ```text
 MP3 解码（helix） ──> hw_audio_write_pcm() → 按路由分发
   ├─ 蓝牙已连接 + 开启 → 音量（~5ms 平滑，全频段）→ bt_audio_write_pcm() → BT 环形缓冲(128KB) → A2DP
-  └─ 喇叭 → 800Hz 保护高通 → 响度低音架 → 音量（平滑）→ 软限幅 → 256KB 环形缓冲
-                                        → audio_feed 任务 → I2S(MAX98357)
+  └─ 喇叭 → 800Hz 保护高通 → 响度低音架 → 音量（平滑）→ 软限幅 → i2s_channel_write() 直写 DMA
+                                       → I2S(MAX98357)
 ```
 
 - 输出 DAC：MAX98357 单声道 Class-D，I2S 标准模式（16-bit 立体声，只写 DOUT 声道），引脚 BCLK=32 / LRC=15 / DIN=21，无 MCLK。
 - 蓝牙输出：A2DP Source，SBC 编码由 Bluedroid 完成（见 `docs/bluetooth.md`）。
-- **路由互斥**：蓝牙连接时只走蓝牙，I2S 完全不喂数据（喇叭静音），解码任务由 BT 环形缓冲的阻塞发送单一时钟驱动，避免双时钟漂移丢音。
-- **通道驻车**：空闲或蓝牙路由时 `audio_feed` 任务禁用 I2S 通道（停 BCLK/LRC），MAX98357 在时钟停止后进入掉电（约 64k BCLK 周期后关断）——菜单待机不空耗；快速续播有 3s 驻车宽限窗口，窗口内不重启时钟（避免 MAX98357 上电咔哒声）。
+- **路由互斥**：蓝牙连接时只走蓝牙，I2S 不喂数据（喇叭静音），解码任务由 BT 环形缓冲的阻塞发送单一时钟驱动，避免双时钟漂移丢音。
+- **直写 I2S（无中间层）**：MP3 解码任务在 DSP 后就地 `i2s_channel_write()` 直写 I2S DMA——没有环形缓冲、没有 feed 任务、没有任务间握手。I2S DMA（8×1024 帧，`auto_clear`）即抖动缓冲，写阻塞的背压把解码节奏钉死在硬件时钟上，解码与硬件不会互相跑飞。
+- **通道驻车（简单开关）**：空闲或蓝牙路由时通道保持禁用（停 BCLK/LRC），MAX98357 在时钟停止后进入掉电（约 64k BCLK 周期后关断）——菜单待机不空耗。播放时由首个 PCM 帧的写入启用通道（采样率重配之后，时钟永不先于数据启动）；停止/切路由时立即驻车。所有通道操作由 `s_io_lock` 互斥锁串行化，IDF 驱动本身会在通道禁用时放行在途写调用（`i2s_channel_disable` 置 READY 并等写循环退出），因此任意任务随时可停。
 
 ## 2. 音量模型
 
@@ -50,27 +51,28 @@ MP3 解码（helix） ──> hw_audio_write_pcm() → 按路由分发
 ## 4. 解码/输出解耦（防爆音与欠载）
 
 ```text
-PCM 环形缓冲 256KB（优先 PSRAM，失败退内部堆；>1s @44.1kHz 立体声）
-  hw_audio_write_pcm() 阻塞写入（50ms 步长背压，播放停止时放弃剩余）
-  audio_feed 任务（4KB 栈，优先级 6）→ I2S DMA 连续输出
+直写：hw_audio_write_pcm() 就地 DSP → i2s_channel_write()（100ms 有界超时）
+  I2S DMA（8×1024 帧 ≈ 186ms @44.1kHz，auto_clear 欠载自动静音）即抖动缓冲
+  DMA 写阻塞的背压 = 解码任务的自然节拍（写不满则 DMA 空转，绝无超前）
 ```
 
-- 停止/暂停：`hw_audio_set_player_active(false)` → feed 任务把环内剩余数据丢弃，立即静音（不等 1.5s 缓冲放完）。
-- **事件驱动 feed**：`hw_audio_write_pcm()` 成功入环后 `xTaskNotifyGive` 唤醒 feed（`xRingbufferSend` 自身也会唤醒阻塞的接收者），feed 的环接收超时只作 100ms 兜底——启动与欠载恢复不再等 50ms 轮询切片。
-- **播放时钟对齐（抗长期 ppm 漂移）**：MP3 解码速率精确，而 I2S BCLK（APLL 派生）只有 ppm 级精度；256KB 环吸收短时漂移，但长播会单向耗尽导致周期性欠载空白（环满侧由 `xRingbufferSend` 背压自限，不可闻，无需处理）。feed 任务每秒测一次环填充率的平滑斜率（`audio_clock_tick`），当环在**衰减**时以 Q16 概率在 I2S 写阶段**插入重复的 L/R 样本对**（`audio_clock_insert_pairs`，1 对/秒 ≈ +22.7ppm，上限 ~4 对/秒 ≈ 90ppm，逐样本统计、随机散布、不可闻），1:1 抵消解码器与硬件的速率差；欠载次数（`s_starve`）与插入数（`s_corr_ins`）在出现时以 WARN 上报。所有状态仅 feed 任务私有，无锁。
-- 采样率变更：`hw_audio_set_sample_rate()` 只写 `s_pending_rate`，由 feed 任务串行执行 `i2s_channel_reconfig_std_clock`（禁用→重配），同时通知蓝牙管线内部重采样。**重配后通道保持禁用**，由 speaker 路径在同一个循环轮次里、紧接环接收/写入之前启用——BCLK 永不先于数据启动（无起始 auto-clear 空白，也没有启用/禁用的空转抖动）。
-- 蓝牙路由时 feed 任务只清空 256KB 环（不入 I2S），保持通道驻车（见 §1），并重置时钟对齐基线（蓝牙侧由 A2DP 流控自行定钟）。
+- 停止/暂停：`hw_audio_set_player_active(false)` 立即禁用通道（停 BCLK），解码任务下次写返回 `AUDIO_WRITE_ABANDONED`，瞬时静音、无缓冲残留。
+- **采样率即时生效**：`hw_audio_set_sample_rate()` 由解码任务同步执行（运行中先驻车 → `i2s_channel_reconfig_std_clock` → 下个写帧再启用），新曲目的时钟必然先于数据就位；不存在旧架构"待应用 rate 被暂停清掉"导致整曲变调的问题，重配返回值也会被检查并上报。
+- **播放时钟对齐（取舍说明）**：MP3 解码速率精确而 I2S BCLK（APLL 派生）仅 ppm 级精度，旧架构用 ring+feed+插样主动抵消漂移；直写模式下该漂移由 DMA 吸收，最坏表现为长时间播放中偶发一次约几十 ms 的欠载静音（`auto_clear` 兜底、自恢复），远轻于旧架构概率性整首无声。
+- **通道生命周期**：启用仅发生在首个 PCM 写帧（采样率重配之后），BCLK 永不先于数据启动（无起始 auto-clear 空白）；禁用发生在停止/暂停/切到蓝牙路由时。全部通道操作（enable/disable/重配/写）由 `s_io_lock` 互斥锁串行，跨任务停止安全（IDF 驱动在 `i2s_channel_disable` 中置 READY 并等待在途写循环退出）。
+- 蓝牙路由时 I2S 通道保持驻车（见 §1），蓝牙侧由 A2DP 流控自行定钟。
 
 ## 5. 接口摘要
 
 ```text
 components/drivers/audio/audio.c
-  hw_audio_init()                        I2S 初始化 + 音量表 + DSP 系数 + feed 任务
+  hw_audio_init()                        I2S 初始化 + 音量表 + DSP 系数 + io 互斥锁（通道驻车）
   hw_audio_set/get_volume(pct)           当前生效路由的音量 0..100
   hw_audio_set/get_speaker_volume(pct)   喇叭路由音量槽位（NVS 恢复用）
   hw_audio_set/get_bt_volume(pct)        蓝牙路由音量槽位
   hw_audio_set_avrc_volume(v)            AVRCP 绝对音量 0..127（写蓝牙槽位）
-  hw_audio_set_sample_rate(hz)           请求重配 I2S（feed 任务内串行执行）
-  hw_audio_set_player_active(bool)       MP3 播放器声明 I2S 总线归属（停止即释放）
-  hw_audio_write_pcm(frames,n)           就地 DSP 后送入生效路由（BT 或喇叭环）
+  hw_audio_set_track_gain_db(dB)         每曲 ReplayGain（两路由通用）
+  hw_audio_set_sample_rate(hz)           立即重配 I2S 采样率（解码任务同步执行）
+  hw_audio_set_player_active(bool)       MP3 播放器声明 I2S 总线归属（停止即驻车）
+  hw_audio_write_pcm(frames,n)           就地 DSP 后直写 I2S DMA（或送 BT 路由）
 ```

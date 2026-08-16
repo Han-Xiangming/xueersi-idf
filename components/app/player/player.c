@@ -37,8 +37,8 @@
  * spinning the CPU forever on a file that will never produce audio. */
 #define TRACK_MAX_DECODE_ERRS    512
 /* Consecutive AUDIO_WRITE_STALLED results that abort a track. Each stall is
- * ~2 s of a full ring, which proves the feed task is not consuming; a few in
- * a row mean the pipeline is wedged, not just momentarily slow. */
+ * a bounded I2S write timing out, which proves the DMA is not consuming; a
+ * few in a row mean the pipeline is wedged, not just momentarily slow. */
 #define TRACK_MAX_PIPELINE_STALLS 3
 /* Consecutive tracks that failed to play before the player gives up and
  * stops (avoids cycling through a whole card of corrupt files forever). */
@@ -103,10 +103,11 @@ typedef struct {
 
 /* Decoder working buffers (owned by the decode loop). s_pcm stays in
  * internal DRAM on purpose: for stereo files (the common case) it is the
- * buffer memcpy'd by hw_audio_write_pcm into the PSRAM audio ring at ~40 Hz,
- * and a PSRAM source there puts the cache-workaround copy on the hot path
- * (documented crash source under BT controller load). s_stereo, used only
- * for mono files, keeps the PSRAM placement to fit the DRAM budget. */
+ * buffer handed to hw_audio_write_pcm (DSP in place, then written to the
+ * I2S DMA) at ~40 Hz, and a PSRAM source there puts the cache-workaround
+ * copy on the hot path (documented crash source under BT controller load).
+ * s_stereo, used only for mono files, keeps the PSRAM placement to fit the
+ * DRAM budget. */
 static track_src_t s_src;
 static HMP3Decoder s_dec;
 static unsigned char s_readbuf[MP3_READ_CHUNK];
@@ -623,7 +624,13 @@ static void close_track(void)
         fclose(s_src.fp);
         s_src.fp = NULL;
     }
-    hw_audio_set_player_active(false);
+    /* Deliberately NOT parking the I2S channel here: a track switch (next/
+     * prev, or list auto-advance) must not stop and restart the clock, or
+     * the DMA would clock out stale descriptors and the first write after
+     * re-enable would block ~26 ms waiting for the queue. The channel stays
+     * enabled across switches; it is parked only when the whole decode loop
+     * exits (stop/watchdog), at pause, and by hw_audio_set_player_active
+     * itself on the BT route. */
 }
 
 /* Read up to `want` bytes from the active source into `out`. Returns the
@@ -727,12 +734,10 @@ static bool decode_frame(bool *rate_set)
         wr = hw_audio_write_pcm(s_stereo, (size_t)info.outputSamps);
     }
     if (wr == AUDIO_WRITE_STALLED) {
-        /* The feed task is not consuming the ring (2 s of full ring proves
-         * it). Drop the backlog and re-wake it so the NEXT frame restarts
-         * the stream; give up on the track after a few consecutive stalls —
-         * the feed task is then wedged/dead, and the pipeline error is the
-         * honest outcome instead of silent playback forever. */
-        hw_audio_kick();
+        /* The I2S DMA is not consuming (bounded write timed out repeatedly).
+         * Give up on the track after a few consecutive stalls — the pipeline
+         * is then wedged, and the pipeline error is the honest outcome
+         * instead of silent playback forever. */
         if (++s_pcm_stalls >= TRACK_MAX_PIPELINE_STALLS) {
             ESP_LOGE(TAG, "audio pipeline stalled %d times, aborting track",
                      s_pcm_stalls);
@@ -800,22 +805,16 @@ static void decode_loop(void)
             s_track_errored = true;
         }
         else {
-            /* Drop any PCM left over from the previous track so the new
-             * stream never starts with stale samples at the wrong rate. */
-            hw_audio_flush();
             ESP_LOGI(TAG, "start track '%s'", s_name);
+            /* 直写模式下无 ring 需预热：首帧解码前即可声明 I2S 归属（通道
+             * 直到首个 PCM 帧写入时才真正使能，时钟不会先于数据启动，采样率
+             * 也在首帧时立即生效）。旧架构"首帧后才激活"会丢弃每曲首帧，
+             * 且与 feed 任务握手存在概率性竞态导致整曲无声。 */
+            hw_audio_set_player_active(true);
 
             bool rate_set = false;
             int frame_cnt = 0;
             s_dbg_frames = 0;             /* reset debug frame counter */
-            /* player-active (feed task) is claimed AFTER the first decoded
-             * frame of THIS track has been enqueued. Reset it per track —
-             * including when we loop back via `continue` for a track switch —
-             * otherwise a switch would leave `s_feeding` false (close_track
-             * cleared it) and the feed task would never re-activate, filling
-             * the ring and wedging decode_loop forever in hw_audio_write_pcm
-             * (the "log hangs, no audio" symptom). */
-            bool started = false;
             while (!s_stop_req && !s_new_req) {
                 /* Decode-progress heartbeat for the stall watchdog: this
                  * runs once per frame, so while PLAYING a healthy pipeline
@@ -863,16 +862,6 @@ static void decode_loop(void)
                              frame_cnt, (float)frame_cnt * 1152.0f /
                                         (float)(s_dbg_rate ? s_dbg_rate : 44100));
                 }
-                if (!started) {
-                    /* Claim the I2S bus only AFTER the first decoded frame
-                     * has been enqueued and its sample rate applied. This
-                     * closes the window where the feed task would enable the
-                     * channel and stream an empty/stale ring (or reconfigure
-                     * the rate) before any real PCM arrived — which is what
-                     * made the next track silent. */
-                    hw_audio_set_player_active(true);
-                    started = true;
-                }
             }
 
             ESP_LOGI(TAG, "track ended: frames=%u (~%u ms est.), %s",
@@ -882,6 +871,34 @@ static void decode_loop(void)
                      s_stop_req ? "stopped by user"
                                 : s_track_errored ? "aborted (error)"
                                                   : "reached EOF");
+            /* Single-track loop: replay the SAME file IN PLACE — rewind the
+             * source, reset the decode state and start decoding again. The
+             * I2S channel is never parked and no request round-trip (which
+             * would re-open the file and stop/start the clock) is involved,
+             * so the loop is gapless and works even when the track is not in
+             * the playlist. Only a clean EOF replays: a corrupt/pipeline
+             * failure falls through to the error path below. */
+            if (!s_stop_req && !s_new_req && !s_track_errored &&
+                s_repeat == PLAYER_REPEAT_ONE) {
+                if (fseek(s_src.fp, 0, SEEK_SET) != 0) {
+                    ESP_LOGE(TAG, "repeat-one rewind failed for '%s'", s_name);
+                    s_track_errored = true;
+                }
+                else {
+                    s_bytes_left = 0;
+                    s_consumed = 0;
+                    s_no_sync_refills = 0;   /* fresh pass: restart watchdogs */
+                    s_track_errs = 0;
+                    s_pcm_stalls = 0;
+                    s_dbg_frames = 0;
+                    frame_cnt = 0;
+                    rate_set = false;
+                    parse_id3v2();           /* re-skip the tag + ReplayGain */
+                    hw_audio_set_player_active(true); /* re-arm the pipeline */
+                    ESP_LOGI(TAG, "repeat one: replaying '%s'", s_name);
+                    continue;   /* back into the decode while: same file */
+                }
+            }
             close_track();
         }
 
@@ -912,18 +929,10 @@ static void decode_loop(void)
         }
         s_fail_count = 0;
 
-        /* Natural end of track: advance per the repeat mode. List loop
-         * advances to the next entry (wrapping at the end); single-track loop
-         * replays the current track. If the current track isn't in the list
-         * (s_index < 0) or the list is empty, list loop just stops —
-         * single-track loop replays by path and needs no list at all. */
-        if (s_repeat == PLAYER_REPEAT_ONE) {
-            player_play(s_path);
-            /* Self-call: only s_new_req is set (no s_stop_req — the track has
-             * already ended), so the loop top picks up the SAME track again.
-             * Re-run rather than break so it loops. */
-            continue;
-        }
+        /* Natural end of track: advance to the next list entry, wrapping at
+         * the end. (Single-track loop never gets here: it replays the file
+         * in place inside the track block above.) If the current track isn't
+         * in the list (s_index < 0) or the list is empty, just stop. */
         int cnt = s_playlist->count;
         if (cnt <= 0 || s_index < 0) {
             break;
@@ -934,6 +943,10 @@ static void decode_loop(void)
          * track. Re-run rather than break so the next song starts. */
         continue;
     }
+    /* Decode loop is leaving for good (stop / watchdog / too many failures):
+     * release the I2S bus so the amp powers down and the BT route can take
+     * over. (Track switches deliberately do NOT park — see close_track().) */
+    hw_audio_set_player_active(false);
     s_state = PLAYER_IDLE;
     s_in_decode_loop = false;
 }
@@ -1005,7 +1018,7 @@ void player_init(void)
     s_name[0] = '\0';
     /* Debug tracing is compiled in (LOG_LOCAL_LEVEL) but off by default;
      * the settings page LOG option enables it at runtime. */
-    if (xTaskCreate(player_task, "mp3_player", 16 * 1024, NULL, 5, &s_task)
+    if (xTaskCreate(player_task, "mp3_player", 16 * 1024, NULL, 6, &s_task)
             != pdPASS) {
         ESP_LOGE(TAG, "[ERROR] player task create FAILED");
         s_task = NULL;
@@ -1201,9 +1214,8 @@ const char *player_current_name(void)
 
 void player_play(const char *path)
 {
-    /* 原则3：audio 未 ready 时不接受播放请求，避免 feed task 不存在导致
-     * decode 卡死（"同一次开机随机失败"的根因之一）。上报错误而不是静默
-     * 忽略，UI 才能告诉用户为什么按播放没反应。 */
+    /* 原则3：audio 未 ready（I2S/互斥锁未初始化）时不接受播放请求。上报
+     * 错误而不是静默忽略，UI 才能告诉用户为什么按播放没反应。 */
     if (!hw_audio_is_ready()) {
         ESP_LOGE(TAG, "[ERROR] play requested but audio not ready, ignored");
         player_report_error(PLAYER_ERR_AUDIO);
@@ -1245,11 +1257,6 @@ void player_play(const char *path)
     if (!s_in_decode_loop) {
         s_stop_req = true;          /* ask any current decode to stop */
     }
-    /* Drop the previous track's queued PCM immediately. Without this, the feed
-     * task would keep playing the old ring's tail (up to ~1 s) after we park
-     * the bus in close_track(), so a track switch would audibly bleed the
-     * previous song before the new one starts. */
-    hw_audio_flush();
     s_state = PLAYER_PLAYING;
     if (s_task != NULL) {
         xTaskNotifyGive(s_task);
@@ -1275,6 +1282,40 @@ int player_current_index(void)
     return s_index;
 }
 
+/* Wrap-around step from the current track: -1 when the list is empty, the
+ * target index otherwise. While nothing is loaded the step starts at the
+ * first entry, so next/prev still report a sensible cursor position. */
+static int player_step(int dir)
+{
+    const int cnt = player_scan_count();
+    if (cnt <= 0) {
+        return -1;
+    }
+    int cur = player_current_index();
+    if (cur < 0) {
+        cur = 0;
+    }
+    return (cur + dir + cnt) % cnt;
+}
+
+int player_next(void)
+{
+    const int i = player_step(1);
+    if (i >= 0 && s_state != PLAYER_IDLE) {
+        player_play_index(i);
+    }
+    return i;
+}
+
+int player_prev(void)
+{
+    const int i = player_step(-1);
+    if (i >= 0 && s_state != PLAYER_IDLE) {
+        player_play_index(i);
+    }
+    return i;
+}
+
 void player_toggle(void)
 {
     if (s_state == PLAYER_PLAYING) {
@@ -1297,11 +1338,11 @@ void player_toggle(void)
 void player_stop(void)
 {
     /*
-     * Release the I2S bus FIRST so the decode task's back-pressure loop
-     * inside hw_audio_write_pcm() bails out immediately (it checks
-     * s_player_active before and during every write). Without this, the
-     * decode task stays stuck waiting for I2S to drain the ring and might
-     * not see s_stop_req for hundreds of milliseconds.
+     * Release the I2S bus FIRST (parks the channel; a concurrent bounded
+     * write in hw_audio_write_pcm() bails out via its s_player_active
+     * check). Without this, the decode task could keep streaming into a
+     * parked/failed DMA and might not see s_stop_req for up to a write
+     * timeout (100 ms).
      *
      * The dormant player path (when paused) is woken via the notify below.
      */

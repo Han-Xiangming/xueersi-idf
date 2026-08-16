@@ -3,6 +3,12 @@
  *
  * Streams decoded MP3 PCM over I2S (BCLK/LRC/DIN); the MAX98357 derives its
  * own master clock from BCLK, so no MCLK is wired.
+ *
+ * Direct-write architecture: the MP3 player task applies the DSP chain and
+ * writes PCM straight to the I2S DMA (no ring buffer / feed task). The DMA
+ * paces the decoder by back-pressure; the channel is enabled by the first
+ * write of a speaker session and parked (BCLK stopped, amp powered down)
+ * while idle or on the Bluetooth route.
  */
 #pragma once
 
@@ -22,13 +28,13 @@ typedef enum {
 } audio_route_t;
 
 /* Initialize the I2S peripheral and the MAX98357 DAC. Leaves the route at its
- * default (SPEAKER). */
+ * default (SPEAKER) and the channel parked. */
 void hw_audio_init(void);
 
 /* Explicitly select the active output route. The writer streams to exactly
- * this destination. Switching away from the speaker parks the I2S feed (the
- * amp powers down) so it goes truly silent instead of starving its ring;
- * switching back resumes it. This is the ONLY way the route changes. */
+ * this destination. Switching away from the speaker parks the I2S channel
+ * (the amp powers down) so it goes truly silent; switching back resumes it.
+ * This is the ONLY way the route changes. */
 void hw_audio_set_route(audio_route_t route);
 
 /* Current active output route. */
@@ -58,40 +64,34 @@ void hw_audio_set_avrc_volume(uint8_t volume_0_127);
  * start (untagged tracks: 0 dB). */
 void hw_audio_set_track_gain_db(float gain_db);
 
-/* Reconfigure the I2S sample rate (e.g. to match an MP3 file's rate). */
+/* Reconfigure the I2S sample rate (e.g. to match an MP3 file's rate).
+ * Applied immediately from the calling task; a running channel is parked
+ * for the reconfig and re-enabled by the next PCM write, so the new clock
+ * is always in place before the first data of a track. */
 void hw_audio_set_sample_rate(uint32_t sample_rate_hz);
 
-/* Mark/unmark the MP3 player as the owner of the I2S bus. */
+/* Mark/unmark the MP3 player as the owner of the I2S bus. Claiming only
+ * arms the pipeline (the channel is enabled by the first PCM write);
+ * releasing parks the channel immediately (BCLK stops, amp powers down).
+ * Safe to call from any task, including while a write is in flight. */
 void hw_audio_set_player_active(bool active);
 
-/* Discard all PCM currently queued in the ring (leftovers from the previous
- * track) without parking the channel. Call before starting a new track so the
- * stream opens cleanly at the new sample rate. */
-void hw_audio_flush(void);
-
-/* Result of a PCM write, so the caller can distinguish "enqueued" from
- * "the pipeline is wedged" (feed task not consuming) vs "playback was
+/* Result of a PCM write, so the caller can distinguish "streamed" from
+ * "the pipeline is wedged" (DMA not consuming) vs "playback was
  * deactivated mid-write" (pause/stop — not an error). */
 typedef enum {
-    AUDIO_WRITE_OK = 0,       /* enqueued into the ring (or BT) */
-    AUDIO_WRITE_STALLED,      /* ring stayed full for the whole bounded wait */
-    AUDIO_WRITE_ABANDONED,    /* player deactivated mid-write: nothing enqueued */
+    AUDIO_WRITE_OK = 0,       /* streamed to the I2S DMA (or BT) */
+    AUDIO_WRITE_STALLED,      /* I2S write failed / timed out (wedged) */
+    AUDIO_WRITE_ABANDONED,    /* player deactivated mid-write: not an error */
 } audio_write_result_t;
 
 /* Stream raw 16-bit stereo PCM (L,R interleaved). `frames` = number of
  * L/R pairs. Used by the MP3 player to output decoded audio. Samples are
  * filtered in place (per-track ReplayGain + speaker-protection high-pass +
- * loudness shelf + volume + limiter, see the driver docs) before enqueueing.
- * Never blocks for more than ~2 s: on a wedged pipeline it returns
- * AUDIO_WRITE_STALLED so the caller can recover instead of hanging. */
+ * loudness shelf + volume + limiter, see the driver docs) before a bounded
+ * direct write to the I2S DMA, which paces the caller by back-pressure. */
 audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames);
 
-/* Pipeline recovery kick: discard all queued PCM and wake the feed task.
- * Call after an AUDIO_WRITE_STALLED to drop the decoder's back-pressure and
- * let the next frame restart the stream from a clean ring. */
-void hw_audio_kick(void);
-
-/* True only after I2S, PCM ring and the feed task are all up. Callers must
- * NOT start playback before this returns true (prevents decode deadlock when
- * the feed task is missing). */
+/* True only after the I2S channel and the IO mutex are up. Callers must
+ * NOT start playback before this returns true. */
 bool hw_audio_is_ready(void);

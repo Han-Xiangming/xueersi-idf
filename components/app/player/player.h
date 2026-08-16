@@ -60,7 +60,7 @@ typedef enum {
     PLAYER_ERR_NONE = 0,   /* all good */
     PLAYER_ERR_OPEN,       /* track file open / decoder init failed */
     PLAYER_ERR_CORRUPT,    /* aborted: no MP3 sync word / too many decode errors */
-    PLAYER_ERR_PIPELINE,   /* audio pipeline stalled repeatedly (feed task wedged) */
+    PLAYER_ERR_PIPELINE,   /* audio pipeline stalled repeatedly (I2S DMA wedged) */
     PLAYER_ERR_STALL,      /* decode made no progress for a long time (SD/BT hang) */
     PLAYER_ERR_AUDIO,      /* play requested while the audio pipeline is not ready */
 } player_err_t;
@@ -177,13 +177,20 @@ const char *player_current_name(void);
 void player_play(const char *path);
 
 /* Play the track at list index `i` (0-based). Out-of-range indices are
- * ignored. Wraps around the scan list, so it doubles as next/prev when the
- * caller adds/subtracts 1 modulo player_scan_count(). */
+ * ignored. */
 void player_play_index(int i);
 
 /* Index of the track currently loaded (0-based), or -1 when nothing has been
- * loaded yet / the list is empty. Lets the UI drive next/prev from the list. */
+ * loaded yet / the list is empty. */
 int player_current_index(void);
+
+/* Move to the next/previous track relative to the current one, wrapping at
+ * the list ends. While a track is loaded (playing or paused) the switch is
+ * immediate; when idle they just report the index a next/prev would land on
+ * (the UI moves its cursor without starting playback). Returns the index of
+ * the target track, or -1 when the list is empty. */
+int player_next(void);
+int player_prev(void);
 
 /* Pause the current track, or resume if paused. */
 void player_toggle(void);
