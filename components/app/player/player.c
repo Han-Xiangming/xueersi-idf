@@ -460,6 +460,23 @@ static void parse_id3v2(void)
         hw_audio_set_track_gain_db(0.0f);
         return;
     }
+    /* A corrupt size field can claim more bytes than the file holds.
+     * Seeking past EOF would make every later read return 0 (the track
+     * silently plays nothing), and the frame walk below would grind across
+     * the whole bogus span on SDSPI (minutes, no WDT feed -> reboot).
+     * Trust the file: when the declared tag overruns it, seek straight
+     * after the 10-byte header and let the decoder resync onto the real
+     * audio frames (MP3FindSyncWord scans byte-wise). */
+    long flen;
+    if (fseek(s_src.fp, 0, SEEK_END) == 0 && (flen = ftell(s_src.fp)) >= 0) {
+        if (base + 10 + tag_size > flen) {
+            ESP_LOGW(TAG, "ID3v2 size %ld overruns file (%ld bytes), resync",
+                     tag_size, flen);
+            fseek(s_src.fp, base + 10, SEEK_SET);
+            hw_audio_set_track_gain_db(0.0f);
+            return;
+        }
+    }
     long tag_end = base + 10 + tag_size;
     long pos = base + 10;
     if (hdr[5] & 0x40) {
@@ -475,7 +492,13 @@ static void parse_id3v2(void)
         }
     }
 
-    while (pos + 10 <= tag_end) {
+    /* Bounded frame walk: even with the file-length check above, a
+     * pathological tag can still claim a large-but-valid size full of
+     * non-padding garbage (no 0x00 frame IDs). Cap the iterations so the
+     * worst case is a few hundred SD seeks (~0.3 s), far under the task
+     * WDT / stall-watchdog limits. */
+    int frames_scanned = 0;
+    while (pos + 10 <= tag_end && frames_scanned++ < 512) {
         unsigned char fh[10];
         if (fseek(s_src.fp, pos, SEEK_SET) != 0 ||
             fread(fh, 1, sizeof(fh), s_src.fp) != sizeof(fh)) {
@@ -490,7 +513,17 @@ static void parse_id3v2(void)
             size_t rd = (fsz < (long)sizeof(d)) ? (size_t)fsz : sizeof(d);
             if (fread(d, 1, rd, s_src.fp) == rd && rd >= 3) {
                 int enc = d[0];
-                size_t de = 1;   /* description terminator: first NUL (pair) */
+                size_t dstart = 1;   /* first description byte */
+                if (enc == 1 || enc == 2) {
+                    /* UTF-16 with BOM (0xFF 0xFE = LE, 0xFE 0xFF = BE):
+                     * the BOM sits between the encoding byte and the text,
+                     * so the description really starts after it. */
+                    if (rd >= 3 && ((d[1] == 0xFF && d[2] == 0xFE) ||
+                                    (d[1] == 0xFE && d[2] == 0xFF))) {
+                        dstart = 3;
+                    }
+                }
+                size_t de = dstart;   /* description terminator */
                 if (enc == 1 || enc == 2) {
                     while (de + 1 < rd &&
                            !(d[de] == 0x00 && d[de + 1] == 0x00)) {
@@ -503,12 +536,12 @@ static void parse_id3v2(void)
                     }
                 }
                 size_t vs = de + ((enc == 1 || enc == 2) ? 2 : 1);
-                if (de > 1 && vs < rd) {
-                    if (id3_desc_matches(d + 1, de - 1,
+                if (de > dstart && vs < rd) {
+                    if (id3_desc_matches(d + dstart, de - dstart,
                                          "REPLAYGAIN_TRACK_GAIN")) {
                         has_track = id3_parse_db(d + vs, rd - vs, &track_gain);
                     }
-                    else if (id3_desc_matches(d + 1, de - 1,
+                    else if (id3_desc_matches(d + dstart, de - dstart,
                                               "REPLAYGAIN_ALBUM_GAIN")) {
                         has_album = id3_parse_db(d + vs, rd - vs, &album_gain);
                     }
@@ -820,6 +853,15 @@ static void decode_loop(void)
                     break;
                 }
                 frame_cnt++;
+                /* Playback heartbeat (INFO, ~6 s at 44.1 kHz): while a track
+                 * plays, healthy decode emits nothing else, so an apparently
+                 * frozen serial log is really normal — this line proves the
+                 * decode loop is alive and producing frames. */
+                if (frame_cnt % 256 == 0) {
+                    ESP_LOGI(TAG, "playing... frame #%d (%.1f s)",
+                             frame_cnt, (float)frame_cnt * 1152.0f /
+                                        (float)(s_dbg_rate ? s_dbg_rate : 44100));
+                }
                 if (!started) {
                     /* Claim the I2S bus only AFTER the first decoded frame
                      * has been enqueued and its sample rate applied. This
