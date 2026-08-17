@@ -56,7 +56,7 @@ FATFS 目录遍历在 SDSPI 上耗时数十 ms，故列表由**独立扫描任�
 
 - 曲目**自然播放结束（EOF）**时的行为由循环模式决定（播放页按 Select 键切换，右上角状态栏显示当前模式）：
   - `PLAYER_REPEAT_ALL`（列表循环，默认）：切到列表下一首，末尾回绕到第一首；当前曲目不在列表（`s_index < 0`）或列表为空时停止。
-  - `PLAYER_REPEAT_ONE`（单曲循环）：按当前曲目路径从头重播，不依赖播放列表。
+  - `PLAYER_REPEAT_ONE`（单曲循环）：按当前曲目路径从头重播，不依赖播放列表。实现为**原地重绕**（`rewind_track()`）：`fseek` 回文件头 → 重建 helix 解码器（`MP3FreeDecoder` + `MP3InitDecoder`，避免第二遍复用残留的 bit-reservoir/VBR/重同步状态）→ 复位游标与看门狗 → 重新跳过 ID3v2 标签并拾取 ReplayGain → 重武装 I2S 管线。整个过程不停 I2S 时钟、不重开文件，循环**无缝**；重绕失败（seek/解码器重建失败）则落入错误路径自动切下一首，损坏文件不会死循环。
 - 播放器没有手动播放列表导航 API：`player_play()` 每次都是新曲目；AVRCP 的 NEXT/PREV 回调在 main.c 中被忽略（仅记日志）。
 
 ## 5. 与其它模块的接口
