@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 
 #include "esp_attr.h"
 #include "esp_log.h"
@@ -21,6 +22,7 @@ static const char *TAG = "ebook";
 
 /* --- Tuning constants (docs/ebook.md) --- */
 #define EBOOK_NAME_MAX      64           /* book name buffer size */
+#define EBOOK_PATH_MAX      320          /* book path buffer size (matches player) */
 #define EBOOK_LIST_MAX      64           /* max books in the scan list */
 #define EBOOK_CHUNK         (4 * 1024)   /* stream window of the reader */
 #define EBOOK_PAGE_BUF      1024         /* rendered page text buffer */
@@ -37,6 +39,27 @@ static const char *TAG = "ebook";
 #define EBOOK_CHAR_W16      256          /* fullwidth advance, 1/16 px = 16 px */
 #define EBOOK_HIST_N        32           /* page-start offset history ring */
 #define EBOOK_ROM_PREFIX    "(ROM)"
+
+/* Reading-progress persistence on the SD card (single file next to the
+ * books, so it moves with the card and survives firmware updates). A
+ * debounced save runs EBOOK_SAVE_DELAY_MS after the last page flip;
+ * ebook_close() / flush save immediately as a fallback. */
+#define EBOOK_PROG_FILE     EBOOK_ROOT "/.progress"
+#define EBOOK_PROG_TMP      EBOOK_ROOT "/.progress.tmp"
+#define EBOOK_PROG_MAGIC    0x47504245   /* "EBPG" */
+#define EBOOK_PROG_MAX      128          /* remembered books (MRU, oldest dropped) */
+#define EBOOK_SAVE_DELAY_MS 3000
+#define EBOOK_SAVE_POLL_MS  500
+
+/* Saved per-book position entry. `hash` is the 48-bit FNV-1a of the book
+ * path; `size` guards against a changed file: the position is only restored
+ * when it matches the current file size. */
+typedef struct {
+    uint64_t hash;
+    uint32_t offset;
+    uint32_t page;
+    uint32_t size;
+} eb_progress_t;
 
 /* Built-in test book compiled into the firmware via EMBED_FILES
  * (IDF names the symbols from the file basename only). */
@@ -142,7 +165,7 @@ typedef struct {
     bool embedded;
     const uint8_t *rom_start;
     size_t rom_size;
-    char path[192];
+    char path[EBOOK_PATH_MAX];
     size_t size;
 } book_src_t;
 
@@ -153,7 +176,7 @@ static reader_t s_reader;
 static book_src_t s_book;
 
 static char s_page_buf[EBOOK_PAGE_BUF] EXT_RAM_BSS_ATTR;
-static char s_scan_buf[2][EBOOK_LIST_MAX][EBOOK_NAME_MAX] EXT_RAM_BSS_ATTR;
+static char s_scan_buf[2][EBOOK_LIST_MAX][EBOOK_PATH_MAX] EXT_RAM_BSS_ATTR;
 
 static size_t s_cur_start;               /* start offset of the current page */
 static size_t s_next_start;              /* start offset of the next page */
@@ -170,11 +193,40 @@ static uint32_t s_open_gen;              /* bump on open/close: invalidate count
 static int s_scan_active;                /* index of the published list */
 static int s_scan_count;
 static bool s_scan_busy;
+static bool s_scan_pending;              /* a load request landed mid-scan: redo */
 static uint32_t s_scan_ver;
+
+/* The directory the next/last scan walks. Defaults to the whole eBook tree
+ * (EBOOK_ROOT). Set by ebook_scan_root(); read by ebook_scan_task. */
+static char s_load_root[EBOOK_PATH_MAX] = EBOOK_ROOT;
+
+/* Display name of the currently loaded source: "整卡" for the whole tree,
+ * else the folder's basename. Mirrors the player's s_src_name. */
+static char s_src_name[EBOOK_NAME_MAX];
 
 static TaskHandle_t s_scan_task;
 static TaskHandle_t s_count_task;
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* --- reading-progress snapshot (UI task writes, save task reads) ---
+ * The save task must not touch s_cur_start / s_page (UI-task-private), so
+ * progress_arm() copies a snapshot under the mutex; progress_save() only
+ * writes it out when the open book still matches s_snap_path (a book switch
+ * re-arms immediately, so the snapshot always belongs to the current book).
+ * The on-card file is mirrored into s_prog[] (MRU order) on open; saves
+ * update the cache and rewrite the file atomically (tmp + rename). */
+static char s_snap_path[EBOOK_PATH_MAX];
+static uint32_t s_snap_off;
+static uint32_t s_snap_page;
+static uint32_t s_snap_size;
+static bool s_save_pending;
+static uint32_t s_save_after;            /* tick deadline for the debounce */
+static uint32_t s_resume_pct;            /* restored position %, 0 = page 1 */
+static TaskHandle_t s_save_task;
+
+static eb_progress_t s_prog[EBOOK_PROG_MAX];
+static int s_prog_count;                 /* entries currently in s_prog[] */
+static bool s_prog_loaded;               /* false until a load attempt ran */
 
 /* --- byte window --- */
 
@@ -499,30 +551,69 @@ static void rebuild_history(void)
 
 /* --- SD scan --- */
 
+/* Sort books by file name: shorter names first, then lexicographic by name,
+ * then by full path (so same-named books in different folders keep a stable
+ * order). The name is the last '/' component of the stored full path. */
 static int name_cmp(const void *a, const void *b)
 {
-    return strcasecmp((const char *)a, (const char *)b);
+    const char *pa = (const char *)a;
+    const char *pb = (const char *)b;
+    const char *ba = strrchr(pa, '/');
+    const char *bb = strrchr(pb, '/');
+    ba = (ba != NULL) ? ba + 1 : pa;
+    bb = (bb != NULL) ? bb + 1 : pb;
+    size_t la = strlen(ba), lb = strlen(bb);
+    if (la != lb) {
+        return (la < lb) ? -1 : 1;
+    }
+    int c = strcasecmp(ba, bb);
+    if (c != 0) {
+        return c;
+    }
+    return strcasecmp(pa, pb);
 }
 
-static int scan_dir(char names[][EBOOK_NAME_MAX], int max)
+/* Recursively collect .txt files under `dir` into `paths`, in-place. `depth`
+ * bounds recursion so a pathological directory cycle can't overflow the
+ * stack (mirrors the player's scan, components/app/player/player.c). Returns
+ * the running total; stops early once `max` is reached. */
+static int scan_dir(char paths[][EBOOK_PATH_MAX], int max, const char *dir,
+                    int depth)
 {
+    if (depth > 16 || max <= 0) {
+        return 0;
+    }
     int n = 0;
-    DIR *d = opendir("/sdcard");
+    DIR *d = opendir(dir);
     if (d != NULL) {
         struct dirent *e;
         while ((e = readdir(d)) != NULL && n < max) {
             const char *fn = e->d_name;
-            int len = (int)strlen(fn);
-            if (len > 4 && strcasecmp(fn + len - 4, ".txt") == 0 &&
-                e->d_type != DT_DIR) {
-                strncpy(names[n], fn, EBOOK_NAME_MAX - 1);
-                names[n][EBOOK_NAME_MAX - 1] = '\0';
-                n++;
+            if (fn[0] == '.') {              /* skip ".", "..", hidden */
+                continue;
+            }
+            char child[EBOOK_PATH_MAX];
+            snprintf(child, sizeof(child), "%s/%s", dir, fn);
+
+            /* Decide file vs directory without relying on d_type (unreliable
+             * on FATFS): stat the entry. A directory is recursed into; a
+             * regular file ending in .txt is added with its full path. */
+            struct stat st;
+            if (stat(child, &st) != 0) {
+                continue;
+            }
+            if (S_ISDIR(st.st_mode)) {
+                n += scan_dir(paths + n, max - n, child, depth + 1);
+            } else if (S_ISREG(st.st_mode)) {
+                int len = (int)strlen(fn);
+                if (len > 4 && strcasecmp(fn + len - 4, ".txt") == 0) {
+                    snprintf(paths[n], EBOOK_PATH_MAX, "%s", child);
+                    n++;
+                }
             }
         }
         closedir(d);
     }
-    qsort(names, (size_t)n, EBOOK_NAME_MAX, name_cmp);
     return n;
 }
 
@@ -531,25 +622,56 @@ static void ebook_scan_task(void *arg)
     (void)arg;
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        int active;
         portENTER_CRITICAL(&s_mux);
-        active = s_scan_active;
+        s_scan_busy = true;
         portEXIT_CRITICAL(&s_mux);
-        int work = 1 - active;           /* fill the inactive buffer */
-        int n = scan_dir(s_scan_buf[work], EBOOK_LIST_MAX - 1);
-        if (n < EBOOK_LIST_MAX - 1) {    /* ROM test book always last */
-            strncpy(s_scan_buf[work][n], EBOOK_ROM_PREFIX " Test.txt",
-                    EBOOK_NAME_MAX - 1);
-            s_scan_buf[work][n][EBOOK_NAME_MAX - 1] = '\0';
-            n++;
-        }
+        do {
+            portENTER_CRITICAL(&s_mux);
+            s_scan_pending = false;
+            portEXIT_CRITICAL(&s_mux);
+            int active;
+            portENTER_CRITICAL(&s_mux);
+            active = s_scan_active;
+            portEXIT_CRITICAL(&s_mux);
+            int work = 1 - active;           /* fill the inactive buffer */
+            int n = scan_dir(s_scan_buf[work], EBOOK_LIST_MAX - 1,
+                             s_load_root, 0);
+            /* readdir/stat order is arbitrary across directories; sort so the
+             * list is stable across rescans: file-name length first (shortest
+             * at the top), then lexicographic by name (mirrors the player's
+             * folder scan for stability of same-folder groups). */
+            if (n > 1) {
+                qsort(s_scan_buf[work], (size_t)n, EBOOK_PATH_MAX, name_cmp);
+            }
+            if (strcmp(s_load_root, EBOOK_ROOT) == 0 &&
+                n < EBOOK_LIST_MAX - 1) {    /* ROM test book: whole-card only */
+                strncpy(s_scan_buf[work][n], EBOOK_ROM_PREFIX " Test.txt",
+                        EBOOK_NAME_MAX - 1);
+                s_scan_buf[work][n][EBOOK_NAME_MAX - 1] = '\0';
+                n++;
+            }
+            /* Source display name: "整卡" for the whole tree, else the folder
+             * basename (mirrors player_load_folder). */
+            const char *b = strrchr(s_load_root, '/');
+            const char *base = (b != NULL) ? b + 1 : s_load_root;
+            if (strcasecmp(base, "eBook") == 0) {
+                snprintf(s_src_name, sizeof(s_src_name), "整卡");
+            }
+            else {
+                size_t blen = strnlen(base, sizeof(s_src_name) - 1);
+                memcpy(s_src_name, base, blen);
+                s_src_name[blen] = '\0';
+            }
+            portENTER_CRITICAL(&s_mux);
+            s_scan_active = work;
+            s_scan_count = n;
+            s_scan_ver++;
+            portEXIT_CRITICAL(&s_mux);
+            ESP_LOGI(TAG, "scan '%s' done: %d book(s)", s_load_root, n);
+        } while (s_scan_pending);   /* a request landed mid-scan: redo */
         portENTER_CRITICAL(&s_mux);
-        s_scan_active = work;
-        s_scan_count = n;
         s_scan_busy = false;
-        s_scan_ver++;
         portEXIT_CRITICAL(&s_mux);
-        ESP_LOGI(TAG, "scan done: %d book(s)", n);
     }
 }
 
@@ -611,6 +733,161 @@ static void ebook_count_task(void *arg)
     }
 }
 
+/* --- reading progress (on-card file) --- */
+
+/* 48-bit FNV-1a of the book path, used as the entry key. 48 bits make a
+ * collision between different paths vanishingly unlikely. */
+static uint64_t fnv1a48(const char *s)
+{
+    uint64_t h = 0xcbf29ce484222325ULL;
+    while (*s) {
+        h ^= (uint8_t)*s++;
+        h *= 0x100000001b3ULL;
+    }
+    return h & 0xFFFFFFFFFFFFULL;
+}
+
+/* Load the progress file into s_prog[] (MRU order). A missing or corrupt
+ * file (bad magic / truncated) yields an empty list; the next save rebuilds
+ * it. Called on every book open, so a card swap or external edit takes
+ * effect immediately. */
+static void progress_load(void)
+{
+    s_prog_count = 0;
+    s_prog_loaded = true;
+    FILE *fp = fopen(EBOOK_PROG_FILE, "rb");
+    if (fp == NULL) {
+        return;
+    }
+    uint32_t magic = 0, count = 0;
+    if (fread(&magic, 4, 1, fp) == 1 && fread(&count, 4, 1, fp) == 1 &&
+        magic == EBOOK_PROG_MAGIC && count > 0 && count <= EBOOK_PROG_MAX) {
+        s_prog_count = (int)fread(s_prog, sizeof(eb_progress_t), count, fp);
+    }
+    fclose(fp);
+}
+
+/* Atomically persist s_prog[] (tmp file + rename, so a power cut mid-write
+ * leaves the old file intact). */
+static void progress_store(void)
+{
+    FILE *fp = fopen(EBOOK_PROG_TMP, "wb");
+    if (fp == NULL) {
+        return;
+    }
+    const uint32_t magic = EBOOK_PROG_MAGIC;
+    const uint32_t count = (uint32_t)s_prog_count;
+    fwrite(&magic, 4, 1, fp);
+    fwrite(&count, 4, 1, fp);
+    fwrite(s_prog, sizeof(eb_progress_t), (size_t)count, fp);
+    fclose(fp);
+    rename(EBOOK_PROG_TMP, EBOOK_PROG_FILE);
+}
+
+static void progress_touch(int idx)
+{
+    eb_progress_t t = s_prog[idx];
+    memmove(&s_prog[1], &s_prog[0], (size_t)idx * sizeof(eb_progress_t));
+    s_prog[0] = t;
+}
+
+static void progress_write(const char *path, uint32_t off, uint32_t page,
+                           uint32_t size)
+{
+    if (path[0] == '\0') {
+        return;                          /* embedded ROM book: nothing to save */
+    }
+    if (!s_prog_loaded) {
+        progress_load();
+    }
+    const uint64_t h = fnv1a48(path);
+    int idx = -1;
+    for (int i = 0; i < s_prog_count; i++) {
+        if (s_prog[i].hash == h) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx >= 0) {
+        s_prog[idx].offset = off;
+        s_prog[idx].page = page;
+        s_prog[idx].size = size;
+        progress_touch(idx);             /* most-recently-used first */
+    }
+    else if (s_prog_count < EBOOK_PROG_MAX) {
+        memmove(&s_prog[1], &s_prog[0],
+                (size_t)s_prog_count * sizeof(eb_progress_t));
+        s_prog[0] = (eb_progress_t){ h, off, page, size };
+        s_prog_count++;
+    }
+    else {
+        /* Cache full: replace the least-recently-used entry (last). */
+        s_prog[EBOOK_PROG_MAX - 1] = (eb_progress_t){ h, off, page, size };
+        progress_touch(EBOOK_PROG_MAX - 1);
+    }
+    progress_store();
+}
+
+/* Look up a book's saved position in the loaded cache. Returns true and
+ * fills *p when present. */
+static bool progress_find(const char *path, eb_progress_t *p)
+{
+    const uint64_t h = fnv1a48(path);
+    for (int i = 0; i < s_prog_count; i++) {
+        if (s_prog[i].hash == h) {
+            *p = s_prog[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+static void progress_arm(void)
+{
+    portENTER_CRITICAL(&s_mux);
+    strncpy(s_snap_path, s_book.path, sizeof(s_snap_path) - 1);
+    s_snap_path[sizeof(s_snap_path) - 1] = '\0';
+    s_snap_off = (uint32_t)s_cur_start;
+    s_snap_page = (uint32_t)s_page;
+    s_snap_size = s_book.size;
+    portEXIT_CRITICAL(&s_mux);
+    s_save_after = xTaskGetTickCount() + pdMS_TO_TICKS(EBOOK_SAVE_DELAY_MS);
+    s_save_pending = true;
+}
+
+static void progress_save(void)
+{
+    s_save_pending = false;
+    char path[EBOOK_PATH_MAX];
+    uint32_t off, page, size;
+    portENTER_CRITICAL(&s_mux);
+    if (strcmp(s_snap_path, s_book.path) != 0) {
+        portEXIT_CRITICAL(&s_mux);
+        return;                          /* book switched: stale snapshot */
+    }
+    strncpy(path, s_snap_path, sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+    off = s_snap_off;
+    page = s_snap_page;
+    size = s_snap_size;
+    portEXIT_CRITICAL(&s_mux);
+    progress_write(path, off, page, size);
+}
+
+static void ebook_save_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        if (s_save_pending &&
+            (int32_t)(s_save_after - xTaskGetTickCount()) <= 0) {
+            progress_save();
+        }
+        /* ulTaskNotifyTake(pdTRUE) wakes immediately on a flush request and
+         * consumes the notification, so no spurious wake-ups. */
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(EBOOK_SAVE_POLL_MS));
+    }
+}
+
 /* --- public API --- */
 
 void ebook_init(void)
@@ -627,16 +904,20 @@ void ebook_init(void)
     s_reader.buf_cap = EBOOK_CHUNK;
     xTaskCreate(ebook_scan_task, "eb_scan", 4 * 1024, NULL, 4, &s_scan_task);
     xTaskCreate(ebook_count_task, "eb_count", 4 * 1024, NULL, 4, &s_count_task);
+    xTaskCreate(ebook_save_task, "eb_save", 4 * 1024, NULL, 2, &s_save_task);
 }
 
 void ebook_scan_start(void)
 {
+    ebook_scan_root(EBOOK_ROOT);
+}
+
+void ebook_scan_root(const char *dir)
+{
+    strncpy(s_load_root, dir ? dir : EBOOK_ROOT, sizeof(s_load_root) - 1);
+    s_load_root[sizeof(s_load_root) - 1] = '\0';
     portENTER_CRITICAL(&s_mux);
-    if (s_scan_busy) {
-        portEXIT_CRITICAL(&s_mux);
-        return;
-    }
-    s_scan_busy = true;
+    s_scan_pending = true;
     portEXIT_CRITICAL(&s_mux);
     if (s_scan_task != NULL) {
         xTaskNotifyGive(s_scan_task);
@@ -647,7 +928,7 @@ bool ebook_scan_busy(void)
 {
     bool b;
     portENTER_CRITICAL(&s_mux);
-    b = s_scan_busy;
+    b = s_scan_busy || s_scan_pending;
     portEXIT_CRITICAL(&s_mux);
     return b;
 }
@@ -675,18 +956,41 @@ const char *ebook_scan_name(int idx)
     const char *name = "";
     portENTER_CRITICAL(&s_mux);
     if (idx >= 0 && idx < s_scan_count) {
-        name = s_scan_buf[s_scan_active][idx];
+        /* Entries are full paths; the UI shows the file name only. The ROM
+         * test book has no '/', so the whole string is its name. */
+        const char *p = s_scan_buf[s_scan_active][idx];
+        const char *b = strrchr(p, '/');
+        name = (b != NULL) ? b + 1 : p;
     }
     portEXIT_CRITICAL(&s_mux);
     return name;
 }
 
+const char *ebook_current_src_name(void)
+{
+    return s_src_name;
+}
+
 void ebook_close(void)
 {
     if (s_reader.fp != NULL) {
+        /* Closing a book is a low-frequency event: persist the position
+         * synchronously so nothing is lost even if the debounced save never
+         * fired (e.g. the user flipped once and immediately switched books). */
+        uint32_t off = (uint32_t)s_cur_start;
+        uint32_t page = (uint32_t)s_page;
+        uint32_t size = s_book.size;
+        char path[EBOOK_PATH_MAX];
+        portENTER_CRITICAL(&s_mux);
+        strncpy(path, s_book.path, sizeof(path) - 1);
+        path[sizeof(path) - 1] = '\0';
+        portEXIT_CRITICAL(&s_mux);
+        progress_write(path, off, page, size);
+
         fclose(s_reader.fp);
         s_reader.fp = NULL;
     }
+    s_save_pending = false;
     /* s_book / s_open_gen / s_is_open are copied by the count task under the
      * mutex; publish the reset under the same lock so it never observes a
      * torn struct. Everything below is UI-task-private. */
@@ -704,14 +1008,14 @@ void ebook_close(void)
 
 bool ebook_open(int idx)
 {
-    char name[EBOOK_NAME_MAX];
+    char path[EBOOK_PATH_MAX];
     portENTER_CRITICAL(&s_mux);
     if (idx < 0 || idx >= s_scan_count) {
         portEXIT_CRITICAL(&s_mux);
         return false;
     }
-    strncpy(name, s_scan_buf[s_scan_active][idx], EBOOK_NAME_MAX - 1);
-    name[EBOOK_NAME_MAX - 1] = '\0';
+    strncpy(path, s_scan_buf[s_scan_active][idx], EBOOK_PATH_MAX - 1);
+    path[EBOOK_PATH_MAX - 1] = '\0';
     portEXIT_CRITICAL(&s_mux);
 
     ebook_close();
@@ -724,7 +1028,7 @@ bool ebook_open(int idx)
     memset(&src, 0, sizeof(src));
 
     const bool embedded =
-        (strncmp(name, EBOOK_ROM_PREFIX, strlen(EBOOK_ROM_PREFIX)) == 0);
+        (strncmp(path, EBOOK_ROM_PREFIX, strlen(EBOOK_ROM_PREFIX)) == 0);
     if (embedded) {
         src.embedded = true;
         src.rom_start = _binary_Test_txt_start;
@@ -733,7 +1037,7 @@ bool ebook_open(int idx)
         src.size = src.rom_size;
     }
     else {
-        snprintf(src.path, sizeof(src.path), "/sdcard/%s", name);
+        snprintf(src.path, sizeof(src.path), "%s", path);
         FILE *fp = fopen(src.path, "rb");
         if (fp == NULL) {
             ESP_LOGE(TAG, "open '%s' failed", src.path);
@@ -757,14 +1061,35 @@ bool ebook_open(int idx)
     s_open_gen++;                        /* start the count fresh for this book */
     portEXIT_CRITICAL(&s_mux);
 
-    s_cur_start = 0;
-    s_page = 1;
-    s_next_start = layout_page(&s_reader, 0, s_page_buf, sizeof(s_page_buf));
+    /* Restore the saved reading position, if any: reload the on-card
+     * progress file (picks up card swaps / external edits), then require the
+     * book to be unchanged (same size) and the offset to point inside it and
+     * past page 1. The stored page number is used as-is, so the "X/N"
+     * readout matches where the reader left off; the byte progress bar is
+     * authoritative. */
+    size_t start = 0;
+    int page = 1;
+    s_resume_pct = 0;
+    if (!embedded && src.size > 0) {
+        progress_load();
+        eb_progress_t p;
+        if (progress_find(src.path, &p) && p.size == src.size &&
+            p.offset > 0 && p.offset < src.size && p.page > 0) {
+            start = p.offset;
+            page = (int)p.page;
+            s_resume_pct = (uint32_t)((uint64_t)p.offset * 100 / src.size);
+        }
+    }
+    s_cur_start = start;
+    s_page = page;
+    s_next_start = layout_page(&s_reader, start, s_page_buf,
+                               sizeof(s_page_buf));
     if (s_count_task != NULL) {
         xTaskNotifyGive(s_count_task);
     }
-    ESP_LOGI(TAG, "open '%s' embedded=%d size=%u", name, embedded ? 1 : 0,
-             (unsigned)src.size);
+    ESP_LOGI(TAG, "open '%s' embedded=%d size=%u resume=%u%%", path,
+             embedded ? 1 : 0, (unsigned)src.size,
+             (unsigned)s_resume_pct);
     return true;
 }
 
@@ -851,6 +1176,95 @@ void ebook_page_flip(int dir)
                                    s_page_buf, sizeof(s_page_buf));
         s_page--;
     }
+    if (s_book.path[0] != '\0') {
+        progress_arm();                  /* debounced save of the new position */
+    }
+}
+
+uint32_t ebook_resume_percent(void)
+{
+    return s_resume_pct;
+}
+
+void ebook_progress_flush(void)
+{
+    if (!s_is_open) {
+        return;
+    }
+    progress_arm();
+    s_save_after = 0;                    /* expire the debounce: save on wake */
+    if (s_save_task != NULL) {
+        xTaskNotifyGive(s_save_task);    /* save immediately, don't wait */
+    }
+}
+
+bool ebook_jump_percent(int pct)
+{
+    if (!s_is_open || s_book.size == 0) {
+        return false;
+    }
+    if (pct < 0) {
+        pct = 0;
+    }
+    if (pct > 100) {
+        pct = 100;
+    }
+    const size_t target =
+        (size_t)((uint64_t)s_book.size * (uint32_t)pct / 100);
+
+    /* Back up to a line start near the target so the first page begins on a
+     * clean line. A long unbroken paragraph (no '\n' within the search
+     * window) falls back to starting about one chunk (~1KB) before the
+     * target, which keeps the backward scan bounded. */
+    size_t start = 0;
+    if (target > 0) {
+        size_t pos = target;
+        while (pos > 0 && target - pos < EBOOK_CHUNK * 2) {
+            if (reader_byte(&s_reader, pos - 1) == '\n') {
+                start = pos;
+                break;
+            }
+            pos--;
+        }
+        if (start == 0 && target > EBOOK_CHUNK) {
+            start = target - EBOOK_CHUNK;
+        }
+    }
+
+    /* Layout forward from `start` to the page that contains `target` (usually
+     * one or two pages; the backward line-search made the distance small). */
+    size_t next = start;
+    size_t prev = start;
+    int guard = 0;
+    while (next < target && guard++ < 1000) {
+        prev = next;
+        next = layout_page(&s_reader, next, NULL, 0);
+        if (next == prev) {
+            break;                       /* safety: no forward progress */
+        }
+    }
+    start = prev;
+
+    s_cur_start = start;
+    s_next_start = layout_page(&s_reader, start, s_page_buf,
+                               sizeof(s_page_buf));
+    s_hist_count = 0;
+    s_hist_head = 0;
+    /* Estimate the page number for the "X/N" readout — the byte progress bar
+     * stays the authoritative indicator. Falls back to 1 while the total is
+     * still being counted. */
+    if (s_page_count > 0) {
+        int est = (int)((uint64_t)pct * s_page_count / 100);
+        s_page = est < 1 ? 1 : est;
+    }
+    else {
+        s_page = 1;
+    }
+    if (s_book.path[0] != '\0') {
+        progress_arm();                  /* remember the jumped-to position */
+    }
+    ESP_LOGI(TAG, "jump to %d%% -> offset %u", pct, (unsigned)start);
+    return true;
 }
 
 const char *ebook_page_text(void)

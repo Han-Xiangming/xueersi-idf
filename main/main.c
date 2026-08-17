@@ -232,11 +232,18 @@ void app_main(void)
     lv_group_t *group = ui_input_init(display);
     ui_start_tick_timer();
 
-    BaseType_t ret = xTaskCreate(lvgl_task,
-                                 "lvgl",
-                                 LVGL_TASK_STACK_SIZE,
-                                 group,
-                                 LVGL_TASK_PRIORITY,
-                                 NULL);
+    /* Pin the LVGL task to core 1: the Bluetooth controller + stack run on
+     * core 0 by default, and an unpinned task can be scheduled there and
+     * starved by BT's higher-priority work (visible as key-feedback jitter
+     * while a sink is linked). Core 1 hosts the app; with LVGL_TASK_PRIORITY
+     * above the decode task, key events + the synchronous render are never
+     * delayed by a decode burst either. */
+    BaseType_t ret = xTaskCreatePinnedToCore(lvgl_task,
+                                             "lvgl",
+                                             LVGL_TASK_STACK_SIZE,
+                                             group,
+                                             LVGL_TASK_PRIORITY,
+                                             NULL,
+                                             1);
     ESP_ERROR_CHECK(ret == pdPASS ? ESP_OK : ESP_FAIL);
 }

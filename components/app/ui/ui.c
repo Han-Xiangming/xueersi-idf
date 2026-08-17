@@ -375,6 +375,29 @@ static ui_marquee_t s_eb_mq;
 static const int s_eb_row_y[EBOOK_LIST_ROWS] = {38, 64, 90, 116, 142, 168};
 static int s_eb_sel;
 static char s_eb_open_name[MP3_NAME_LEN];
+/* Reader "jump" overlay: Select enters it, left/right move the target
+ * percentage, A jumps, B cancels (see ebook_jump_percent). */
+static bool s_eb_jump;
+static int  s_eb_jump_pct;
+
+/* Ebook "source" picker, mirroring the music player: <ALL> (the whole
+ * /sdcard/eBook tree) + each top-level folder directly under it. Choosing one
+ * scans only that folder; its name shows in the status row while browsing. */
+typedef enum {
+    EBV_SOURCE = 0,   /* picking a source: <ALL> + folders */
+    EBV_LIST,         /* browsing the loaded book list */
+} ebook_view_t;
+EXT_RAM_BSS_ATTR static char s_eb_src_list[SRC_MAX][MP3_NAME_LEN];
+EXT_RAM_BSS_ATTR static char s_eb_src_path[SRC_MAX][PLAYER_PATH_LEN];
+static int      s_eb_src_count;
+static int      s_eb_src_sel;
+static ebook_view_t s_ebv = EBV_SOURCE;
+static int      s_paint_eb_src_sel = -1;
+static int      s_paint_eb_src_top  = -1;
+/* True from the moment we leave the source picker to load a source until that
+ * load finishes: suppresses the stale book rows of the previous source
+ * (mirrors s_mp3_loading). */
+static bool     s_eb_loading;
 
 /* BIOS/DOS-style menu palette: dark base + cyan accent + gray monochrome text. */
 static const uint32_t UI_CYAN = 0x00E0E0;
@@ -1041,9 +1064,50 @@ static void copy_book_name(char *dst, size_t dst_size, const char *src)
     snprintf(dst, dst_size, "%s", src ? src : "");
 }
 
+/* Discover ebook sources: <ALL> (every .txt under /sdcard/eBook, recursive)
+ * plus each sub-directory directly under it (one source each), mirroring the
+ * music player's ui_discover_sources(). Fills s_eb_src_list[] /
+ * s_eb_src_path[]; entry 0 is the whole-tree pseudo-source. Re-run each time
+ * the ebook page is (re)built or the SD card changes. */
+static void ui_discover_ebook_sources(void)
+{
+    s_eb_src_count = 0;
+    s_eb_src_list[0][0] = '\0';              /* empty name => render as "<ALL>" */
+    snprintf(s_eb_src_path[0], sizeof(s_eb_src_path[0]), "%s", EBOOK_ROOT);
+
+    DIR *d = opendir(EBOOK_ROOT);
+    if (d != NULL) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL && s_eb_src_count < SRC_MAX - 1) {
+            const char *fn = e->d_name;
+            if (fn[0] == '.') {
+                continue;
+            }
+            char child[PLAYER_PATH_LEN];
+            snprintf(child, sizeof(child), "%s/%s", EBOOK_ROOT, fn);
+            struct stat st;
+            if (stat(child, &st) != 0 || !S_ISDIR(st.st_mode)) {
+                continue;                    /* only sub-directories are sources */
+            }
+            int idx = s_eb_src_count + 1;
+            snprintf(s_eb_src_list[idx], sizeof(s_eb_src_list[idx]), "%s", fn);
+            snprintf(s_eb_src_path[idx], sizeof(s_eb_src_path[idx]), "%s", child);
+            s_eb_src_count = idx;
+        }
+        closedir(d);
+    }
+    s_eb_src_count = (s_eb_src_count == 0) ? 1 : s_eb_src_count + 1;
+    if (s_eb_src_sel >= s_eb_src_count) {
+        s_eb_src_sel = 0;
+    }
+}
+
 static void ui_build_ebook_list(lv_obj_t *page)
 {
     s_eb_sel = 0;
+    s_ebv = EBV_SOURCE;
+    s_eb_src_sel = 0;
+    ui_discover_ebook_sources();
 
     for (int i = 0; i < EBOOK_LIST_ROWS; i++) {
         lv_obj_t *cur = lv_label_create(page);
@@ -1062,16 +1126,17 @@ static void ui_build_ebook_list(lv_obj_t *page)
         s_ui.eb_text[i] = txt;
     }
 
-    s_ui.eb_status = ui_label(page, "扫描中...", 196, UI_GRAY,
+    s_ui.eb_status = ui_label(page, "选择阅读来源", 196, UI_GRAY,
                               &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
-    s_ui.hint = ui_label(page, "上/下选 A打开 B返回", 214, UI_GRAY,
+    s_ui.hint = ui_label(page, "上/下选 A进入 B返回", 214, UI_GRAY,
                          &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
-
-    ebook_scan_start();
 }
 
 static void ui_build_ebook_read(lv_obj_t *page)
 {
+    s_eb_jump = false;
+    s_eb_jump_pct = 0;
+
     /* Single body label: the reader engine joins exactly 8 lines with '\n'
      * and measures with the same font, so the layout matches exactly. The
      * 16 px font's natural line height is 30 px; we compress it with a
@@ -1306,6 +1371,8 @@ static void ui_enter_page(ui_page_t page)
     s_paint_set_sel = s_paint_mp3_sel = s_paint_bt_sel = -1;
     s_paint_mp3_top = -1;
     s_paint_eb_sel = -1;
+    s_paint_eb_src_sel = -1;
+    s_paint_eb_src_top = -1;
     ui_mark_dirty();
     ui_refresh();
 }
@@ -1345,12 +1412,22 @@ static bool ui_external_changed(void)
             ui_discover_sources();
             s_paint_src_sel = -1;
         }
+        if (s_ui.page_id == UI_PAGE_EBOOK_LIST) {
+            ui_discover_ebook_sources();
+            s_paint_eb_src_sel = -1;
+        }
         player_scan_with_cache();   /* prefer cache; scan only if absent */
         /* A background scan may now be running; if we're showing the track
          * list, suppress the stale rows until it publishes (same guard as
          * entering a sub-folder). */
         if (s_pv == PV_LIST && player_scan_busy()) {
             s_mp3_loading = true;
+        }
+        /* Same for the ebook list: reload the currently browsed source (the
+         * source picker itself just refreshes its folder list above). */
+        if (s_ebv == EBV_LIST) {
+            ebook_scan_root(s_eb_src_path[s_eb_src_sel]);
+            s_eb_loading = true;
         }
         changed = true;
     }
@@ -1834,6 +1911,49 @@ void ui_refresh(void)
         break;
     }
     case UI_PAGE_EBOOK_LIST: {
+        if (s_ebv == EBV_SOURCE) {
+            /* Source picker: <ALL> (whole eBook tree) + top-level folders. */
+            int top = s_eb_src_sel - 1;
+            if (top < 0) {
+                top = 0;
+            }
+            if (top > s_eb_src_count - EBOOK_LIST_ROWS) {
+                top = MAX(0, s_eb_src_count - EBOOK_LIST_ROWS);
+            }
+            const bool sel_changed = (s_eb_src_sel != s_paint_eb_src_sel)
+                                   || (top != s_paint_eb_src_top);
+            for (int i = 0; i < EBOOK_LIST_ROWS; i++) {
+                int idx = top + i;
+                const int sel = (idx == s_eb_src_sel);
+                if (idx < s_eb_src_count) {
+                    static char s_eb_src_buf[MP3_NAME_LEN];
+                    const char *label = (s_eb_src_list[idx][0] == '\0')
+                                      ? "<ALL>" : s_eb_src_list[idx];
+                    copy_utf8_clipped(s_eb_src_buf, sizeof(s_eb_src_buf), label);
+                    ui_label_set(s_ui.eb_cursor[i], sel ? ">" : " ");
+                    /* Repaint the highlight every frame (the source list can
+                     * change underneath us on SD hotplug). */
+                    lv_obj_set_style_text_color(s_ui.eb_cursor[i],
+                                                lv_color_hex(UI_CYAN), 0);
+                    lv_obj_set_style_text_color(s_ui.eb_text[i],
+                        lv_color_hex(sel ? UI_CYAN : UI_GRAY), 0);
+                    ui_label_set(s_ui.eb_text[i], s_eb_src_buf);
+                }
+                else {
+                    ui_label_set(s_ui.eb_cursor[i], " ");
+                    ui_label_set(s_ui.eb_text[i], "");
+                }
+            }
+            if (sel_changed) {
+                s_paint_eb_src_sel = s_eb_src_sel;
+                s_paint_eb_src_top = top;
+            }
+            ui_label_set(s_ui.eb_status, "选择阅读来源");
+            ui_set_hint("上/下选 A进入 B返回");
+            break;
+        }
+
+        /* EBV_LIST: the book list of the chosen source. */
         int count = ebook_scan_count();
         if (s_eb_sel >= count && count > 0) {
             s_eb_sel = count - 1;
@@ -1846,10 +1966,14 @@ void ui_refresh(void)
             top = MAX(0, count - EBOOK_LIST_ROWS);
         }
         const bool sel_changed = (s_eb_sel != s_paint_eb_sel);
+        /* While a source load is in flight, the engine still publishes the
+         * previous source's list. Suppress drawing it so we don't flash the
+         * old books for a frame before the scan publishes the new one. */
+        const bool loading = s_eb_loading && ebook_scan_busy();
         for (int i = 0; i < EBOOK_LIST_ROWS; i++) {
             int idx = top + i;
             const int sel = (idx == s_eb_sel);
-            if (idx < count) {
+            if (!loading && idx < count) {
                 static char s_eb_name_buf[64];
                 copy_book_name(s_eb_name_buf, sizeof(s_eb_name_buf),
                                ebook_scan_name(idx));
@@ -1881,6 +2005,11 @@ void ui_refresh(void)
         if (sel_changed) {
             s_paint_eb_sel = s_eb_sel;
         }
+        /* The load we armed on leaving the source picker has now published
+         * (busy cleared) — stop suppressing the book rows. */
+        if (s_eb_loading && !ebook_scan_busy()) {
+            s_eb_loading = false;
+        }
         if (ebook_scan_busy()) {
             ui_label_set(s_ui.eb_status, "扫描中...");
         }
@@ -1888,8 +2017,9 @@ void ui_refresh(void)
             ui_label_set(s_ui.eb_status, "无TXT文件");
         }
         else {
-            char buf[24];
-            snprintf(buf, sizeof(buf), "%d 本", count);
+            char buf[80];
+            snprintf(buf, sizeof(buf), "[%s] %d 本",
+                     ebook_current_src_name(), count);
             ui_label_set(s_ui.eb_status, buf);
         }
         ui_set_hint("上/下选 A打开 B返回");
@@ -1923,7 +2053,22 @@ void ui_refresh(void)
         char pbuf[8];
         snprintf(pbuf, sizeof(pbuf), "%d%%", pct);
         ui_label_set(s_ui.eb_pct, pbuf);
-        ui_set_hint("");
+        if (s_eb_jump) {
+            /* Jump overlay: the hint row shows the adjustable target percent
+             * (toasts are suspended while it is active). Hide the status-row
+             * bar/percentage so the hint text does not overlap them. */
+            char jbuf[48];
+            snprintf(jbuf, sizeof(jbuf), "跳转至 %d%% 左/右调 A确认 B取消",
+                     s_eb_jump_pct);
+            ui_set_hint(jbuf);
+            if (s_ui.eb_bar && s_ui.eb_pct) {
+                lv_obj_add_flag(s_ui.eb_bar, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(s_ui.eb_pct, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        else {
+            ui_set_hint("");
+        }
         break;
     }
     default:
@@ -2009,6 +2154,21 @@ static void ui_action(void)
         break;
     }
     case UI_PAGE_EBOOK_LIST:
+        if (s_ebv == EBV_SOURCE) {
+            /* Enter the highlighted source: kick off a background scan of that
+             * directory (or the whole eBook tree for <ALL>), then switch to
+             * the book-list view. */
+            if (s_eb_src_count == 0) {
+                break;
+            }
+            ebook_scan_root(s_eb_src_path[s_eb_src_sel]);
+            s_ebv = EBV_LIST;
+            s_eb_sel = 0;
+            s_paint_eb_sel = -1;   /* force list repaint */
+            s_eb_loading = true;   /* hide stale books until this load finishes */
+            set_action("加载中");
+            break;
+        }
         if (ebook_scan_count() == 0) {
             set_action("无TXT文件");
             break;
@@ -2017,11 +2177,27 @@ static void ui_action(void)
             set_action("打开失败");
             break;
         }
+        const uint32_t resume = ebook_resume_percent();
         copy_book_name(s_eb_open_name, sizeof(s_eb_open_name),
                        ebook_scan_name(s_eb_sel));
         ui_enter_page(UI_PAGE_EBOOK_READ);
+        if (resume > 0) {
+            char buf[24];
+            snprintf(buf, sizeof(buf), "已续读 %u%%", (unsigned)resume);
+            set_action(buf);
+        }
         break;
     case UI_PAGE_EBOOK_READ:
+        if (s_eb_jump) {
+            /* Confirm the jump target. */
+            if (ebook_jump_percent(s_eb_jump_pct)) {
+                char buf[24];
+                snprintf(buf, sizeof(buf), "已跳转至 %d%%", s_eb_jump_pct);
+                set_action(buf);
+            }
+            s_eb_jump = false;
+            break;
+        }
         if (ebook_at_end()) {
             set_action("最后一页");
         }
@@ -2074,13 +2250,20 @@ static void ui_adjust(int step)
         }
         break;
     }
-    case UI_PAGE_EBOOK_LIST: {
-        int count = ebook_scan_count();
-        if (count > 0) {
-            s_eb_sel = (s_eb_sel - step + count) % count;
+    case UI_PAGE_EBOOK_LIST:
+        if (s_ebv == EBV_SOURCE) {
+            if (s_eb_src_count > 0) {
+                s_eb_src_sel = (s_eb_src_sel - step + s_eb_src_count) % s_eb_src_count;
+            }
+            break;
+        }
+        {
+            int count = ebook_scan_count();
+            if (count > 0) {
+                s_eb_sel = (s_eb_sel - step + count) % count;
+            }
         }
         break;
-    }
     default:
         return;
     }
@@ -2127,6 +2310,18 @@ static void ui_adjust_lr(int dir)
     }
 
     if (s_ui.page_id == UI_PAGE_EBOOK_READ) {
+        if (s_eb_jump) {
+            /* Jump overlay: left/right adjust the target percentage. */
+            s_eb_jump_pct += (dir > 0) ? 1 : -1;
+            if (s_eb_jump_pct < 0) {
+                s_eb_jump_pct = 0;
+            }
+            if (s_eb_jump_pct > 100) {
+                s_eb_jump_pct = 100;
+            }
+            ui_refresh();
+            return;
+        }
         if (dir > 0) {
             if (ebook_at_end()) {
                 set_action("最后一页");
@@ -2207,7 +2402,6 @@ static void ui_key_event_cb(lv_event_t *e)
             }
             else {
                 s_pv = PV_SOURCE;
-                s_src_sel = 0;
                 s_paint_src_sel = -1;   /* force source picker repaint */
                 ui_mark_dirty();        /* ensure ui_refresh() actually repaints,
                                            otherwise the stale PV_LIST stays on
@@ -2219,9 +2413,50 @@ static void ui_key_event_cb(lv_event_t *e)
             /* Return to Settings, the screen this sub-page was opened from. */
             ui_enter_page(UI_PAGE_SETTINGS);
         }
+else if (s_ui.page_id == UI_PAGE_EBOOK_LIST) {
+            if (s_ebv == EBV_SOURCE) {
+                /* On the source picker: B returns to the main menu. */
+                ui_show_menu();
+            }
+            else {
+                /* EBV_LIST: B returns up one level to the source picker
+                 * (not the menu), mirroring the player's idle track list.
+                 * The previously selected source stays selected. */
+                s_ebv = EBV_SOURCE;
+                s_paint_eb_src_sel = -1;   /* force source picker repaint */
+                s_paint_eb_src_top = -1;
+                ui_mark_dirty();           /* ensure ui_refresh() repaints now */
+                ui_refresh();
+            }
+        }
         else if (s_ui.page_id == UI_PAGE_EBOOK_READ) {
             /* Back to the book list; the book stays open in the engine. */
-            ui_enter_page(UI_PAGE_EBOOK_LIST);
+            if (s_eb_jump) {
+                /* Jump overlay: B cancels, staying on the current page. */
+                s_eb_jump = false;
+                ui_mark_dirty();
+                ui_refresh();
+            }
+            else {
+                ebook_progress_flush();      /* persist the position right now */
+                /* Rebuild the list page, then restore the browsing position
+                 * (source + selected book) and the list view, so coming back
+                 * from a book lands exactly where the user left off instead
+                 * of resetting to the first source/first row. */
+                const int bk_src_sel = s_eb_src_sel;
+                const int bk_sel = s_eb_sel;
+                ui_enter_page(UI_PAGE_EBOOK_LIST);
+                s_ebv = EBV_LIST;
+                s_eb_src_sel = bk_src_sel;
+                if (s_eb_src_sel >= s_eb_src_count) {
+                    s_eb_src_sel = 0;      /* source vanished on card: clamp */
+                }
+                s_eb_sel = bk_sel;
+                s_paint_eb_src_sel = -1;   /* force a full repaint */
+                s_paint_eb_src_top = -1;
+                ui_mark_dirty();
+                ui_refresh();
+            }
         }
         else {
             ui_show_menu();
@@ -2229,12 +2464,19 @@ static void ui_key_event_cb(lv_event_t *e)
     }
     else if (key == LV_KEY_HOME) {
         /* Select: switch the player's repeat mode (list loop ⇄ single-track
-         * loop). Only meaningful on the player page; ignored elsewhere.
-         * No toast — the mode is already shown in the top-right status
-         * (">>单曲" / ">>列表"), so a bottom hint would be redundant. */
+         * loop) or, on the reader page, jump back to page 1 and forget the
+         * saved reading position. No toast for the player — the mode is
+         * already shown in the top-right status (">>单曲" / ">>列表"). */
         if (s_ui.page_id == UI_PAGE_PLAYER) {
             ui_mark_dirty();   /* repaint the top-right status */
             player_repeat_toggle();
+        }
+        else if (s_ui.page_id == UI_PAGE_EBOOK_READ) {
+            /* Jump overlay: Select enters it (current percent as the start
+             * point); A confirms and B cancels from there. */
+            s_eb_jump = true;
+            s_eb_jump_pct = ebook_percent();
+            ui_mark_dirty();
         }
     }
     else if (key == LV_KEY_ENTER) {
@@ -2362,8 +2604,11 @@ lv_group_t *ui_input_init(lv_display_t *display)
     lv_indev_set_display(indev, display);
     lv_indev_set_group(indev, group);
     lv_indev_set_read_cb(indev, hw_buttons_read);
-    lv_indev_set_long_press_time(indev, 360);
-    lv_indev_set_long_press_repeat_time(indev, 130);
+    /* Tuned repeat: 250 ms to the first auto-repeat (was 360 ms — a hold
+     * felt like it stalled), then every 90 ms. Matches typical handheld
+     * keypad feel for list scrolling and volume ramping. */
+    lv_indev_set_long_press_time(indev, 250);
+    lv_indev_set_long_press_repeat_time(indev, 90);
     /* Poll the buttons faster than the default 16 ms LVGL refresh period so
      * a press (plus the 10 ms debounce) reaches the UI within ~15 ms instead
      * of ~40 ms. The read callback only scans 9 GPIOs, so the extra polls

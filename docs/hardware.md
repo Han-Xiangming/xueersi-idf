@@ -49,7 +49,7 @@ ESP32（WROVER-B，PSRAM 8MB）@ 240MHz
 - SDSPI 复用 SPI2（SCLK/MOSI/MISO 与 LCD 共用），CS=22，上限 10MHz（`SD_SPI_MAX_FREQ_KHZ=10000`）。
 - `hw_sd_try_mount()` 启动时尝试挂载；挂载配置 `max_files=3`、`format_if_mount_failed=false`；失败/卸载后名称显示 "NO CARD"。
 - 暴露 `hw_sd_is_mounted()` / `hw_sd_name()` / `hw_sd_mb()` / `hw_sd_last_err()`，软件层不触碰卡内部。
-- 挂载点 `/sdcard`：播放器扫 `/sdcard/*.mp3`，电子书扫 `/sdcard/*.txt`。
+- 挂载点 `/sdcard`：播放器扫 `/sdcard/Music/**/*.mp3`，电子书递归扫 `/sdcard/eBook/**/*.txt`。
 
 ## 6. 音频输出（components/drivers/audio/audio.c）
 

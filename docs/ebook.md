@@ -40,7 +40,7 @@
 ```text
 Main Menu
   └─ "电子书"
-       ├─ [书列表页] UI_PAGE_EBOOK_LIST    ← 扫描 /sdcard/*.txt，样式复用 MP3 列表
+       ├─ [书列表页] UI_PAGE_EBOOK_LIST    ← 先选来源（<ALL> 或子目录），再递归扫描该书目录，样式复用 MP3 列表
        └─ [阅读页]   UI_PAGE_EBOOK_READ    ← 单 Label 渲染，翻页式阅读
               │
               ▼
@@ -70,14 +70,20 @@ Main Menu
 
 ```c
 void ebook_init(void);                     /* 创建扫描/计数任务 + PSRAM 缓冲 */
-void ebook_scan_start(void);               /* 后台扫描 /sdcard/*.txt */
+void ebook_scan_start(void);               /* 后台递归扫描 /sdcard/eBook/**/*.txt */
+void ebook_scan_root(const char *dir);     /* 只扫描指定来源目录（顶层子文件夹） */
 bool ebook_scan_busy(void);
 uint32_t ebook_scan_version(void);         /* 列表版本号，UI 轮询用 */
 int  ebook_scan_count(void);
 const char *ebook_scan_name(int idx);
+const char *ebook_current_src_name(void);  /* 当前来源名："整卡"或子文件夹名 */
 
-bool ebook_open(int idx);                  /* 打开第 idx 本书，定位第 1 页 */
-void ebook_close(void);
+bool ebook_open(int idx);                  /* 打开第 idx 本书（自动续读） */
+void ebook_close(void);                    /* 关闭（同步保存当前进度） */
+
+uint32_t ebook_resume_percent(void);       /* 本次打开恢复的进度 %（0=从头） */
+void ebook_progress_flush(void);           /* 立即保存当前进度（退出阅读页时） */
+bool ebook_jump_percent(int pct);           /* 跳转到 0~100% 字节位置（0=从头） */
 
 int  ebook_page(void);                     /* 当前页，1 起 */
 int  ebook_page_count(void);               /* 总页数；未算完为 0（后台算） */
@@ -129,7 +135,7 @@ const char *ebook_page_text(void);         /* 本页文本（行间 '\n'），�
 - 页文本缓冲：1KB（`EBOOK_PAGE_BUF`，PSRAM `EXT_RAM_BSS_ATTR`）。
 - 块缓冲：4KB × 2（`heap_caps_malloc(..., MALLOC_CAP_SPIRAM)`，失败退回内部 RAM），主读者与计数任务各一块。
 - 向后翻页无需重读整页布局，历史环命中即 O(1)；环只存 4 字节偏移（ESP32 `size_t`）× 32 = 128B。
-- 内置测试书 `(ROM) Test.txt`：EMBED_FILES 编入固件，扫描列表恒存在最后一位，SD 无卡可读。
+- 内置测试书 `(ROM) Test.txt`：EMBED_FILES 编入固件，仅 `<ALL>`（整卡）视图恒存在列表最后一位，SD 无卡可读。
 
 ***
 
@@ -148,19 +154,25 @@ const char *ebook_page_text(void);         /* 本页文本（行间 '\n'），�
 
 ### 5.2 书列表页（复用 MP3 列表版式）
 
+两级视图，同播放器：先选来源，再浏览书目。
+
 ```text
-电子书  ────────────────
-> 红楼梦
-  三国演义
-  西游记
-  朝花夕拾
-    4 本        上/下选 A打开 B返回
+来源选择                      书目浏览
+电子书  ──────────────         电子书  ──────────────
+> <ALL>                       > 红楼梦
+  四大名著                      三国演义
+  科幻小说                      西游记
+  武侠小说                      朝花夕拾
+    选择阅读来源    A进入          [四大名著] 4 本  A打开
 ```
 
-- 后台扫描 `/sdcard/*.txt`（不区分大小写，过滤目录），qsort 忽略大小写排序（strcasecmp）；
-- 列表显示名去除 `.txt` 扩展名；最多显示 4 行，滚动窗口同 MP3 列表；
-- 状态行显示"扫描中..."（扫描中）/ "N 本" / "无TXT文件"；无文件时 A 提示"无TXT文件"；
+- 来源 = `<ALL>`（整个 `/sdcard/eBook` 树，递归）+ `/sdcard/eBook` 下每个顶层子文件夹（各为一个来源，SD 热插拔/重进页面时重新发现，同 `ui_discover_sources`）；
+- 进入某来源后后台递归扫描该目录（不区分大小写，同播放器：stat 判定目录并下钻，深度 ≤16，跳过隐藏项），收集全部 `.txt`；qsort 排序 = 先按文件名长度（短在前）再按文件名忽略大小写字典序（strcasecmp），文件名相同（不同子目录同名书）按完整路径兜底，跨扫描稳定；
+- 状态行显示当前来源名（`<ALL>` 显示为"整卡"）+ 书目数，如 `[四大名著] 4 本`；扫描中显示"扫描中..."；
+- 列表显示名去路径（仅文件名）；最多显示 6 行，滚动窗口同 MP3 列表；
+- B：书目视图返回来源选择（同播放器曲目列表），来源选择再按 B 回主菜单；
 - 打开失败提示"打开失败"；打开成功进入阅读页，书名（去扩展名）先捕获到 `s_eb_open_name`，后续扫描不改变标题。
+- **续读**：每本书的阅读位置（页起点字节偏移 + 页码 + 文件大小）保存在 SD 卡 `/sdcard/eBook/.progress`（点开头文件不会被扫描收录；单文件 MRU 表，最多 128 本，满则淘汰最久未读；条目键 = 路径 48 位 FNV-1a；原子写 = `.progress.tmp` + rename，断电不损坏），文件未变（大小一致）且偏移有效时打开直接跳回上次位置，toast 提示"已续读 N%"；每次打开书重新加载该文件（换卡/外部修改立即生效）；翻页后延迟 3s 防抖保存（连续翻页重置计时），换书/退出阅读页（B）/`ebook_progress_flush()` 时立即保存；阅读页按 Select 呼出跳转界面（见 5.4），跳转 0% 即从头并覆盖进度。
 
 ### 5.3 阅读页
 
@@ -186,10 +198,13 @@ const char *ebook_page_text(void);         /* 本页文本（行间 '\n'），�
 | 按键 | 书列表页 | 阅读页 |
 | ---- | ---- | ---- |
 | 上 / 下 | 移动选择 | （预留） |
-| A | 打开所选书 | 下一页（末页提示"最后一页"） |
-| 左 | — | 上一页（首页提示"第一页"） |
-| 右 | — | 下一页 |
-| B | 返回主菜单 | 返回书列表 |
+| A | 打开所选书 | 下一页（末页提示"最后一页"）；跳转界面中：确认跳转 |
+| 左 | — | 上一页（首页提示"第一页"）；跳转界面中：目标百分比 −1% |
+| 右 | — | 下一页；跳转界面中：目标百分比 +1% |
+| B | 返回主菜单 | 返回书列表（立即保存进度）；跳转界面中：取消跳转 |
+| Select | — | 呼出跳转界面（见下） |
+
+**跳转界面**（无数字键盘的替代方案）：阅读页按 Select 呼出，hint 行显示"跳转至 N% 左/右调 A确认 B取消"，初始值为当前进度；左/右以 1% 步进调整（长按自动连续），A 确认后跳到目标百分比位置并 toast"已跳转至 N%"，B 取消留在原页。跳转实现：目标字节 = 文件大小 × N%，向前回退到最近换行（超 2 块窗口未遇换行则回退 ~1KB 兜底），逐页布局定位到包含目标的页起点（通常 1~2 页），页码按 N% × 总页数估算（字节进度条为权威），随后正常保存进度。跳转 0% = 从头开始（覆盖旧进度），跳转 100% = 最后一页。
 
 ***
 
@@ -201,7 +216,7 @@ const char *ebook_page_text(void);         /* 本页文本（行间 '\n'），�
 | 页文本缓冲 | 1KB | PSRAM（EXT_RAM_BSS_ATTR） |
 | 块读取缓冲 × 2（主读者 / 计数任务） | 4KB × 2 | PSRAM（失败退回内部 RAM） |
 | 页偏移历史环 | 128B（32 × 4B） | 内部 RAM |
-| 扫描 / 计数任务栈 | 4KB × 2 | — |
+| 扫描 / 计数 / 进度保存任务栈 | 4KB × 3 | — |
 | 翻页耗时 | 读 ~1KB + 布局 8 行 | 典型 < 20ms（历史环命中时零重复布局） |
 
 > 新增 DRAM 占用 < 5KB，对现有 60fps 部分刷新双缓冲无影响；SD 读发生在翻页瞬间，toast 遮挡期间完成。
@@ -243,5 +258,5 @@ const char *ebook_page_text(void);         /* 本页文本（行间 '\n'），�
 3. UTF-8 BOM / 无 BOM 文件均可读；
 4. CRLF 与 LF 混合文件换行正常；
 5. 翻 100 页后翻回第 1 页，无错位（验证历史环重建）；
-6. 中文书名 + 英文书名排序稳定（qsort strcasecmp）；
+6. 中文书名 + 英文书名排序稳定（文件名长度优先，同长度字典序）；
 7. 无 SD 卡时列表显示 `(ROM) Test.txt` 并可正常阅读。

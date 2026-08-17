@@ -19,7 +19,11 @@
  * ISR (spi_bus_lock.c:317). 16 KB leaves headroom for partial-refresh and
  * lv_timer_handler(). */
 #define LVGL_TASK_STACK_SIZE        (16 * 1024)
-#define LVGL_TASK_PRIORITY          5
+/* Above the MP3 decode task (6): key events and the synchronous render in
+ * ui_key_event_cb must never queue behind a decode CPU burst (~3-5 ms per
+ * frame). Safe because the I2S DMA ring buffers ~280 ms of audio, so the
+ * decode task tolerates being preempted for one full page render. */
+#define LVGL_TASK_PRIORITY          7
 #define LVGL_TASK_MIN_DELAY_MS      1
 #define LVGL_TASK_MAX_DELAY_MS      16
 
