@@ -633,6 +633,35 @@ static void close_track(void)
      * itself on the BT route. */
 }
 
+/* Rewind the current track for a gapless single-track (repeat-one) loop:
+ * seek the source back to byte 0 and REBUILD the helix decoder so the second
+ * pass starts from pristine state — a reused decoder keeps bit-reservoir /
+ * VBR / resync state that can mis-decode the first frames of the replay. All
+ * cursors and watchdogs are reset and the ID3v2 tag is re-skipped (the file
+ * may have been re-tagged between passes). Returns false if the seek or the
+ * decoder rebuild fails; the caller then falls through to the error path. */
+static bool rewind_track(void)
+{
+    if (fseek(s_src.fp, 0, SEEK_SET) != 0) {
+        return false;
+    }
+    MP3FreeDecoder(s_dec);
+    s_dec = MP3InitDecoder();
+    if (s_dec == NULL) {
+        ESP_LOGE(TAG, "MP3InitDecoder failed on repeat-one rewind");
+        return false;
+    }
+    s_bytes_left = 0;
+    s_consumed = 0;
+    s_no_sync_refills = 0;   /* fresh pass: restart sync-word watchdog */
+    s_track_errs = 0;        /* fresh pass: restart decode-error watchdog */
+    s_pcm_stalls = 0;        /* fresh pass: restart pipeline-stall watchdog */
+    s_dbg_frames = 0;
+    parse_id3v2();           /* re-skip the tag + pick up ReplayGain again */
+    hw_audio_set_player_active(true); /* re-arm the pipeline */
+    return true;
+}
+
 /* Read up to `want` bytes from the active source into `out`. Returns the
  * number of bytes actually read (0 at end of source). */
 static int src_read(void *out, int want)
@@ -872,29 +901,21 @@ static void decode_loop(void)
                                 : s_track_errored ? "aborted (error)"
                                                   : "reached EOF");
             /* Single-track loop: replay the SAME file IN PLACE — rewind the
-             * source, reset the decode state and start decoding again. The
-             * I2S channel is never parked and no request round-trip (which
-             * would re-open the file and stop/start the clock) is involved,
-             * so the loop is gapless and works even when the track is not in
-             * the playlist. Only a clean EOF replays: a corrupt/pipeline
-             * failure falls through to the error path below. */
+             * source, rebuild the decoder, reset the decode state and start
+             * decoding again. The I2S channel is never parked and no request
+             * round-trip (which would re-open the file and stop/start the
+             * clock) is involved, so the loop is gapless and works even when
+             * the track is not in the playlist. Only a clean EOF replays: a
+             * corrupt/pipeline failure falls through to the error path. */
             if (!s_stop_req && !s_new_req && !s_track_errored &&
                 s_repeat == PLAYER_REPEAT_ONE) {
-                if (fseek(s_src.fp, 0, SEEK_SET) != 0) {
+                if (!rewind_track()) {
                     ESP_LOGE(TAG, "repeat-one rewind failed for '%s'", s_name);
                     s_track_errored = true;
                 }
                 else {
-                    s_bytes_left = 0;
-                    s_consumed = 0;
-                    s_no_sync_refills = 0;   /* fresh pass: restart watchdogs */
-                    s_track_errs = 0;
-                    s_pcm_stalls = 0;
-                    s_dbg_frames = 0;
                     frame_cnt = 0;
                     rate_set = false;
-                    parse_id3v2();           /* re-skip the tag + ReplayGain */
-                    hw_audio_set_player_active(true); /* re-arm the pipeline */
                     ESP_LOGI(TAG, "repeat one: replaying '%s'", s_name);
                     continue;   /* back into the decode while: same file */
                 }
