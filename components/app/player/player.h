@@ -28,10 +28,12 @@
 /* On-card playlist cache: a flat text file so we avoid pulling in a JSON
  * parser. One record per line, two TAB-separated fields:
  *     <title> <TAB> <path> <LF>
- * `title` is the display basename; `path` is the absolute path. The source
- * is implicitly PL_SRC_FOLDER (the only one implemented today). A line that
- * cannot be parsed invalidates the whole cache, so a corrupt file never
- * freezes the UI into a broken state — we just fall back to a real scan. */
+ * `title` is the display basename (redundant: it is always the basename of
+ * `path`; kept so older cache files written before the entry was slimmed
+ * down still load); `path` is the absolute path. The source is implicitly
+ * PL_SRC_FOLDER (the only one implemented today). A line that cannot be
+ * parsed invalidates the whole cache, so a corrupt file never freezes the
+ * UI into a broken state — we just fall back to a real scan. */
 #define PLAYER_CACHE_FILE "/sdcard/.xueersi_playlist.cache"
 
 /* Max length of a fully-qualified track path anywhere on the SD card.
@@ -78,17 +80,19 @@ const char *player_err_text(player_err_t err);
  * player_scan_start() and poll player_scan_version() / player_scan_busy() to
  * learn when the cached list refreshes.
  *
- * Source abstraction: a playlist entry is always a fully-qualified absolute
- * path plus a display name. The playback layer is source-agnostic — it only
- * ever sees the published playlist_t. Today only PL_SRC_FOLDER is implemented
- * (recursive scan of the whole SD card); PL_SRC_M3U is reserved so a future
- * playlist-file source fills the SAME entry array without touching playback.
+ * Source abstraction: a playlist entry is a fully-qualified absolute path;
+ * the display name is derived as the path's basename (no duplicate storage,
+ * so the entry is only PLAYER_PATH_LEN bytes). The playback layer is
+ * source-agnostic — it only ever sees the published playlist_t. Today only
+ * PL_SRC_FOLDER is implemented (recursive scan of the whole SD card);
+ * PL_SRC_M3U is reserved so a future playlist-file source fills the SAME
+ * entry array without touching playback.
  *
  * ORDER IS LOCKED: no runtime code may reorder or mutate a published
  * snapshot. The only way to change the order is to reload a fresh snapshot
  * (which, for the folder source, means the filesystem order + a stable sort).
  * There is deliberately NO move/shuffle/reorder API. */
-#define PLAYER_SCAN_MAX 64
+#define PLAYER_SCAN_MAX 256
 
 /* Playlist source. Only PL_SRC_FOLDER is implemented now; PL_SRC_M3U is a
  * placeholder for a future playlist-file source (no playback-layer change). */
@@ -98,10 +102,10 @@ typedef enum {
 } playlist_src_t;
 
 /* A single playlist entry. `path` is an absolute path so folder- and
- * file-sourced playlists are structurally identical at playback time. */
+ * file-sourced playlists are structurally identical at playback time; the
+ * display name is `strrchr(path, '/') + 1` (basename), never stored twice. */
 typedef struct {
     char path[PLAYER_PATH_LEN];   /* absolute path, e.g. /sdcard/Album/a.mp3 */
-    char name[MP3_NAME_LEN];      /* display basename */
 } playlist_entry_t;
 
 /* Published, read-only playlist snapshot. Double-buffered (see player.c): a

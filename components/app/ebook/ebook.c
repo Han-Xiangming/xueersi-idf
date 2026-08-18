@@ -23,7 +23,7 @@ static const char *TAG = "ebook";
 /* --- Tuning constants (docs/ebook.md) --- */
 #define EBOOK_NAME_MAX      64           /* book name buffer size */
 #define EBOOK_PATH_MAX      320          /* book path buffer size (matches player) */
-#define EBOOK_LIST_MAX      64           /* max books in the scan list */
+#define EBOOK_LIST_MAX      128          /* max books in the scan list */
 #define EBOOK_CHUNK         (4 * 1024)   /* stream window of the reader */
 #define EBOOK_PAGE_BUF      1024         /* rendered page text buffer */
 #define EBOOK_PAGE_LINES    8            /* lines per page. Body label starts at

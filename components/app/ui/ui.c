@@ -346,8 +346,8 @@ typedef enum {
     PV_LIST,         /* browsing/playing the loaded playlist */
 } player_view_t;
 
-#define SRC_MAX 48
-/* UI-only source list data (~28 KB): keep it in external PSRAM (EXT_RAM_BSS)
+#define SRC_MAX 128
+/* UI-only source list data (~72 KB): keep it in external PSRAM (EXT_RAM_BSS)
  * so it does not compete with the Bluetooth stack for internal DRAM. */
 EXT_RAM_BSS_ATTR static char s_src_list[SRC_MAX][MP3_NAME_LEN];  /* folder names; [0]="" => <ALL> */
 EXT_RAM_BSS_ATTR static char s_src_path[SRC_MAX][PLAYER_PATH_LEN];/* absolute dir path per entry */

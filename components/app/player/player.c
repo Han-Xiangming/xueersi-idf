@@ -154,7 +154,6 @@ player_err_t player_last_error(void)
  * complete, consistent list and never a half-written one. The UI polls
  * s_playlist->version at its 16 ms cadence, so it never blocks on the load.
  * EXT_RAM_BSS keeps the two playlist buffers out of internal DRAM. */
-#define PLAYER_SCAN_MAX 64
 
 /* Double buffer: loaders write one, readers see the other via s_playlist. */
 EXT_RAM_BSS_ATTR static playlist_t s_pl_a;
@@ -175,11 +174,17 @@ static TaskHandle_t s_watch_task;   /* decode-stall watchdog (see player_watch_t
  * down with the cache read/parse helpers. */
 static void playlist_cache_write(const playlist_t *pl);
 
-/* Compare two entries by name, case-insensitive, for a stable folder order. */
+/* Compare two entries by their basename, case-insensitive, for a stable
+ * folder order (mirrors the display name used elsewhere). */
 static int playlist_entry_cmp(const void *a, const void *b)
 {
-    return strcasecmp(((const playlist_entry_t *)a)->name,
-                      ((const playlist_entry_t *)b)->name);
+    const playlist_entry_t *pa = (const playlist_entry_t *)a;
+    const playlist_entry_t *pb = (const playlist_entry_t *)b;
+    const char *ba = strrchr(pa->path, '/');
+    const char *bb = strrchr(pb->path, '/');
+    ba = (ba != NULL) ? ba + 1 : pa->path;
+    bb = (bb != NULL) ? bb + 1 : pb->path;
+    return strcasecmp(ba, bb);
 }
 
 /* Publish a filled work buffer as the new live snapshot (atomic pointer
@@ -230,10 +235,6 @@ static int playlist_collect_dir(playlist_t *work, int n, const char *dir,
             if (len > 4 && strcasecmp(fn + len - 4, ".mp3") == 0) {
                 snprintf(work->items[n].path, sizeof(work->items[n].path),
                          "%s", child);
-                /* snprintf (not strncpy): always NUL-terminated, and quiet
-                 * under -Wstringop-truncation. */
-                snprintf(work->items[n].name, sizeof(work->items[n].name),
-                         "%s", fn);
                 n++;
             }
         }
@@ -345,7 +346,8 @@ const char *player_scan_name(int i)
     if (i < 0 || i >= s_scan_count) {
         return "";
     }
-    return s_playlist->items[i].name;
+    const char *b = strrchr(s_playlist->items[i].path, '/');
+    return (b != NULL) ? b + 1 : s_playlist->items[i].path;
 }
 
 const char *player_scan_path(int i)
@@ -1082,10 +1084,12 @@ void player_init(void)
  * entries. Loading the cache is O(n) line reads and is effectively
  * instantaneous versus the FATFS walk that a real scan requires. */
 
-/* Append one entry to the cache file (already open in append mode). */
+/* Append one entry to the cache file (already open in append mode). The
+ * title column is the path's basename, kept for backward compatibility. */
 static void playlist_cache_write_entry(FILE *f, const playlist_entry_t *e)
 {
-    fprintf(f, "%s\t%s\n", e->name, e->path);
+    const char *b = strrchr(e->path, '/');
+    fprintf(f, "%s\t%s\n", (b != NULL) ? b + 1 : e->path, e->path);
 }
 
 /* Serialize the just-published snapshot to the cache file. Called from the
@@ -1132,7 +1136,8 @@ static bool playlist_cache_parse_line(char *line, playlist_entry_t *e)
     if (path_len == 0 || path_len >= PLAYER_PATH_LEN) {
         return false;
     }
-    memcpy(e->name, p_title, title_len + 1);
+    /* Only the path is stored: the display name is derived from it. The
+     * title column is still validated above so a corrupt cache line fails. */
     memcpy(e->path, p_path, path_len + 1);
     return true;
 }
