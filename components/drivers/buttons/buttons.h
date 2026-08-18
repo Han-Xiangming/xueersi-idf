@@ -9,6 +9,13 @@
 
 #include "lvgl.h"
 
+/* Global media key, used by the UI on every page. This is a CUSTOM key
+ * code, NOT LVGL's LV_KEY_NEXT / LV_KEY_PREV: LVGL intercepts those two
+ * for group-focus navigation and they never reach the UI's LV_EVENT_KEY
+ * handler. (START is deliberately left without a function — it only wakes
+ * the screen — so it maps to the inert LV_KEY_END.) */
+#define LV_KEY_MEDIA_PANEL 0x101   /* MENU: toggle the floating playback panel */
+
 #define BUTTON_ACTIVE_LEVEL         0
 /* Press-debounce time. Kept short (10 ms) because the input is polled every
  * BUTTON_POLL_PERIOD_MS; together they keep press-to-UI latency at ~10-15 ms

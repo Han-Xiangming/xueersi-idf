@@ -169,10 +169,38 @@ static bool s_scan_pending;
 static TaskHandle_t s_scan_task;
 static TaskHandle_t s_watch_task;   /* decode-stall watchdog (see player_watch_task) */
 
+/* The whole-card cache is validated like an HTTP ETag / Last-Modified
+ * before any re-read: we remember the cache file's size + mtime at load and
+ * write time, then stat() again before touching it — so repeated player
+ * entries and <ALL> selections skip the SD I/O entirely when nothing
+ * changed. The fingerprint turns stale after: the file changed, the SD was
+ * removed (stat fails), or an explicit rescan dropped the cache. */
+static bool s_pub_is_whole_card;   /* published snapshot == whole-card list */
+static bool s_cache_fp_valid;      /* s_cache_fp holds a valid fingerprint */
+static struct stat s_cache_fp;
+
+static void playlist_cache_refresh_fp(void)
+{
+    s_cache_fp_valid = (stat(PLAYER_CACHE_FILE, &s_cache_fp) == 0);
+}
+
+/* True when the cache file still looks byte-identical to what we last loaded
+ * or wrote (same size and mtime). False if it is gone (SD removed / rescan
+ * unlinked it) or no reference fingerprint has been captured yet. */
+static bool playlist_cache_unchanged(void)
+{
+    struct stat st;
+    if (!s_cache_fp_valid || stat(PLAYER_CACHE_FILE, &st) != 0) {
+        return false;
+    }
+    return st.st_size == s_cache_fp.st_size && st.st_mtime == s_cache_fp.st_mtime;
+}
+
 /* Forward declaration: a completed real scan persists its result to the
  * on-card cache so the next player entry is instantaneous. Defined further
  * down with the cache read/parse helpers. */
 static void playlist_cache_write(const playlist_t *pl);
+static int playlist_load_from_cache(playlist_t *work);
 
 /* Compare two entries by their basename, case-insensitive, for a stable
  * folder order (mirrors the display name used elsewhere). */
@@ -276,6 +304,9 @@ static void player_load_folder(const char *root)
         s_src_name[blen] = '\0';
     }
     playlist_publish(work, n, PL_SRC_FOLDER);
+    /* Remember what we just published: the whole-card list only when the
+     * scan root was the card root (drives the cache fingerprint reuse). */
+    s_pub_is_whole_card = (strcmp(root, PLAYER_ROOT) == 0);
     /* The on-card cache represents the WHOLE-CARD list only. A sub-folder
      * browse must NOT overwrite it, or the next player entry (which always
      * loads the cache as "整卡") would show the wrong list. Persist the
@@ -318,7 +349,24 @@ void player_load(playlist_src_t src, const char *root)
         ESP_LOGW(TAG, "playlist source %d not implemented", src);
         return;
     }
-    strncpy(s_load_root, root ? root : PLAYER_ROOT, sizeof(s_load_root) - 1);
+    if (root == NULL) {
+        root = PLAYER_ROOT;
+    }
+    /* Whole-card requests are served from the on-card cache (or the
+     * in-memory snapshot) instead of a full FATFS walk: the cache IS the
+     * whole-card list, and staleness is handled by the explicit rescan.
+     * Only a sub-folder request needs a real scan. */
+    if (strcmp(root, PLAYER_ROOT) == 0 && !s_scan_busy && !s_scan_pending) {
+        if (s_pub_is_whole_card && playlist_cache_unchanged()) {
+            return;   /* already showing the fresh whole-card list */
+        }
+        playlist_t *work = (s_playlist == &s_pl_a) ? &s_pl_b : &s_pl_a;
+        if (playlist_load_from_cache(work) > 0) {
+            return;   /* served from cache; no walk needed */
+        }
+        /* Cache unusable: fall through to a real scan (which rewrites it). */
+    }
+    strncpy(s_load_root, root, sizeof(s_load_root) - 1);
     s_load_root[sizeof(s_load_root) - 1] = '\0';
     s_scan_pending = true;
     if (s_scan_task != NULL) {
@@ -1106,6 +1154,9 @@ static void playlist_cache_write(const playlist_t *pl)
     }
     fclose(f);
     ESP_LOGI(TAG, "wrote %d entries to cache %s", pl->count, PLAYER_CACHE_FILE);
+    /* The RAM snapshot now matches the file: refresh the fingerprint so the
+     * next entry/source selection can skip re-reading it. */
+    playlist_cache_refresh_fp();
 }
 
 /* Parse one cache line into `e`. Returns true on success. `line` is mutated
@@ -1175,6 +1226,8 @@ static int playlist_load_from_cache(playlist_t *work)
      * re-sort needed. Publish as the whole-card folder source. */
     snprintf(s_src_name, sizeof(s_src_name), "整卡");
     playlist_publish(work, n, PL_SRC_FOLDER);
+    s_pub_is_whole_card = true;
+    playlist_cache_refresh_fp();   /* the snapshot now matches the file */
     ESP_LOGI(TAG, "loaded %d entries from cache %s", n, PLAYER_CACHE_FILE);
     return n;
 }
@@ -1194,6 +1247,13 @@ void player_scan_with_cache(void)
      * cache), so skipping the cache load is safe; the UI shows "加载中"
      * until the list lands. */
     if (s_scan_busy || s_scan_pending) {
+        return;
+    }
+    /* In-memory snapshot reuse: the published list is already the fresh
+     * whole-card list (cache unchanged since it was loaded or written), so
+     * a player re-entry needs no SD I/O and no re-publish — no version
+     * bump, no UI repaint churn. */
+    if (s_pub_is_whole_card && playlist_cache_unchanged()) {
         return;
     }
     playlist_t *work = (s_playlist == &s_pl_a) ? &s_pl_b : &s_pl_a;

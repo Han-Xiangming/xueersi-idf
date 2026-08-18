@@ -448,6 +448,11 @@ typedef struct {
     lv_obj_t *bat_seg[5]; /* 5 fill segments inside the battery icon */
     lv_obj_t *bat_text;  /* "100%" label next to the battery */
 
+    lv_obj_t *pl_panel;   /* floating playback control panel (MENU key) */
+    lv_obj_t *pl_panel_name;
+    lv_obj_t *pl_panel_state;
+    lv_obj_t *pl_panel_btn[4];  /* 上一曲 / 播放暂停 / 下一曲 / 停止 */
+
     lv_group_t *group;
     ui_page_t page_id;
 } ui_state_t;
@@ -1439,17 +1444,16 @@ static bool ui_external_changed(void)
         changed = true;
     }
 
-    /* Player state / track affects the PLAYER page. */
-    if (s_ui.page_id == UI_PAGE_PLAYER) {
-        player_state_t st = player_state();
-        const char *nm    = player_current_name();
-        if (st != s_ext_pl_state
-            || strncmp(nm, s_ext_pl_name, MP3_NAME_LEN - 1) != 0) {
-            s_ext_pl_state = st;
-            strncpy(s_ext_pl_name, nm, MP3_NAME_LEN - 1);
-            s_ext_pl_name[MP3_NAME_LEN - 1] = '\0';
-            changed = true;
-        }
+    /* Player state / track affects the PLAYER page and the global mini
+     * player bar, so watch it on every page. */
+    player_state_t st = player_state();
+    const char *nm    = player_current_name();
+    if (st != s_ext_pl_state
+        || strncmp(nm, s_ext_pl_name, MP3_NAME_LEN - 1) != 0) {
+        s_ext_pl_state = st;
+        strncpy(s_ext_pl_name, nm, MP3_NAME_LEN - 1);
+        s_ext_pl_name[MP3_NAME_LEN - 1] = '\0';
+        changed = true;
     }
 
     /* Ebook: the scan list and the background page count land asynchronously. */
@@ -1555,12 +1559,178 @@ static void ui_refresh_battery(void)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Floating playback control panel (MENU key)                          */
+/* ------------------------------------------------------------------ */
+
+/* Panel controls: prev / play-pause / next / stop. */
+#define PLAYER_PANEL_NBTN 4
+
+static bool s_panel_open;
+static int  s_panel_sel;   /* 0..3, index into the four controls */
+
+static const char *const s_panel_labels[PLAYER_PANEL_NBTN] = {
+    "上一曲", "播放", "下一曲", "停止",
+};
+/* The play/pause button label is state-dependent (player-page convention:
+ * "暂停" while playing, "继续" while paused). */
+static const char *ui_panel_btn_text(int i)
+{
+    if (i == 1) {
+        switch (player_state()) {
+        case PLAYER_PLAYING: return "暂停";
+        case PLAYER_PAUSED:  return "继续";
+        default:             return "播放";
+        }
+    }
+    return s_panel_labels[i];
+}
+
+/* Build the floating panel once at startup (sibling of the battery gauge on
+ * the ACTIVE SCREEN, so it draws above every page/menu). Hidden by default;
+ * MENU toggles it, B or MENU closes it. Layout (screen 320x240):
+ *   panel (12,64,296,136), 1px border, near-black fill
+ *   row 1: track name (left) + ">>列表"/"||单曲" (right)
+ *   row 2: four controls, 64px slots at x = 8/80/152/224
+ *   row 3: hint "左/右选 A确认 B关闭" */
+static void ui_build_player_panel(void)
+{
+    lv_obj_t *panel = lv_obj_create(lv_screen_active());
+    lv_obj_remove_style_all(panel);
+    lv_obj_set_pos(panel, 12, 64);
+    lv_obj_set_size(panel, 296, 136);
+    lv_obj_set_style_bg_color(panel, lv_color_hex(0x101010), 0);
+    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(panel, lv_color_hex(UI_GRAY), 0);
+    lv_obj_set_style_border_width(panel, 1, 0);
+    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(panel, LV_OBJ_FLAG_HIDDEN);
+    s_ui.pl_panel = panel;
+
+    s_ui.pl_panel_name = lv_label_create(panel);
+    lv_label_set_text(s_ui.pl_panel_name, "");
+    lv_label_set_long_mode(s_ui.pl_panel_name, LV_LABEL_LONG_MODE_CLIP);
+    lv_obj_set_pos(s_ui.pl_panel_name, 10, 8);
+    lv_obj_set_size(s_ui.pl_panel_name, 190, LV_SIZE_CONTENT);
+    lv_obj_set_style_text_font(s_ui.pl_panel_name, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(s_ui.pl_panel_name, lv_color_hex(UI_GRAY), 0);
+
+    s_ui.pl_panel_state = lv_label_create(panel);
+    lv_label_set_text(s_ui.pl_panel_state, "");
+    lv_label_set_long_mode(s_ui.pl_panel_state, LV_LABEL_LONG_MODE_CLIP);
+    lv_obj_set_pos(s_ui.pl_panel_state, 208, 8);
+    lv_obj_set_size(s_ui.pl_panel_state, 78, LV_SIZE_CONTENT);
+    lv_obj_set_style_text_font(s_ui.pl_panel_state, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(s_ui.pl_panel_state, lv_color_hex(UI_GRAY), 0);
+    lv_obj_set_style_text_align(s_ui.pl_panel_state, LV_TEXT_ALIGN_RIGHT, 0);
+
+    static const int s_panel_x[PLAYER_PANEL_NBTN] = {8, 80, 152, 224};
+    for (int i = 0; i < PLAYER_PANEL_NBTN; i++) {
+        lv_obj_t *btn = lv_label_create(panel);
+        lv_label_set_text(btn, ui_panel_btn_text(i));
+        lv_label_set_long_mode(btn, LV_LABEL_LONG_MODE_CLIP);
+        lv_obj_set_pos(btn, s_panel_x[i], 72);
+        lv_obj_set_size(btn, 64, LV_SIZE_CONTENT);
+        lv_obj_set_style_text_font(btn, &lv_font_cn_16, 0);
+        lv_obj_set_style_text_color(btn, lv_color_hex(UI_GRAY), 0);
+        s_ui.pl_panel_btn[i] = btn;
+    }
+
+    lv_obj_t *hint = lv_label_create(panel);
+    lv_label_set_text(hint, "左/右选 A确认 B关闭");
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_MODE_CLIP);
+    lv_obj_set_pos(hint, 10, 104);
+    /* Fixed height instead of LV_SIZE_CONTENT: the size would be computed
+     * with the default (montserrat_10) font at creation time and the hint
+     * text never changes, so CLIP would cut the 15px CJK glyphs top and
+     * bottom. 30px = lv_font_cn_16 line height, keeps the whole row. */
+    lv_obj_set_size(hint, 276, 30);
+    lv_obj_set_style_text_font(hint, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(hint, lv_color_hex(UI_GRAY), 0);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+}
+
+/* Repaint the panel's live content: track name + state symbol, the
+ * state-dependent play/pause button label, and the selection highlight. */
+static void ui_refresh_player_panel(void)
+{
+    if (s_ui.pl_panel == NULL || !s_panel_open) {
+        return;
+    }
+    const player_state_t st = player_state();
+
+    static char s_panel_name_buf[MP3_NAME_LEN + 8];
+    if (st == PLAYER_IDLE) {
+        snprintf(s_panel_name_buf, sizeof(s_panel_name_buf), "未播放");
+    }
+    else {
+        snprintf(s_panel_name_buf, sizeof(s_panel_name_buf), "%s",
+                 strip_ext(player_current_name()));
+    }
+    ui_label_set(s_ui.pl_panel_name, s_panel_name_buf);
+
+    static char s_panel_state_buf[16];
+    snprintf(s_panel_state_buf, sizeof(s_panel_state_buf), "%s%s",
+             st == PLAYER_PLAYING ? ">>" : st == PLAYER_PAUSED ? "||" : "--",
+             player_repeat_mode() == PLAYER_REPEAT_ONE ? "单曲" : "列表");
+    ui_label_set(s_ui.pl_panel_state, s_panel_state_buf);
+
+    for (int i = 0; i < PLAYER_PANEL_NBTN; i++) {
+        ui_label_set(s_ui.pl_panel_btn[i], ui_panel_btn_text(i));
+        lv_obj_set_style_text_color(s_ui.pl_panel_btn[i],
+                                    lv_color_hex(i == s_panel_sel ? UI_CYAN : UI_GRAY), 0);
+    }
+}
+
+/* A on the panel: run the selected control. */
+static void ui_panel_activate(void)
+{
+    switch (s_panel_sel) {
+    case 0:   /* 上一曲 */
+        if (player_state() != PLAYER_IDLE) {
+            player_prev();
+            set_action("上一曲");
+        }
+        else {
+            set_action("未播放");
+        }
+        break;
+    case 1:   /* 播放 / 暂停 / 继续 */
+        if (player_state() != PLAYER_IDLE) {
+            player_toggle();
+            set_action(player_state() == PLAYER_PLAYING ? "播放中" : "已暂停");
+        }
+        else {
+            set_action("未播放");
+        }
+        break;
+    case 2:   /* 下一曲 */
+        if (player_state() != PLAYER_IDLE) {
+            player_next();
+            set_action("下一曲");
+        }
+        else {
+            set_action("未播放");
+        }
+        break;
+    default:  /* 停止 */
+        if (player_state() != PLAYER_IDLE) {
+            player_stop();
+            set_action("已停止");
+        }
+        break;
+    }
+    ui_mark_dirty();
+}
+
 void ui_refresh(void)
 {
     ui_settings_flush();
     if (s_in_menu) {
-        /* Menu is event-driven, but keep the battery gauge live on every tick. */
+        /* Menu is event-driven, but keep the battery gauge and the playback
+         * panel live on every tick. */
         ui_refresh_battery();
+        ui_refresh_player_panel();
         return;                         /* menu is event-driven */
     }
 
@@ -2075,6 +2245,7 @@ void ui_refresh(void)
         break;
     }
     ui_refresh_battery();
+    ui_refresh_player_panel();
     /* Keep refreshing while a selected list row is still scrolling, otherwise
      * the marquee freezes after a single step (s_ui_dirty would be cleared).
      * During playback the MP3 marquee is intentionally frozen, so it must not
@@ -2361,6 +2532,43 @@ static void ui_key_event_cb(lv_event_t *e)
 
     const uint32_t key = lv_event_get_key(e);
 
+    /* Global media key (MENU = toggle the floating playback panel), active on
+     * every page and even while the panel is blanked (it wakes the screen
+     * too). The buttons driver delivers it single-shot (no auto-repeat),
+     * so one press is exactly one action. START is deliberately unbound: it
+     * only wakes the screen via the standby handler below. */
+    if (key == LV_KEY_MEDIA_PANEL) {
+        hw_lcd_activity();
+        /* On the player page MENU returns to the main menu (the playback
+         * panel is ebook-only and cannot be open here). */
+        if (!s_in_menu && s_ui.page_id == UI_PAGE_PLAYER) {
+            ui_show_menu();
+            ui_refresh();
+            lv_refr_now(NULL);
+            return;
+        }
+        const bool on_ebook = !s_in_menu
+                              && (s_ui.page_id == UI_PAGE_EBOOK_LIST
+                                  || s_ui.page_id == UI_PAGE_EBOOK_READ);
+        /* The floating panel may only be summoned on the ebook pages (it is
+         * the background-music companion while reading). A closed panel
+         * ignores the key anywhere else; an open one always closes. */
+        if (s_panel_open || on_ebook) {
+            s_panel_open = !s_panel_open;
+            if (s_panel_open) {
+                s_panel_sel = 1;         /* default to play/pause */
+                lv_obj_clear_flag(s_ui.pl_panel, LV_OBJ_FLAG_HIDDEN);
+            }
+            else {
+                lv_obj_add_flag(s_ui.pl_panel, LV_OBJ_FLAG_HIDDEN);
+            }
+            ui_mark_dirty();
+        }
+        ui_refresh();
+        lv_refr_now(NULL);
+        return;
+    }
+
     /* While the screen is blanked in standby, this key press only wakes it
      * up: light the panel and re-arm the idle timer, but swallow the key so
      * the user does not accidentally trigger a selection/page change just by
@@ -2372,6 +2580,27 @@ static void ui_key_event_cb(lv_event_t *e)
 
     /* Any key press counts as user activity: re-arm the idle timer. */
     hw_lcd_activity();
+
+    /* The playback panel is modal: while it is open it owns all keys. */
+    if (s_panel_open) {
+        if (key == LV_KEY_LEFT) {
+            s_panel_sel = (s_panel_sel + PLAYER_PANEL_NBTN - 1) % PLAYER_PANEL_NBTN;
+        }
+        else if (key == LV_KEY_RIGHT) {
+            s_panel_sel = (s_panel_sel + 1) % PLAYER_PANEL_NBTN;
+        }
+        else if (key == LV_KEY_ENTER) {
+            ui_panel_activate();
+        }
+        else if (key == LV_KEY_ESC) {
+            s_panel_open = false;
+            lv_obj_add_flag(s_ui.pl_panel, LV_OBJ_FLAG_HIDDEN);
+        }
+        ui_mark_dirty();
+        ui_refresh();
+        lv_refr_now(NULL);
+        return;
+    }
 
     if (s_in_menu) {
         if (key == LV_KEY_UP) {
@@ -2590,6 +2819,12 @@ void ui_create(lv_group_t *group)
         lv_obj_clear_flag(seg, LV_OBJ_FLAG_SCROLLABLE);
         s_ui.bat_seg[i] = seg;
     }
+
+    /* Floating playback control panel (MENU key): built once, hidden by
+     * default; parented to the ACTIVE SCREEN like the battery gauge so it
+     * draws above every page/menu and survives page rebuilds. */
+    ui_build_player_panel();
+    s_panel_open = false;
 }
 
 lv_group_t *ui_input_init(lv_display_t *display)

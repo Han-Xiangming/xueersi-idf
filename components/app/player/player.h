@@ -135,7 +135,9 @@ static inline void player_scan_start(void)
  * instantaneous start. If the cache is missing or unreadable we fall back to
  * a background scan and (re)write the cache on completion. Call this from
  * player_init() in place of player_scan_start() so a re-entered player never
- * blocks on the FATFS walk. */
+ * blocks on the FATFS walk. Repeated calls are cheap: the cache is
+ * validated by file fingerprint (size+mtime) and skipped entirely when the
+ * published snapshot is already the unchanged whole-card list. */
 void player_scan_with_cache(void);
 
 /* Force a fresh scan and rewrite the cache (e.g. the user asked to rebuild

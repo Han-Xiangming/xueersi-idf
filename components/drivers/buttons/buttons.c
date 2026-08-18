@@ -24,8 +24,8 @@ static const board_button_t s_buttons[] = {
     {GPIO_NUM_34, LV_KEY_ENTER, "A", 0},
     {GPIO_NUM_12, LV_KEY_ESC, "B", 0},
     {GPIO_NUM_25, LV_KEY_HOME, "SELECT", 0},   /* Select */
-    {GPIO_NUM_26, LV_KEY_PREV, "START", 0},     /* Start  */
-    {GPIO_NUM_33, LV_KEY_NEXT, "MENU", 0},      /* Menu (low-active, GND) */
+    {GPIO_NUM_26, LV_KEY_END, "START", 0},    /* Start: wake only, no function */
+    {GPIO_NUM_33, LV_KEY_MEDIA_PANEL, "MENU", 0},  /* Menu: playback panel */
 };
 
 void hw_buttons_init(void)
@@ -79,6 +79,16 @@ void hw_buttons_init(void)
     }
 }
 
+/* Media keys are delivered single-shot: report the press only on the poll
+ * where the debounce settles, then look released while the button is still
+ * held. This keeps LVGL's keypad state machine out of long-press
+ * auto-repeat (which re-sends the same key every 90 ms while held), so one
+ * START/MENU press performs exactly one action. */
+static bool key_is_media(uint32_t key)
+{
+    return key == LV_KEY_MEDIA_PANEL;
+}
+
 void hw_buttons_read(lv_indev_t *indev, lv_indev_data_t *data)
 {
     (void)indev;
@@ -87,6 +97,7 @@ void hw_buttons_read(lv_indev_t *indev, lv_indev_data_t *data)
     static int stable_index = -1;
     static uint32_t raw_changed_ms = 0;
     static uint32_t last_key = LV_KEY_ENTER;
+    static int media_hold_index = -1;
 
     int raw_index = -1;
     const uint32_t now_ms = lv_tick_get();
@@ -110,11 +121,27 @@ void hw_buttons_read(lv_indev_t *indev, lv_indev_data_t *data)
     }
 
     if (stable_index >= 0) {
-        last_key = s_buttons[stable_index].key;
+        const uint32_t key = s_buttons[stable_index].key;
+        if (key_is_media(key)) {
+            if (stable_index != media_hold_index) {
+                media_hold_index = stable_index;   /* first settling poll: press */
+                last_key = key;
+                data->state = LV_INDEV_STATE_PRESSED;
+                data->key = key;
+            }
+            else {
+                data->state = LV_INDEV_STATE_RELEASED;  /* still held: release */
+                data->key = last_key;
+            }
+            return;
+        }
+        media_hold_index = -1;
+        last_key = key;
         data->state = LV_INDEV_STATE_PRESSED;
         data->key = last_key;
     }
     else {
+        media_hold_index = -1;
         data->state = LV_INDEV_STATE_RELEASED;
         data->key = last_key;
     }
