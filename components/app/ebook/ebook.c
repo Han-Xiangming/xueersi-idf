@@ -39,6 +39,16 @@ static const char *TAG = "ebook";
 #define EBOOK_CHAR_W16      256          /* fullwidth advance, 1/16 px = 16 px */
 #define EBOOK_HIST_N        32           /* page-start offset history ring */
 
+/* Page-start offset table built by the count task: entry k is the byte
+ * offset where the canonical page (from offset 0) k starts. Pagination is
+ * deterministic, so these are exactly the UI reader's page starts for any
+ * session that never jumped. rebuild_history() uses the table to restore
+ * backward history in O(1) instead of re-laying out the whole book on the
+ * UI task (multi-second freeze on large books). 64k entries * 4 B = 256 KB
+ * PSRAM covers ~64k pages (~10-15 MB of CJK text); larger books fall back
+ * to the slow synchronous relayout. */
+#define EBOOK_START_TABLE_CAP (64 * 1024)
+
 /* Reading-progress persistence on the SD card (single file next to the
  * books, so it moves with the card and survives firmware updates). A
  * debounced save runs EBOOK_SAVE_DELAY_MS after the last page flip;
@@ -166,8 +176,21 @@ static book_src_t s_book;
 static char s_page_buf[EBOOK_PAGE_BUF] EXT_RAM_BSS_ATTR;
 static char s_scan_buf[2][EBOOK_LIST_MAX][EBOOK_PATH_MAX] EXT_RAM_BSS_ATTR;
 
+/* Page-start table (see EBOOK_START_TABLE_CAP). Written by the count task,
+ * published under s_mux once the walk finishes; entries are immutable while
+ * s_table_valid is true (the table is invalidated on open/close before any
+ * writer can overwrite it). */
+static uint32_t *s_start_table;
+static uint32_t s_table_count;
+static bool s_table_valid;
+
 static size_t s_cur_start;               /* start offset of the current page */
 static size_t s_next_start;              /* start offset of the next page */
+/* Origin of the current page sequence: the resume offset at open or the
+ * jump target. Page starts after a jump are laid out from this offset and
+ * are NOT canonical (they do not coincide with the from-zero layout), so
+ * backward history must be rebuilt from here. UI-task-private. */
+static size_t s_session_start;
 static size_t s_hist[EBOOK_HIST_N];      /* page-start history ring */
 static int s_hist_head;                  /* oldest entry */
 static int s_hist_count;
@@ -512,24 +535,106 @@ static bool hist_pop(size_t *off)
     return true;
 }
 
-/* Deep-backward fallback: sequentially re-lay out the whole book from page 1
- * and rebuild the history of page-start offsets up to the current page.
- * One-time O(pages) cost, afterwards normal O(1) pops resume. */
+/* Deep-backward fallback: rebuild the history ring of page-start offsets
+ * before the current page. Afterwards normal O(1) pops resume.
+ *
+ * Fast path (the common case): the count task already laid the whole book
+ * out from offset 0 and recorded every canonical page start in
+ * s_start_table (deterministic pagination => identical to the UI reader's
+ * pages). A canonical current page is then restored in O(1) instead of
+ * re-laying the book out here — the old path blocked the UI task for
+ * seconds on large books. */
 static void rebuild_history(void)
 {
     s_hist_count = 0;
     s_hist_head = 0;
-    size_t off = 0;
-    while (off != s_cur_start) {
-        if (s_hist_count == EBOOK_HIST_N) {
-            s_hist_head = (s_hist_head + 1) % EBOOK_HIST_N;
-            s_hist_count--;
+
+    if (s_start_table != NULL) {
+        uint32_t n;
+        portENTER_CRITICAL(&s_mux);
+        n = s_table_valid ? s_table_count : 0;
+        portEXIT_CRITICAL(&s_mux);
+        if (n > 0) {
+            const uint32_t *t = s_start_table;
+            uint32_t lo = 0, hi = n - 1, k = (uint32_t)-1;
+            while (lo <= hi) {          /* k = last index with t[k] < cur */
+                const uint32_t mid = (lo + hi) / 2;
+                if (t[mid] < (uint32_t)s_cur_start) {
+                    k = mid;
+                    lo = mid + 1;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            const bool canonical = k != (uint32_t)-1 && k + 1 < n &&
+                                   t[k + 1] == (uint32_t)s_cur_start;
+            if (canonical) {
+                /* The user is on a canonical page: the whole ring is in the
+                 * table. (Keeps the last EBOOK_HIST_N entries via hist_push.) */
+                for (uint32_t i = 0; i <= k; i++) {
+                    hist_push(t[i]);
+                }
+                return;
+            }
+            /* The current page belongs to a post-jump session whose starts
+             * are laid out from s_session_start and are not canonical.
+             * Restore the canonical part below the session start from the
+             * table, then lay the session part out (bounded by the distance
+             * read since the jump). */
+            k = (uint32_t)-1;
+            lo = 0;
+            hi = n - 1;
+            while (lo <= hi) {      /* k = last index with t[k] < session start */
+                const uint32_t mid = (lo + hi) / 2;
+                if (t[mid] < (uint32_t)s_session_start) {
+                    k = mid;
+                    lo = mid + 1;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            if (k != (uint32_t)-1) {
+                for (uint32_t i = 0; i <= k; i++) {
+                    hist_push(t[i]);
+                }
+            }
+            if (s_cur_start > s_session_start) {
+                size_t off = s_session_start;
+                while (off < s_cur_start) {
+                    hist_push(off);
+                    const size_t prev = off;
+                    off = layout_page(&s_reader, off, NULL, 0);
+                    if (off == prev) {
+                        break;      /* read error: no forward progress */
+                    }
+                }
+            }
+            return;
         }
-        s_hist[(s_hist_head + s_hist_count) % EBOOK_HIST_N] = off;
-        s_hist_count++;
-        off = layout_page(&s_reader, off, NULL, 0);
-        if (off >= s_book.size) {
-            break;                       /* safety: current start unreachable */
+    }
+
+    /* Fallback (no table yet, or allocation failed): walk the canonical
+     * sequence from 0, then the session part from s_session_start. */
+    {
+        size_t off = 0;
+        while (off < s_cur_start) {
+            hist_push(off);
+            const size_t prev = off;
+            off = layout_page(&s_reader, off, NULL, 0);
+            if (off == prev) {
+                break;              /* read error: no forward progress */
+            }
+        }
+        if (off != s_cur_start && s_cur_start > s_session_start) {
+            size_t off2 = s_session_start;
+            while (off2 < s_cur_start) {
+                hist_push(off2);
+                const size_t prev = off2;
+                off2 = layout_page(&s_reader, off2, NULL, 0);
+                if (off2 == prev) {
+                    break;          /* read error: no forward progress */
+                }
+            }
         }
     }
 }
@@ -688,8 +793,23 @@ static void ebook_count_task(void *arg)
 
         uint32_t pages = 0;
         size_t off = 0;
-        while (off < src.size) {
+        for (;;) {
+            const size_t start = off;      /* byte offset of page `pages` */
+            if (off >= src.size) {
+                break;                     /* normal end of walk */
+            }
             off = layout_page(&r, off, NULL, 0);
+            if (off == start) {
+                /* No forward progress: a mid-file SD read error, or the file
+                 * shrank after open (src.size is the open-time size). Treat
+                 * it as EOF instead of spinning here forever at 100% CPU. */
+                ESP_LOGW(TAG, "count aborted at offset %u (SD read error)",
+                         (unsigned)start);
+                break;
+            }
+            if (s_start_table != NULL && pages < EBOOK_START_TABLE_CAP) {
+                s_start_table[pages] = (uint32_t)start;
+            }
             pages++;
         }
         fclose(r.fp);
@@ -699,6 +819,16 @@ static void ebook_count_task(void *arg)
         if (gen == s_open_gen && s_is_open) {
             s_page_count = pages;
             s_count_ver++;
+            /* Publish the page-start table built on this pass. Every entry
+             * written so far is a valid canonical page start (the entries
+             * before an abort are untouched), so the table is usable even
+             * after a read error — rebuild_history() falls back when the
+             * current page is not covered. */
+            if (s_start_table != NULL) {
+                s_table_count = (pages < EBOOK_START_TABLE_CAP)
+                                    ? pages : EBOOK_START_TABLE_CAP;
+                s_table_valid = true;
+            }
         }
         portEXIT_CRITICAL(&s_mux);
     }
@@ -871,6 +1001,18 @@ void ebook_init(void)
     if (s_chunk_b == NULL) {
         s_chunk_b = malloc(EBOOK_CHUNK);
     }
+    s_start_table = heap_caps_malloc(EBOOK_START_TABLE_CAP * sizeof(uint32_t),
+                                     MALLOC_CAP_SPIRAM);
+    if (s_start_table == NULL) {
+        s_start_table = malloc(EBOOK_START_TABLE_CAP * sizeof(uint32_t));
+    }
+    if (s_start_table == NULL) {
+        /* Not fatal: deep backward history falls back to the synchronous
+         * whole-book relayout in rebuild_history(). */
+        ESP_LOGW(TAG, "page-start table alloc failed (%u B): deep back-nav "
+                      "falls back to slow relayout",
+                 (unsigned)(EBOOK_START_TABLE_CAP * sizeof(uint32_t)));
+    }
     s_reader.buf = s_chunk_a;
     s_reader.buf_cap = EBOOK_CHUNK;
     xTaskCreate(ebook_scan_task, "eb_scan", 4 * 1024, NULL, 4, &s_scan_task);
@@ -970,8 +1112,11 @@ void ebook_close(void)
     s_open_gen++;
     s_page = 0;
     s_page_count = 0;
+    s_table_valid = false;
+    s_table_count = 0;
     portEXIT_CRITICAL(&s_mux);
     s_cur_start = s_next_start = 0;
+    s_session_start = 0;
     s_hist_count = s_hist_head = 0;
     s_page_buf[0] = '\0';
 }
@@ -1015,6 +1160,11 @@ bool ebook_open(int idx)
     s_book = src;
     s_is_open = true;
     s_open_gen++;                        /* start the count fresh for this book */
+    /* The page-start table belongs to the previous book: invalidate it until
+     * the new count walk publishes its own (its entries are written outside
+     * the mutex, so readers must never see them while stale). */
+    s_table_valid = false;
+    s_table_count = 0;
     portEXIT_CRITICAL(&s_mux);
 
     /* Restore the saved reading position, if any: reload the on-card
@@ -1036,6 +1186,9 @@ bool ebook_open(int idx)
             s_resume_pct = (uint32_t)((uint64_t)p.offset * 100 / src.size);
         }
     }
+    /* The restored position is the origin of the current page sequence:
+     * backward history is rebuilt from here (see s_session_start). */
+    s_session_start = start;
     s_cur_start = start;
     s_page = page;
     s_next_start = layout_page(&s_reader, start, s_page_buf,
@@ -1200,6 +1353,10 @@ bool ebook_jump_percent(int pct)
     }
     start = prev;
 
+    /* The jump target becomes the origin of the current page sequence: the
+     * pages after a jump are laid out from here and are not canonical (see
+     * s_session_start / rebuild_history). */
+    s_session_start = start;
     s_cur_start = start;
     s_next_start = layout_page(&s_reader, start, s_page_buf,
                                sizeof(s_page_buf));

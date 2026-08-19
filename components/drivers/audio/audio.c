@@ -758,6 +758,19 @@ void hw_audio_set_sample_rate(uint32_t sample_rate_hz)
     ESP_LOGI(TAG, "I2S rate -> %u Hz", (unsigned)s_rate);
 }
 
+/* Drop the previous pass's queued audio so a repeat-one replay starts clean:
+ * the speaker DMA's auto_clear clocks silence once its last frame is out, so
+ * only the BT PCM ring (up to ~740 ms of stale tail) needs a real flush; the
+ * underrun bookkeeping is reset so the deliberate seam pause is not flagged
+ * as an I2S write gap. Call from the task that owns PCM writes. */
+void hw_audio_pipeline_flush(void)
+{
+    s_last_write_us = 0;
+    if (s_route == AUDIO_ROUTE_BT) {
+        bt_audio_flush_pcm_ring();
+    }
+}
+
 /* Stream decoded 16-bit stereo PCM (L,R interleaved). `frames` = number of
  * L/R pairs. Returns the write result so the player can tell a wedged
  * pipeline (AUDIO_WRITE_STALLED) from a clean pause/stop

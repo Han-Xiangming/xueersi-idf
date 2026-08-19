@@ -451,7 +451,7 @@ typedef struct {
     lv_obj_t *pl_panel;   /* floating playback control panel (MENU key) */
     lv_obj_t *pl_panel_name;
     lv_obj_t *pl_panel_state;
-    lv_obj_t *pl_panel_btn[4];  /* 上一曲 / 播放暂停 / 下一曲 / 停止 */
+    lv_obj_t *pl_panel_btn[5];  /* 上一曲 / 播放暂停 / 下一曲 / 停止 / 循环 */
 
     lv_group_t *group;
     ui_page_t page_id;
@@ -1563,17 +1563,34 @@ static void ui_refresh_battery(void)
 /* Floating playback control panel (MENU key)                          */
 /* ------------------------------------------------------------------ */
 
-/* Panel controls: prev / play-pause / next / stop. */
-#define PLAYER_PANEL_NBTN 4
+/* Panel controls: prev / play-pause / next / stop / repeat-mode toggle. */
+#define PLAYER_PANEL_NBTN 5
+
+/* Width of a label in px: every glyph in lv_font_cn_16 is 16 px wide and
+ * every label here is pure CJK, so counting UTF-8 characters (skipping the
+ * 0b10xxxxxx continuation bytes) gives the exact width without font metrics. */
+static int ui_label_width_px(const char *s)
+{
+    int n = 0;
+    while (*s != '\0') {
+        if ((*s & 0xC0) != 0x80) {
+            n++;
+        }
+        s++;
+    }
+    return n * 16;
+}
 
 static bool s_panel_open;
-static int  s_panel_sel;   /* 0..3, index into the four controls */
+static int  s_panel_sel;   /* 0..4, index into the five controls */
 
 static const char *const s_panel_labels[PLAYER_PANEL_NBTN] = {
-    "上一曲", "播放", "下一曲", "停止",
+    "上一曲", "播放", "下一曲", "停止", "循环",
 };
 /* The play/pause button label is state-dependent (player-page convention:
- * "暂停" while playing, "继续" while paused). */
+ * "暂停" while playing, "继续" while paused); the repeat button shows the
+ * current mode ("单曲" while REPEAT_ONE, else "列表") so pressing it reads
+ * as "switch to the other mode". */
 static const char *ui_panel_btn_text(int i)
 {
     if (i == 1) {
@@ -1583,6 +1600,9 @@ static const char *ui_panel_btn_text(int i)
         default:             return "播放";
         }
     }
+    if (i == 4) {
+        return player_repeat_mode() == PLAYER_REPEAT_ONE ? "单曲" : "列表";
+    }
     return s_panel_labels[i];
 }
 
@@ -1591,7 +1611,8 @@ static const char *ui_panel_btn_text(int i)
  * MENU toggles it, B or MENU closes it. Layout (screen 320x240):
  *   panel (12,64,296,136), 1px border, near-black fill
  *   row 1: track name (left) + ">>列表"/"||单曲" (right)
- *   row 2: four controls, 64px slots at x = 8/80/152/224
+ *   row 2: five controls, laid out from the exact label widths with a
+ *          uniform 12 px gap, centered in the panel
  *   row 3: hint "左/右选 A确认 B关闭" */
 static void ui_build_player_panel(void)
 {
@@ -1624,13 +1645,35 @@ static void ui_build_player_panel(void)
     lv_obj_set_style_text_color(s_ui.pl_panel_state, lv_color_hex(UI_GRAY), 0);
     lv_obj_set_style_text_align(s_ui.pl_panel_state, LV_TEXT_ALIGN_RIGHT, 0);
 
-    static const int s_panel_x[PLAYER_PANEL_NBTN] = {8, 80, 152, 224};
+    /* Evenly distribute the five controls: fixed-width slots left 4 px /
+     * 20 px alternating gaps (3-char vs 2-char labels); laying the row out
+     * from the exact label widths with a uniform gap and centered margins
+     * makes every inter-button gap identical whatever the labels read. */
+    int s_panel_x[PLAYER_PANEL_NBTN];
+    {
+        const int gap = 12;
+        /* Panel width from the literal set above (296): lv_obj_get_width()
+         * would return the laid-out coords box, which is still empty at
+         * build time (the panel is created before the first layout pass),
+         * pushing the whole row off the panel's left edge. */
+        const int pw = 296;
+        int total = 0;
+        for (int i = 0; i < PLAYER_PANEL_NBTN; i++) {
+            total += ui_label_width_px(s_panel_labels[i]);
+        }
+        int x = (pw - total - gap * (PLAYER_PANEL_NBTN - 1)) / 2;
+        for (int i = 0; i < PLAYER_PANEL_NBTN; i++) {
+            s_panel_x[i] = x;
+            x += ui_label_width_px(s_panel_labels[i]) + gap;
+        }
+    }
     for (int i = 0; i < PLAYER_PANEL_NBTN; i++) {
         lv_obj_t *btn = lv_label_create(panel);
         lv_label_set_text(btn, ui_panel_btn_text(i));
         lv_label_set_long_mode(btn, LV_LABEL_LONG_MODE_CLIP);
         lv_obj_set_pos(btn, s_panel_x[i], 72);
-        lv_obj_set_size(btn, 64, LV_SIZE_CONTENT);
+        lv_obj_set_size(btn, ui_label_width_px(s_panel_labels[i]),
+                        LV_SIZE_CONTENT);
         lv_obj_set_style_text_font(btn, &lv_font_cn_16, 0);
         lv_obj_set_style_text_color(btn, lv_color_hex(UI_GRAY), 0);
         s_ui.pl_panel_btn[i] = btn;
@@ -1712,6 +1755,12 @@ static void ui_panel_activate(void)
         else {
             set_action("未播放");
         }
+        break;
+    case 4:   /* 循环: 切换播放模式 (列表循环 ⇄ 单曲循环). The button label
+               * shows the CURRENT mode; pressing toggles to the other. */
+        player_repeat_toggle();
+        set_action(player_repeat_mode() == PLAYER_REPEAT_ONE
+                       ? "已切换单曲循环" : "已切换列表循环");
         break;
     default:  /* 停止 */
         if (player_state() != PLAYER_IDLE) {

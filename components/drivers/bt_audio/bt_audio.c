@@ -114,6 +114,19 @@ static volatile bool s_disabling;
  * pull more PCM (and the decode side must not push more) once the profiles
  * start going away —feeding SBC during A2DP deinit can crash the BTC task. */
 static volatile bool s_tx_stopped;
+/* True while bt_audio_teardown() is executing (in the Timer task). A
+ * concurrent bt_audio_enable() (LVGL task) cannot start Bluedroid while the
+ * stack is being deinit'ed from another task, so it defers via
+ * s_reenable_pending instead and the teardown re-initialises at the end. */
+static volatile bool s_teardown_running;
+/* Set by bt_audio_enable() when it arrived during a running teardown; the
+ * teardown honours it either by cancelling (link still dropping / stack
+ * still up) or by re-running the full init once deinit finished. */
+static volatile bool s_reenable_pending;
+/* True while a (re-)initialisation is running, so a concurrent enable call
+ * never runs the Bluedroid bring-up twice (e.g. the Timer task re-enables
+ * while the LVGL task is also mid-call). */
+static volatile bool s_enabling;
 static RingbufHandle_t s_pcm_ring;
 static uint8_t *s_ring_storage;
 static StaticRingbuffer_t s_ring_struct;
@@ -516,6 +529,16 @@ void bt_audio_init(void)
  * Call when the user opens the BLUETOOTH page, not at boot. */
 void bt_audio_enable(void)
 {
+    if (s_teardown_running) {
+        /* A teardown is mid-flight (it runs in the Timer task). Starting the
+         * controller/Bluedroid while the stack is being deinit'ed from
+         * another task is not safe, so defer: the teardown re-runs this
+         * enable once it has finished (either cancelling the deinit or
+         * re-initialising after it). Do NOT clear s_disabling / s_tx_stopped
+         * here — they stay frozen until the teardown resolves. */
+        s_reenable_pending = true;
+        return;
+    }
     if (s_initialized) {
         /* Already up. Clear any teardown that bt_audio_disable() deferred
          * while a link was dropping: the user flipped BT back ON before the
@@ -524,6 +547,13 @@ void bt_audio_enable(void)
         s_tx_stopped = false;
         return;
     }
+    if (s_enabling) {
+        /* A (re-)initialisation is already running on our behalf (the Timer
+         * task re-enabling after a deferred teardown). Nothing to do: this
+         * call will have succeeded when that one completes. */
+        return;
+    }
+    s_enabling = true;
     s_disabling = false;
 
     esp_err_t err;
@@ -535,21 +565,25 @@ void bt_audio_enable(void)
     err = esp_bt_controller_init(&ctrl_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "BT controller init: %s", esp_err_to_name(err));
+        s_enabling = false;
         return;
     }
     err = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "BT controller enable: %s", esp_err_to_name(err));
+        s_enabling = false;
         return;
     }
     err = esp_bluedroid_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Bluedroid init: %s", esp_err_to_name(err));
+        s_enabling = false;
         return;
     }
     err = esp_bluedroid_enable();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Bluedroid enable: %s", esp_err_to_name(err));
+        s_enabling = false;
         return;
     }
 
@@ -568,6 +602,7 @@ void bt_audio_enable(void)
     err = esp_a2d_source_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "A2DP source init: %s", esp_err_to_name(err));
+        s_enabling = false;
         return;
     }
     /* Re-register SEP 0 with the capped SBC bitpool (overwrites the default
@@ -581,6 +616,7 @@ void bt_audio_enable(void)
     }
 
     s_initialized = true;
+    s_enabling = false;
     ESP_LOGI(TAG, "A2DP source ready ('Xiaomao MP3')");
 }
 
@@ -611,6 +647,7 @@ static void bt_audio_teardown(void *param1, uint32_t param2)
     if (!s_disabling) {
         return;                             /* re-enabled: keep the stack up */
     }
+    s_teardown_running = true;
     /* Freeze the PCM feed first: while the link is going away the stack may
      * still pull data, and feeding SBC during profile teardown can crash the
      * BTC task. */
@@ -626,20 +663,34 @@ static void bt_audio_teardown(void *param1, uint32_t param2)
      * the teardown forever. Re-check s_disabling afterwards so a concurrent
      * bt_audio_enable() can cancel the teardown even mid-wait. */
     int waited = 0;
-    while (bt_link_busy() && waited < BT_TD_MAX_RECHECK) {
+    while (bt_link_busy() && waited < BT_TD_MAX_RECHECK && !s_reenable_pending) {
         vTaskDelay(pdMS_TO_TICKS(BT_TD_RECHECK_MS));
         waited++;
     }
-    if (!s_disabling) {
-        return;                         /* re-enabled: keep the stack up */
+    if (!s_disabling || s_reenable_pending) {
+        /* Re-enabled while we were waiting: keep the stack up and undo the
+         * flags the deferred bt_audio_enable() set. (The disconnect issued
+         * above, if any, completes on its own — same as the pre-teardown
+         * cancellation path.) */
+        s_teardown_running = false;
+        s_disabling = false;
+        s_tx_stopped = false;
+        s_reenable_pending = false;
+        ESP_LOGI(TAG, "BT teardown cancelled: stack kept up");
+        return;
     }
     if (bt_link_busy()) {
         ESP_LOGW(TAG, "link still busy after %d ms of teardown polling, "
                       "tearing down anyway", waited * BT_TD_RECHECK_MS);
     }
-    /* Bluedroid requires the AVRCP Target to be torn down *before* the A2DP
+    /* From here on the teardown is no longer cancellable: publish the stack
+     * as down FIRST so a concurrent bt_audio_enable() can never take the
+     * "already up" shortcut into a half-destroyed stack — it defers via
+     * s_reenable_pending and is re-initialised at the end of this function.
+     * Bluedroid requires the AVRCP Target to be torn down *before* the A2DP
      * source; deinit'ing A2DP first triggers a "AVRC TG should deinit in
      * advance of A2DP" warning and can leave the AVRC profile half-freed. */
+    s_initialized = false;
     esp_avrc_tg_deinit();
     esp_a2d_source_deinit();
     esp_bluedroid_disable();
@@ -648,7 +699,6 @@ static void bt_audio_teardown(void *param1, uint32_t param2)
     esp_bt_controller_deinit();
 
     /* Reset all state so the next bt_audio_enable() starts from scratch. */
-    s_initialized = false;
     s_connected   = false;
     s_streaming   = false;
     s_enabled     = false;
@@ -667,6 +717,16 @@ static void bt_audio_teardown(void *param1, uint32_t param2)
     s_peer_name[0] = '\0';
 
     ESP_LOGI(TAG, "BT audio disabled, controller powered off");
+
+    s_teardown_running = false;
+    if (s_reenable_pending) {
+        /* The user flipped BT back ON while we were tearing down: bring the
+         * stack back up right here (Timer-task context, safe — this is the
+         * same call path the UI uses). */
+        s_reenable_pending = false;
+        ESP_LOGI(TAG, "re-enabling Bluetooth after deferred teardown");
+        bt_audio_enable();
+    }
 }
 
 /* Tear the stack down and power off the controller —the reverse of
@@ -961,6 +1021,24 @@ bool bt_audio_write_pcm(const int16_t *stereo_frames, size_t frames)
     return true;
 }
 
+/* Drop all PCM still queued in the A2DP ring (the previous pass's tail, up
+ * to ~740 ms) so the next write starts from silence. Called by the player
+ * at a repeat-one seam before the inter-pass pause; drains exactly like the
+ * established sites above and is safe against a concurrent A2DP data
+ * callback (ringbuffer receive hands out distinct items). */
+void bt_audio_flush_pcm_ring(void)
+{
+    if (s_pcm_ring == NULL) {
+        return;
+    }
+    uint8_t *item;
+    size_t sz;
+    while ((item = xRingbufferReceiveUpTo(s_pcm_ring, &sz, 0,
+                                          BT_PCM_RING_BYTES)) != NULL) {
+        vRingbufferReturnItem(s_pcm_ring, item);
+    }
+}
+
 #else /* Bluetooth / A2DP not compiled in */
 
 void bt_audio_init(void)
@@ -992,6 +1070,11 @@ void bt_audio_write_pcm(const int16_t *stereo_frames, size_t frames)
 void bt_audio_set_sample_rate(uint32_t rate_hz)
 {
     (void)rate_hz;
+}
+
+void bt_audio_flush_pcm_ring(void)
+{
+    /* No Bluetooth in this build: nothing to flush. */
 }
 
 void bt_audio_scan_start(void)

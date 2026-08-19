@@ -47,6 +47,12 @@
  * this long, the decode task is stuck (SD read hang, BT send hang, ...) and
  * the watchdog stops playback instead of faking an endless "playing" state. */
 #define PLAYER_STALL_MS          12000
+/* Pause between repeat-one passes. The previous pass's tail (up to ~280 ms
+ * in the I2S DMA / ~740 ms in the BT PCM ring) is flushed first and the
+ * channel then clocks silence for this long, so the replay starts from a
+ * clean boundary instead of the old ending running straight into the new
+ * beginning (perceived as the previous play's audio bleeding through). */
+#define REPEAT_ONE_GAP_MS        500
 
 static const char *TAG = "player";
 
@@ -952,11 +958,13 @@ static void decode_loop(void)
                                                   : "reached EOF");
             /* Single-track loop: replay the SAME file IN PLACE — rewind the
              * source, rebuild the decoder, reset the decode state and start
-             * decoding again. The I2S channel is never parked and no request
-             * round-trip (which would re-open the file and stop/start the
-             * clock) is involved, so the loop is gapless and works even when
-             * the track is not in the playlist. Only a clean EOF replays: a
-             * corrupt/pipeline failure falls through to the error path. */
+             * decoding again. No request round-trip (which would re-open the
+             * file and stop/start the clock) is involved; instead the old
+             * pass's tail is flushed and the task waits out REPEAT_ONE_GAP_MS
+             * while the channel clocks silence, so the replay starts from a
+             * clean boundary rather than the previous pass's ending bleeding
+             * straight into it. Only a clean EOF replays: a corrupt/pipeline
+             * failure falls through to the error path. */
             if (!s_stop_req && !s_new_req && !s_track_errored &&
                 s_repeat == PLAYER_REPEAT_ONE) {
                 if (!rewind_track()) {
@@ -964,6 +972,12 @@ static void decode_loop(void)
                     s_track_errored = true;
                 }
                 else {
+                    /* Drop the previous pass's queued audio (BT PCM ring;
+                     * the speaker DMA's auto_clear handles itself) and reset
+                     * the underrun bookkeeping, then wait out the gap in this
+                     * task. The channel keeps running on auto_clear silence. */
+                    hw_audio_pipeline_flush();
+                    vTaskDelay(pdMS_TO_TICKS(REPEAT_ONE_GAP_MS));
                     frame_cnt = 0;
                     rate_set = false;
                     ESP_LOGI(TAG, "repeat one: replaying '%s'", s_name);
@@ -1034,7 +1048,15 @@ static void player_task(void *arg)
 #if defined(CONFIG_ESP_TASK_WDT_EN)
         esp_task_wdt_reset();
 #endif
-        if (s_state == PLAYER_PLAYING) {
+        /* s_new_req is also honoured: player_play() may land in the tiny
+         * window between a stop and this task re-blocking (or during the
+         * decode loop's teardown), where its s_state = PLAYING write is
+         * clobbered by decode_loop()'s exit and by the line below. Without
+         * this check such a play press would be silently lost (the notify
+         * is consumed but decode_loop never runs). A set s_new_req always
+         * means "a real track request is pending" — player_stop() clears
+         * it, so a stale flag cannot fake playback. */
+        if (s_state == PLAYER_PLAYING || s_new_req) {
             decode_loop();
         }
         s_state = PLAYER_IDLE;

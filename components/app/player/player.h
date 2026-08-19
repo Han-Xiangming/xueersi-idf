@@ -207,8 +207,9 @@ void player_stop(void);
 /* --- Repeat mode -------------------------------------------------------
  * How the player behaves when a track reaches its natural end. Default is
  * list loop (advance to the next entry, wrapping at the end); single-track
- * loop replays the current track. Toggled at runtime by the UI (Select key).
- * Not persisted to NVS: each boot starts in list-loop mode. */
+ * loop replays the current track. Toggled at runtime by the UI (Select key
+ * on the player page, 循环 control on the floating playback panel). Not
+ * persisted to NVS: each boot starts in list-loop mode. */
 typedef enum {
     PLAYER_REPEAT_ALL = 0,   /* list loop: next track at end (default) */
     PLAYER_REPEAT_ONE,       /* single-track loop: replay the current track */

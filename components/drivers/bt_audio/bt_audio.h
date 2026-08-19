@@ -102,6 +102,11 @@ bool bt_audio_write_pcm(const int16_t *stereo_frames, size_t frames);
  * internally (otherwise the sink would play fast/slow and pitch-shifted). */
 void bt_audio_set_sample_rate(uint32_t rate_hz);
 
+/* Drop all PCM still queued in the A2DP ring (the previous pass's tail) so
+ * the next write starts from silence. Used at repeat-one seams, right before
+ * the inter-pass pause. Safe against a concurrent A2DP data callback. */
+void bt_audio_flush_pcm_ring(void);
+
 /* === AVRCP remote control ===================================================
  * The device is an A2DP SOURCE, so it registers the AVRCP TARGET (TG) role and
  * lets a paired remote (the headset/speaker's media keys) drive local playback
