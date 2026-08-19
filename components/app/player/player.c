@@ -18,6 +18,7 @@
 #include "esp_attr.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "rtc_wdt.h"
 #include "freertos/FreeRTOS.h"
@@ -1014,15 +1015,33 @@ static void decode_loop(void)
         }
         s_fail_count = 0;
 
-        /* Natural end of track: advance to the next list entry, wrapping at
-         * the end. (Single-track loop never gets here: it replays the file
-         * in place inside the track block above.) If the current track isn't
-         * in the list (s_index < 0) or the list is empty, just stop. */
+        /* Natural end of track: in list-loop mode advance to the next entry,
+         * wrapping at the end; in random mode play a random entry (never the
+         * one that just ended when the list holds more than one track, and
+         * no dependence on s_index). (Single-track loop never gets here: it
+         * replays the file in place inside the track block above.) If the
+         * list is empty, just stop. */
         int cnt = s_playlist->count;
-        if (cnt <= 0 || s_index < 0) {
+        if (cnt <= 0) {
             break;
         }
-        int next = (s_index + 1) % cnt;
+        int next;
+        if (s_repeat == PLAYER_REPEAT_RANDOM) {
+            if (cnt > 1) {
+                do {
+                    next = (int)(esp_random() % (uint32_t)cnt);
+                } while (next == s_index);
+            }
+            else {
+                next = 0;
+            }
+        }
+        else {
+            if (s_index < 0) {
+                break;
+            }
+            next = (s_index + 1) % cnt;
+        }
         player_play(s_playlist->items[next].path);
         /* Self-call: only s_new_req is set; the loop top picks up the new
          * track. Re-run rather than break so the next song starts. */
@@ -1307,12 +1326,19 @@ player_repeat_t player_repeat_mode(void)
     return s_repeat;
 }
 
+static const char *repeat_mode_text(void)
+{
+    switch (s_repeat) {
+    case PLAYER_REPEAT_ONE:    return "单曲循环";
+    case PLAYER_REPEAT_RANDOM: return "随机播放";
+    default:                   return "列表循环";
+    }
+}
+
 void player_repeat_toggle(void)
 {
-    s_repeat = (s_repeat == PLAYER_REPEAT_ALL) ? PLAYER_REPEAT_ONE
-                                               : PLAYER_REPEAT_ALL;
-    ESP_LOGI(TAG, "repeat mode -> %s",
-             s_repeat == PLAYER_REPEAT_ONE ? "单曲循环" : "列表循环");
+    s_repeat = (player_repeat_t)(((int)s_repeat + 1) % (PLAYER_REPEAT_RANDOM + 1));
+    ESP_LOGI(TAG, "repeat mode -> %s", repeat_mode_text());
 }
 
 const char *player_current_name(void)
@@ -1408,6 +1434,29 @@ static int player_step(int dir)
 
 int player_next(void)
 {
+    /* In random mode a manual next picks a random entry (never the current
+     * one when the list holds more than one); prev stays sequential so the
+     * user can always step back through the list order. */
+    if (s_repeat == PLAYER_REPEAT_RANDOM) {
+        const int cnt = player_scan_count();
+        if (cnt <= 0) {
+            return -1;
+        }
+        const int cur = player_current_index();
+        int i;
+        if (cnt > 1) {
+            do {
+                i = (int)(esp_random() % (uint32_t)cnt);
+            } while (i == cur);
+        }
+        else {
+            i = 0;
+        }
+        if (s_state != PLAYER_IDLE) {
+            player_play_index(i);
+        }
+        return i;
+    }
     const int i = player_step(1);
     if (i >= 0 && s_state != PLAYER_IDLE) {
         player_play_index(i);

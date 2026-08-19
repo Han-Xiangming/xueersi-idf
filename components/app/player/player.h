@@ -207,16 +207,20 @@ void player_stop(void);
 /* --- Repeat mode -------------------------------------------------------
  * How the player behaves when a track reaches its natural end. Default is
  * list loop (advance to the next entry, wrapping at the end); single-track
- * loop replays the current track. Toggled at runtime by the UI (Select key
- * on the player page, 循环 control on the floating playback panel). Not
- * persisted to NVS: each boot starts in list-loop mode. */
+ * loop replays the current track; random plays a random entry (never the
+ * one that just ended, unless the list has a single track). In random mode
+ * a manual next also picks randomly; prev stays sequential so the user can
+ * always step back. Changed at runtime by the UI (Select key on the player
+ * page, 循环 control on the floating playback panel). Not persisted to NVS:
+ * each boot starts in list-loop mode. */
 typedef enum {
     PLAYER_REPEAT_ALL = 0,   /* list loop: next track at end (default) */
     PLAYER_REPEAT_ONE,       /* single-track loop: replay the current track */
+    PLAYER_REPEAT_RANDOM,    /* random: play a random track at end / on next */
 } player_repeat_t;
 
 /* Current repeat mode. */
 player_repeat_t player_repeat_mode(void);
 
-/* Toggle between list loop and single-track loop. */
+/* Cycle the repeat mode: list loop -> single-track -> random -> list loop. */
 void player_repeat_toggle(void);

@@ -1581,6 +1581,17 @@ static int ui_label_width_px(const char *s)
     return n * 16;
 }
 
+/* Short name of the current repeat mode for the status texts and the
+ * floating-panel 循环 button: "单曲" / "列表" / "随机". */
+static const char *ui_repeat_text(void)
+{
+    switch (player_repeat_mode()) {
+    case PLAYER_REPEAT_ONE:    return "单曲";
+    case PLAYER_REPEAT_RANDOM: return "随机";
+    default:                   return "列表";
+    }
+}
+
 static bool s_panel_open;
 static int  s_panel_sel;   /* 0..4, index into the five controls */
 
@@ -1589,8 +1600,8 @@ static const char *const s_panel_labels[PLAYER_PANEL_NBTN] = {
 };
 /* The play/pause button label is state-dependent (player-page convention:
  * "暂停" while playing, "继续" while paused); the repeat button shows the
- * current mode ("单曲" while REPEAT_ONE, else "列表") so pressing it reads
- * as "switch to the other mode". */
+ * current mode ("单曲"/"列表"/"随机") so pressing it reads as "cycle to the
+ * next mode". */
 static const char *ui_panel_btn_text(int i)
 {
     if (i == 1) {
@@ -1601,7 +1612,7 @@ static const char *ui_panel_btn_text(int i)
         }
     }
     if (i == 4) {
-        return player_repeat_mode() == PLAYER_REPEAT_ONE ? "单曲" : "列表";
+        return ui_repeat_text();
     }
     return s_panel_labels[i];
 }
@@ -1610,7 +1621,7 @@ static const char *ui_panel_btn_text(int i)
  * the ACTIVE SCREEN, so it draws above every page/menu). Hidden by default;
  * MENU toggles it, B or MENU closes it. Layout (screen 320x240):
  *   panel (12,64,296,136), 1px border, near-black fill
- *   row 1: track name (left) + ">>列表"/"||单曲" (right)
+ *   row 1: track name (left) + ">>列表"/"||单曲"/"--随机" (right)
  *   row 2: five controls, laid out from the exact label widths with a
  *          uniform 12 px gap, centered in the panel
  *   row 3: hint "左/右选 A确认 B关闭" */
@@ -1715,7 +1726,7 @@ static void ui_refresh_player_panel(void)
     static char s_panel_state_buf[16];
     snprintf(s_panel_state_buf, sizeof(s_panel_state_buf), "%s%s",
              st == PLAYER_PLAYING ? ">>" : st == PLAYER_PAUSED ? "||" : "--",
-             player_repeat_mode() == PLAYER_REPEAT_ONE ? "单曲" : "列表");
+             ui_repeat_text());
     ui_label_set(s_ui.pl_panel_state, s_panel_state_buf);
 
     for (int i = 0; i < PLAYER_PANEL_NBTN; i++) {
@@ -1756,11 +1767,14 @@ static void ui_panel_activate(void)
             set_action("未播放");
         }
         break;
-    case 4:   /* 循环: 切换播放模式 (列表循环 ⇄ 单曲循环). The button label
-               * shows the CURRENT mode; pressing toggles to the other. */
+    case 4:   /* 循环: 切换播放模式 (列表循环 -> 单曲循环 -> 随机 -> 列表...).
+               * The button label shows the CURRENT mode; pressing cycles to
+               * the next one. */
         player_repeat_toggle();
         set_action(player_repeat_mode() == PLAYER_REPEAT_ONE
-                       ? "已切换单曲循环" : "已切换列表循环");
+                       ? "已切换单曲循环"
+                       : player_repeat_mode() == PLAYER_REPEAT_RANDOM
+                             ? "已切换随机播放" : "已切换列表循环");
         break;
     default:  /* 停止 */
         if (player_state() != PLAYER_IDLE) {
@@ -1983,11 +1997,11 @@ void ui_refresh(void)
         }
         player_state_t st = player_state();
         /* Top-right status: playback symbol + repeat mode, e.g. ">>单曲" /
-         * "||列表" / "--列表", so the current loop mode is always visible. */
+         * "||列表" / "--随机", so the current loop mode is always visible. */
         char stbuf[16];
         snprintf(stbuf, sizeof(stbuf), "%s%s",
                  st == PLAYER_PLAYING ? ">>" : st == PLAYER_PAUSED ? "||" : "--",
-                 player_repeat_mode() == PLAYER_REPEAT_ONE ? "单曲" : "列表");
+                 ui_repeat_text());
         ui_label_set(s_ui.status, stbuf);
         if (st == PLAYER_IDLE) {
             if (player_scan_busy()) {
@@ -1996,7 +2010,9 @@ void ui_refresh(void)
             else {
                 ui_label_set(s_ui.pl_prog, s_mp3_count
                              ? (player_repeat_mode() == PLAYER_REPEAT_ONE
-                                ? "循环:单曲" : "循环:列表")
+                                ? "循环:单曲"
+                                : player_repeat_mode() == PLAYER_REPEAT_RANDOM
+                                      ? "循环:随机" : "循环:列表")
                              : "无MP3文件");
             }
         }
