@@ -21,7 +21,7 @@ app/ui/ui.c（页面控制器，不依赖具体硬件）
 | 页面 | 枚举 | 用途 | 构建函数 |
 | ---- | ---- | ---- | ---- |
 | 播放器 | `UI_PAGE_PLAYER` | MP3 列表（4 行）+ 播放状态 | `ui_build_player` |
-| 书列表 | `UI_PAGE_EBOOK_LIST` | 先选来源（`<ALL>`+子目录），再递归扫描 `/sdcard/eBook/**/*.txt`（含内置 ROM 书） | `ui_build_ebook_list` |
+| 书列表 | `UI_PAGE_EBOOK_LIST` | 先选来源（`<ALL>`+子目录），再递归扫描 `/sdcard/eBook/**/*.txt` | `ui_build_ebook_list` |
 | 阅读 | `UI_PAGE_EBOOK_READ` | TXT 电子书分页阅读 | `ui_build_ebook_read` |
 | 蓝牙 | `UI_PAGE_BT` | A2DP 设备扫描/配对/连接 | `ui_build_bt` |
 | 设置 | `UI_PAGE_SETTINGS` | 音量/背光/蓝牙/息屏/重置 | `ui_build_settings` |

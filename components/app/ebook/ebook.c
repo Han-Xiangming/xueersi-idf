@@ -23,7 +23,7 @@ static const char *TAG = "ebook";
 /* --- Tuning constants (docs/ebook.md) --- */
 #define EBOOK_NAME_MAX      64           /* book name buffer size */
 #define EBOOK_PATH_MAX      320          /* book path buffer size (matches player) */
-#define EBOOK_LIST_MAX      128          /* max books in the scan list */
+#define EBOOK_LIST_MAX      512          /* max books in the scan list */
 #define EBOOK_CHUNK         (4 * 1024)   /* stream window of the reader */
 #define EBOOK_PAGE_BUF      1024         /* rendered page text buffer */
 #define EBOOK_PAGE_LINES    8            /* lines per page. Body label starts at
@@ -38,7 +38,6 @@ static const char *TAG = "ebook";
 #define EBOOK_LINE_W16      (EBOOK_LINE_W * 16)  /* width in 1/16 px */
 #define EBOOK_CHAR_W16      256          /* fullwidth advance, 1/16 px = 16 px */
 #define EBOOK_HIST_N        32           /* page-start offset history ring */
-#define EBOOK_ROM_PREFIX    "(ROM)"
 
 /* Reading-progress persistence on the SD card (single file next to the
  * books, so it moves with the card and survives firmware updates). A
@@ -47,7 +46,7 @@ static const char *TAG = "ebook";
 #define EBOOK_PROG_FILE     EBOOK_ROOT "/.progress"
 #define EBOOK_PROG_TMP      EBOOK_ROOT "/.progress.tmp"
 #define EBOOK_PROG_MAGIC    0x47504245   /* "EBPG" */
-#define EBOOK_PROG_MAX      128          /* remembered books (MRU, oldest dropped) */
+#define EBOOK_PROG_MAX      512          /* remembered books (MRU, oldest dropped) */
 #define EBOOK_SAVE_DELAY_MS 3000
 #define EBOOK_SAVE_POLL_MS  500
 
@@ -60,11 +59,6 @@ typedef struct {
     uint32_t page;
     uint32_t size;
 } eb_progress_t;
-
-/* Built-in test book compiled into the firmware via EMBED_FILES
- * (IDF names the symbols from the file basename only). */
-extern const uint8_t _binary_Test_txt_start[];
-extern const uint8_t _binary_Test_txt_end[];
 
 /* ASCII advance widths (1/16 px), copied verbatim from the lv_font_cn_16
  * glyph_dsc table so the reader's line breaks match LVGL rendering. Indexed
@@ -148,12 +142,9 @@ static uint8_t compress_punct(uint32_t cp)
 }
 
 /* Windowed byte reader: serves bytes by absolute file offset through a
- * 4KB chunk window. SD files and the embedded ROM book share this. */
+ * 4KB chunk window. */
 typedef struct {
-    bool embedded;
     FILE *fp;
-    const uint8_t *rom;
-    size_t rom_size;
     uint8_t *buf;                        /* chunk window */
     size_t buf_cap;
     size_t base;                         /* file offset of buf[0] */
@@ -162,9 +153,6 @@ typedef struct {
 
 /* Description of the currently open book (shared with the count task). */
 typedef struct {
-    bool embedded;
-    const uint8_t *rom_start;
-    size_t rom_size;
     char path[EBOOK_PATH_MAX];
     size_t size;
 } book_src_t;
@@ -224,7 +212,7 @@ static uint32_t s_save_after;            /* tick deadline for the debounce */
 static uint32_t s_resume_pct;            /* restored position %, 0 = page 1 */
 static TaskHandle_t s_save_task;
 
-static eb_progress_t s_prog[EBOOK_PROG_MAX];
+static eb_progress_t s_prog[EBOOK_PROG_MAX] EXT_RAM_BSS_ATTR;
 static int s_prog_count;                 /* entries currently in s_prog[] */
 static bool s_prog_loaded;               /* false until a load attempt ran */
 
@@ -232,9 +220,6 @@ static bool s_prog_loaded;               /* false until a load attempt ran */
 
 static int reader_byte(reader_t *r, size_t off)
 {
-    if (r->embedded) {
-        return off < r->rom_size ? r->rom[off] : -1;
-    }
     if (off < r->base || off >= r->base + r->len) {
         if (fseeko(r->fp, (off_t)off, SEEK_SET) != 0) {
             return -1;
@@ -634,7 +619,7 @@ static void ebook_scan_task(void *arg)
             active = s_scan_active;
             portEXIT_CRITICAL(&s_mux);
             int work = 1 - active;           /* fill the inactive buffer */
-            int n = scan_dir(s_scan_buf[work], EBOOK_LIST_MAX - 1,
+            int n = scan_dir(s_scan_buf[work], EBOOK_LIST_MAX,
                              s_load_root, 0);
             /* readdir/stat order is arbitrary across directories; sort so the
              * list is stable across rescans: file-name length first (shortest
@@ -642,13 +627,6 @@ static void ebook_scan_task(void *arg)
              * folder scan for stability of same-folder groups). */
             if (n > 1) {
                 qsort(s_scan_buf[work], (size_t)n, EBOOK_PATH_MAX, name_cmp);
-            }
-            if (strcmp(s_load_root, EBOOK_ROOT) == 0 &&
-                n < EBOOK_LIST_MAX - 1) {    /* ROM test book: whole-card only */
-                strncpy(s_scan_buf[work][n], EBOOK_ROM_PREFIX " Test.txt",
-                        EBOOK_NAME_MAX - 1);
-                s_scan_buf[work][n][EBOOK_NAME_MAX - 1] = '\0';
-                n++;
             }
             /* Source display name: "整卡" for the whole tree, else the folder
              * basename (mirrors player_load_folder). */
@@ -689,28 +667,23 @@ static void ebook_count_task(void *arg)
         gen = s_open_gen;
         portEXIT_CRITICAL(&s_mux);
 
-        if (src.size == 0 || (!src.embedded && src.path[0] == '\0')) {
+        if (src.size == 0 || src.path[0] == '\0') {
             continue;
         }
 
         reader_t r;
         memset(&r, 0, sizeof(r));
-        r.embedded = src.embedded;
-        r.rom = src.rom_start;
-        r.rom_size = src.rom_size;
         r.buf = s_chunk_b;
         r.buf_cap = EBOOK_CHUNK;
-        if (!src.embedded) {
-            r.fp = fopen(src.path, "rb");
-            if (r.fp == NULL) {
-                portENTER_CRITICAL(&s_mux);
-                if (gen == s_open_gen) {
-                    s_page_count = 0;
-                    s_count_ver++;
-                }
-                portEXIT_CRITICAL(&s_mux);
-                continue;
+        r.fp = fopen(src.path, "rb");
+        if (r.fp == NULL) {
+            portENTER_CRITICAL(&s_mux);
+            if (gen == s_open_gen) {
+                s_page_count = 0;
+                s_count_ver++;
             }
+            portEXIT_CRITICAL(&s_mux);
+            continue;
         }
 
         uint32_t pages = 0;
@@ -719,9 +692,7 @@ static void ebook_count_task(void *arg)
             off = layout_page(&r, off, NULL, 0);
             pages++;
         }
-        if (r.fp != NULL) {
-            fclose(r.fp);
-        }
+        fclose(r.fp);
         ESP_LOGI(TAG, "count done: %u page(s)", (unsigned)pages);
 
         portENTER_CRITICAL(&s_mux);
@@ -795,7 +766,7 @@ static void progress_write(const char *path, uint32_t off, uint32_t page,
                            uint32_t size)
 {
     if (path[0] == '\0') {
-        return;                          /* embedded ROM book: nothing to save */
+        return;                          /* no path: nothing to save */
     }
     if (!s_prog_loaded) {
         progress_load();
@@ -956,8 +927,7 @@ const char *ebook_scan_name(int idx)
     const char *name = "";
     portENTER_CRITICAL(&s_mux);
     if (idx >= 0 && idx < s_scan_count) {
-        /* Entries are full paths; the UI shows the file name only. The ROM
-         * test book has no '/', so the whole string is its name. */
+        /* Entries are full paths; the UI shows the file name only. */
         const char *p = s_scan_buf[s_scan_active][idx];
         const char *b = strrchr(p, '/');
         name = (b != NULL) ? b + 1 : p;
@@ -1027,31 +997,17 @@ bool ebook_open(int idx)
     book_src_t src;
     memset(&src, 0, sizeof(src));
 
-    const bool embedded =
-        (strncmp(path, EBOOK_ROM_PREFIX, strlen(EBOOK_ROM_PREFIX)) == 0);
-    if (embedded) {
-        src.embedded = true;
-        src.rom_start = _binary_Test_txt_start;
-        src.rom_size = (size_t)(_binary_Test_txt_end -
-                                _binary_Test_txt_start);
-        src.size = src.rom_size;
+    snprintf(src.path, sizeof(src.path), "%s", path);
+    FILE *fp = fopen(src.path, "rb");
+    if (fp == NULL) {
+        ESP_LOGE(TAG, "open '%s' failed", src.path);
+        ebook_close();
+        return false;
     }
-    else {
-        snprintf(src.path, sizeof(src.path), "%s", path);
-        FILE *fp = fopen(src.path, "rb");
-        if (fp == NULL) {
-            ESP_LOGE(TAG, "open '%s' failed", src.path);
-            ebook_close();
-            return false;
-        }
-        fseeko(fp, 0, SEEK_END);
-        src.size = (size_t)ftello(fp);
-        fseeko(fp, 0, SEEK_SET);
-        s_reader.fp = fp;                /* reader is UI-task-private */
-    }
-    s_reader.embedded = embedded;
-    s_reader.rom = src.rom_start;
-    s_reader.rom_size = src.rom_size;
+    fseeko(fp, 0, SEEK_END);
+    src.size = (size_t)ftello(fp);
+    fseeko(fp, 0, SEEK_SET);
+    s_reader.fp = fp;                /* reader is UI-task-private */
     s_reader.base = 0;
     s_reader.len = 0;
 
@@ -1070,7 +1026,7 @@ bool ebook_open(int idx)
     size_t start = 0;
     int page = 1;
     s_resume_pct = 0;
-    if (!embedded && src.size > 0) {
+    if (src.size > 0) {
         progress_load();
         eb_progress_t p;
         if (progress_find(src.path, &p) && p.size == src.size &&
@@ -1087,9 +1043,8 @@ bool ebook_open(int idx)
     if (s_count_task != NULL) {
         xTaskNotifyGive(s_count_task);
     }
-    ESP_LOGI(TAG, "open '%s' embedded=%d size=%u resume=%u%%", path,
-             embedded ? 1 : 0, (unsigned)src.size,
-             (unsigned)s_resume_pct);
+    ESP_LOGI(TAG, "open '%s' size=%u resume=%u%%", path,
+             (unsigned)src.size, (unsigned)s_resume_pct);
     return true;
 }
 

@@ -2,8 +2,7 @@
  * Application layer: TXT ebook reader.
  *
  * Streams UTF-8 plain-text books from the SD card (the /sdcard/eBook tree,
- * scanned recursively, plus a built-in ROM test book) and lays them out into
- * fixed 8-line pages with the 16px CJK font. Pagination is
+ * scanned recursively) and lays them out into fixed 8-line pages with the 16px CJK font. Pagination is
  * deterministic (independent of LVGL), so forward/backward flips and the
  * background page-count task always agree. Reading position is remembered
  * per book in NVS (page offset + page number) and restored on open. See
