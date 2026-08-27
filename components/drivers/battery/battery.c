@@ -60,15 +60,6 @@ static uint8_t  s_percent = BAT_INVALID_PERCENT;   /* raw mapped value */
 static uint8_t  s_percent_disp = BAT_INVALID_PERCENT; /* hysteresis-filtered for display */
 static bool     s_inited  = false;
 
-/* Low-battery warning state (#9). The callback fires once when the level
- * crosses DOWN through s_low_thresh, and re-arms only after the level recovers
- * above it by BAT_LOW_REARM_MARGIN % — so a cell hovering at the threshold does
- * not spam the application. */
-static uint8_t            s_low_thresh = 0;     /* 0 = disabled */
-static bt_battery_low_cb_t s_low_cb = NULL;
-static bool               s_low_armed = true;   /* armed = may fire next crossing */
-#define BAT_LOW_REARM_MARGIN   3               /* % hysteresis to re-arm */
-
 /* Map a pack voltage to 0..100 % via a piecewise open-circuit (rested) Li-ion
  * table. A single-cell Li-ion curve is strongly non-linear: it sits on a long
  * ~3.7 V plateau, so a linear 3.30→4.20 V map would report ~50 % near 3.75 V
@@ -192,24 +183,6 @@ void hw_battery_sample(void)
         }
     }
 
-    /* Low-battery crossing detection (#9): fire once on the down-crossing
-     * (recovered=false) and again when the level climbs back above the
-     * threshold + hysteresis margin (recovered=true, so the handler can restore
-     * any user setting it changed). Runs after the display value is settled so
-     * ADC noise around the threshold does not chatter the callback. */
-    if (s_low_thresh > 0 && s_low_cb != NULL) {
-        if (s_percent >= s_low_thresh + BAT_LOW_REARM_MARGIN) {
-            if (!s_low_armed) {
-                s_low_armed = true;             /* recovered above threshold */
-                s_low_cb(s_percent, true);
-            }
-        }
-        else if (s_low_armed && s_percent <= s_low_thresh) {
-            s_low_armed = false;                /* latched until recovery */
-            s_low_cb(s_percent, false);
-        }
-    }
-
     ESP_LOGD(TAG, "raw=%d v_pin=%d mV vbat=%.2f V pct=%u%%",
              raw, v_pin_mv, s_voltage, s_percent);
 }
@@ -307,11 +280,4 @@ uint8_t hw_battery_percent(void)
     return s_percent_disp;
 }
 
-void hw_battery_set_low_warn(uint8_t threshold_pct, bt_battery_low_cb_t cb)
-{
-    s_low_thresh = (threshold_pct > 100) ? 100 : threshold_pct;
-    s_low_cb = cb;
-    /* Re-arm from the current level: only a fresh down-crossing will fire. */
-    s_low_armed = (s_percent_disp == BAT_INVALID_PERCENT)
-                  || (s_percent_disp >= s_low_thresh + BAT_LOW_REARM_MARGIN);
-}
+

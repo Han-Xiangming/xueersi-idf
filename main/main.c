@@ -131,29 +131,7 @@ static void xiaomiao_avrc_volume(uint8_t volume_0_127)
     hw_audio_set_avrc_volume(volume_0_127);
 }
 
-/* Low-battery guard (#9, improved): on the down-crossing, pause playback and
- * dim the backlight to at most 20 % (remembering the user's setting so it can
- * be restored on recovery). On the up-crossing, restore the saved backlight and
- * do NOT touch playback. Runs from the battery sample timer task; keep it short. */
-static uint8_t s_bl_saved = 0;   /* user backlight captured at low-battery entry */
 
-static void xiaomiao_battery_low(uint8_t pct, bool recovered)
-{
-    if (recovered) {
-        if (s_bl_saved != 0) {
-            hw_lcd_set_backlight(s_bl_saved);   /* restore user brightness */
-            s_bl_saved = 0;
-        }
-        ESP_LOGI(TAG, "battery recovered %u%%, backlight restored", pct);
-        return;
-    }
-    ESP_LOGW(TAG, "low battery %u%%, pausing playback / dimming backlight", pct);
-    player_stop();
-    s_bl_saved = hw_lcd_get_backlight();        /* capture before dimming */
-    if (s_bl_saved > 20) {
-        hw_lcd_set_backlight(20);               /* only dim if brighter than 20 */
-    }
-}
 
 static void lvgl_task(void *arg)
 {
@@ -219,7 +197,6 @@ void app_main(void)
     hw_lcd_init();
     hw_audio_init();
     hw_battery_init();
-    hw_battery_set_low_warn(15, xiaomiao_battery_low);   /* #9 low-battery guard */
     bt_audio_init();
     bt_audio_set_avrc_cmd_cb(xiaomiao_avrc_cmd);
     bt_audio_set_avrc_volume_cb(xiaomiao_avrc_volume);

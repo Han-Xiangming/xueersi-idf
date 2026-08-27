@@ -72,7 +72,7 @@ dev clean      :: 清理
 - 显示：ST7789（旋转 90° 后逻辑分辨率 320×240，实际面板为 240×320 原生），SPI2 最高 60 MHz；采用部分刷新 + 双 DMA 缓冲（每屏只重绘脏区）。由于屏幕 TE 引脚未接 MCU，无法做垂直同步，但双缓冲部分刷新已规避明显撕裂。
 - 背光由 GPIO14 的 LEDC PWM 驱动（5 kHz，10 位分辨率），可在设置页调节亮度（0..100%）。
 - 自动息屏：设置页可选空闲超时（永不 / 15 秒 / 30 秒 / 60 秒 / 2 分钟 / 5 分钟，默认 30 秒）；超时后关闭背光并让 ST7789 进入 DISPOFF 省电，任意按键即时唤醒恢复亮度。
-- 已接入功能：按键（6 键）、MicroSD（SDSPI）、I2S 音频（MAX98357 Class-D DAC）、MP3 播放（libhelix-mp3 解码 + ReplayGain 2.0 响度归一 + 曲库缓存）、蓝牙 A2DP 音频输出（SOURCE 角色）、TXT 电子书阅读、单节锂电电量检测与低电量保护。
+- 已接入功能：按键（6 键）、MicroSD（SDSPI）、I2S 音频（MAX98357 Class-D DAC）、MP3 播放（libhelix-mp3 解码 + ReplayGain 2.0 响度归一 + 曲库缓存）、蓝牙 A2DP 音频输出（SOURCE 角色）、TXT 电子书阅读、单节锂电电量检测。
 - 蓝牙在用户打开蓝牙页时才懒加载启动（开机不广播），关掉蓝牙开关时彻底断电。蓝牙输出为显式路由切换，不会因蓝牙连接上来而静默抢占本地扬声器。
 
 ---
@@ -226,10 +226,9 @@ MAX98357 由 BCLK 内部派生主时钟，因此 **不需要 MCLK**。
 重置NVS —— 清除已保存配置
 ```
 
-### 5.5 电池与低电量保护
+### 5.5 电池
 
 - 电压经 ADC 采样 + 开路电压查表换算为百分比。
-- 低电量保护（`hw_battery_set_low_warn`，阈值 15%）：下穿阈值时暂停播放并把背光调暗至不高于 20%（记住用户设定）；回升超过阈值 + 3% 迟滞后恢复用户背光，不干预播放。
 
 ### 5.6 稳定性与故障兜底
 
@@ -249,7 +248,7 @@ MAX98357 由 BCLK 内部派生主时钟，因此 **不需要 MCLK**。
 | `components/drivers/lcd/`         | ST7789 驱动 + LVGL 显示绑定 + 背光 PWM          |
 | `components/drivers/audio/`       | I2S → MAX98357，路由/音量/采样率/ PCM 写入         |
 | `components/drivers/bt_audio/`    | 蓝牙 A2DP SOURCE + AVRCP + 扫描/配对/连接管理      |
-| `components/drivers/battery/`     | 电池电压采样 + 开路电压查表 + 低电量回调              |
+| `components/drivers/battery/`     | 电池电压采样 + 开路电压查表              |
 | `components/drivers/sd/`          | SDSPI 挂载状态与访问                          |
 | `components/app/ui/`              | LVGL 分页 UI（播放器/电子书/设置/蓝牙）            |
 | `components/app/player/`          | MP3 解码任务 + 后台曲库扫描                      |
