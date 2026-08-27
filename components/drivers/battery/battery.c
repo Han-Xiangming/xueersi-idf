@@ -23,6 +23,8 @@
 #include "freertos/task.h"
 #include "freertos/timers.h"
 
+#include "audio.h"   /* hw_audio_is_playing / hw_audio_get_volume */
+
 static const char *TAG = "hw_battery";
 
 /* ADC setup. */
@@ -59,6 +61,15 @@ static float    s_voltage = 0.0f;
 static uint8_t  s_percent = BAT_INVALID_PERCENT;   /* raw mapped value */
 static uint8_t  s_percent_disp = BAT_INVALID_PERCENT; /* hysteresis-filtered for display */
 static bool     s_inited  = false;
+
+/* I2S load handling. */
+/* Per-100%-volume load-compensation slope, in mV added to the pack voltage.
+ * The applied offset = comp_mv_per_100pct * volume_pct / 100. Default ~50 mV
+ * at full volume; tune to your cell's sag under the MAX98357 load. */
+static uint16_t s_load_comp_mv = 50;
+/* Hold the last rested reading while audio is actively playing, so the gauge
+ * does not creep down under load. Forced samples still refresh. */
+static bool     s_freeze_while_playing = true;
 
 /* Map a pack voltage to 0..100 % via a piecewise open-circuit (rested) Li-ion
  * table. A single-cell Li-ion curve is strongly non-linear: it sits on a long
@@ -124,9 +135,20 @@ static int window_average(void)
     return sum / s_window_filled;
 }
 
-void hw_battery_sample(void)
+/* Internal sampler. `forced` bypasses the freeze-while-playing guard so a
+ * settings-page refresh still updates the gauge mid-playback. */
+static void battery_sample_int(bool forced)
 {
     if (!s_inited) {
+        return;
+    }
+
+    /* Freeze guard (方案2): while audio is actively clocking to the DAC, hold
+     * the last displayed reading instead of letting the load sag drag it down.
+     * The ADC is still read below (keeps the window fresh), but we skip the
+     * conversion/display update unless this is a forced sample. */
+    const bool playing = hw_audio_is_playing();
+    if (!forced && s_freeze_while_playing && playing) {
         return;
     }
 
@@ -163,7 +185,18 @@ void hw_battery_sample(void)
     }
 
     const float v_pin_v = ((float)window_average()) / 1000.0f;
-    s_voltage = v_pin_v * BAT_DIV_FACTOR;
+    float vbat = v_pin_v * BAT_DIV_FACTOR;
+
+    /* Load compensation (方案1): the pack sags under speaker load, so add an
+     * offset that scales with the current volume. Only meaningful while
+     * playing; when idle the rested voltage is already correct. */
+    if (playing) {
+        const float comp_mv = (float)s_load_comp_mv *
+                              (float)hw_audio_get_volume() / 100.0f;
+        vbat += comp_mv / 1000.0f;
+    }
+
+    s_voltage = vbat;
     s_percent = voltage_to_percent(s_voltage);
 
     /* Apply display hysteresis: only move the shown value when the raw
@@ -183,8 +216,33 @@ void hw_battery_sample(void)
         }
     }
 
-    ESP_LOGD(TAG, "raw=%d v_pin=%d mV vbat=%.2f V pct=%u%%",
-             raw, v_pin_mv, s_voltage, s_percent);
+    ESP_LOGD(TAG, "raw=%d v_pin=%d mV vbat=%.2f V pct=%u%% (%s)",
+             raw, v_pin_mv, s_voltage, s_percent, playing ? "playing" : "idle");
+}
+
+void hw_battery_sample(void)
+{
+    battery_sample_int(false);
+}
+
+void hw_battery_set_load_comp_mv(uint16_t comp_mv_per_100pct)
+{
+    s_load_comp_mv = comp_mv_per_100pct;
+}
+
+uint16_t hw_battery_get_load_comp_mv(void)
+{
+    return s_load_comp_mv;
+}
+
+void hw_battery_set_freeze_while_playing(bool enable)
+{
+    s_freeze_while_playing = enable;
+}
+
+bool hw_battery_get_freeze_while_playing(void)
+{
+    return s_freeze_while_playing;
 }
 
 static void battery_timer_cb(TimerHandle_t timer)

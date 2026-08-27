@@ -1342,6 +1342,9 @@ static void ui_enter_page(ui_page_t page)
      * next refresh (the cached value may be stale from a previous visit). */
     if (page == UI_PAGE_SETTINGS) {
         s_cache_queried_ver = 0;
+        /* Force a battery refresh (bypasses the freeze-while-playing guard)
+         * so the gauge shows a live reading even if audio is playing. */
+        hw_battery_sample();
     }
     /* Entering the Music Player: prefer the on-card playlist cache so the list
      * shows instantly. Only falls back to a real scan (which rewrites the

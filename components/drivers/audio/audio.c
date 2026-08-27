@@ -605,6 +605,11 @@ uint8_t hw_audio_get_volume(void)
     return s_volume;
 }
 
+bool hw_audio_is_playing(void)
+{
+    return s_player_active && s_i2s_enabled;
+}
+
 void hw_audio_set_speaker_volume(uint8_t volume_pct)
 {
     if (volume_pct > 100) {

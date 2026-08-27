@@ -114,6 +114,12 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames);
  * NOT start playback before this returns true. */
 bool hw_audio_is_ready(void);
 
+/* True while the MP3 player owns the I2S bus AND the channel is actually
+ * clocking data to the DAC (i.e. sound is being emitted). Safe for other
+ * drivers (e.g. the battery gauge) to probe load state without touching
+ * audio internals. */
+bool hw_audio_is_playing(void);
+
 /* Troubleshooting: tear down and re-create the I2S channel from scratch
  * (DMA descriptors, std-mode init, pins), recompute the DSP coefficients
  * for the current sample rate and reset the filter history, leaving the
