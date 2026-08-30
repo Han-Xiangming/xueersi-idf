@@ -388,6 +388,24 @@ static void audio_dsp_reset(void)
     s_lim_gain = 32768;
 }
 
+/* Fill every DMA descriptor with silence while the channel is READY (parked)
+ * or RUNNING. The descriptors' buffers are DRAM, so this works regardless of
+ * channel state; the next enable clocks out silence instead of a previous
+ * track's tail. Each descriptor holds 1024 frames x 4 bytes = 4096 bytes, so
+ * one chunk per descriptor silences the whole ring. Caller holds s_io_lock
+ * and s_tx != NULL. */
+static void audio_silence_dma_ring(void)
+{
+    static const uint8_t s_zero_dma[4096] = {0};
+    for (int i = 0; i < I2S_DMA_DESC_NUM; i++) {
+        size_t loaded = 0;
+        i2s_channel_preload_data(s_tx, s_zero_dma, sizeof(s_zero_dma), &loaded);
+        if (loaded < sizeof(s_zero_dma)) {
+            break;   /* ring full of silence */
+        }
+    }
+}
+
 /* Mark/unmark the MP3 player as the owner of the I2S bus. On release the
  * channel is parked immediately (BCLK stops, the MAX98357 powers down); on
  * claim only the flags/DSP are set up — the channel is actually enabled by
@@ -419,6 +437,16 @@ void hw_audio_set_player_active(bool active)
                 }
                 s_i2s_enabled = false;
                 s_last_write_us = 0;
+            }
+            /* Clear the DMA ring's residual audio now. The descriptor buffers
+             * still hold the PREVIOUS track's tail after a park, and the next
+             * hw_audio_write_pcm re-enables the channel from this ring — so
+             * without this the old tail clocks out first as "余音" on the next
+             * track. Silencing leaves a clean, silent ring ready for re-enable.
+             * Harmless on pause too (the channel is parked, so silence is what
+             * the gap plays anyway). */
+            if (s_tx != NULL) {
+                audio_silence_dma_ring();
             }
             xSemaphoreGive(s_io_lock);
         }
@@ -738,15 +766,7 @@ void hw_audio_set_sample_rate(uint32_t sample_rate_hz)
      * the new clock (this is the audible chirp at every track change). Each
      * descriptor holds 1024 frames x 4 bytes = 4096 bytes, so one chunk per
      * descriptor silences the whole ring. */
-    static const uint8_t s_zero_dma[4096] = {0};
-    for (int i = 0; i < I2S_DMA_DESC_NUM; i++) {
-        size_t loaded = 0;
-        i2s_channel_preload_data(s_tx, s_zero_dma, sizeof(s_zero_dma),
-                                 &loaded);
-        if (loaded < sizeof(s_zero_dma)) {
-            break;   /* ring is full of silence */
-        }
-    }
+    audio_silence_dma_ring();
     i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate_hz);
     esp_err_t e = i2s_channel_reconfig_std_clock(s_tx, &clk);
     xSemaphoreGive(s_io_lock);
@@ -802,15 +822,7 @@ void hw_audio_pipeline_flush(void)
             /* Fill every descriptor with silence so the re-enabled channel
              * clocks silence (not the previous pass's tail) until the next
              * write. */
-            static const uint8_t s_zero_dma[4096] = {0};
-            for (int i = 0; i < I2S_DMA_DESC_NUM; i++) {
-                size_t loaded = 0;
-                i2s_channel_preload_data(s_tx, s_zero_dma, sizeof(s_zero_dma),
-                                         &loaded);
-                if (loaded < sizeof(s_zero_dma)) {
-                    break;   /* ring full of silence */
-                }
-            }
+            audio_silence_dma_ring();
             if (was_enabled) {
                 esp_err_t e = i2s_channel_enable(s_tx);
                 if (e != ESP_OK) {
