@@ -764,16 +764,67 @@ void hw_audio_set_sample_rate(uint32_t sample_rate_hz)
     ESP_LOGI(TAG, "I2S rate -> %u Hz", (unsigned)s_rate);
 }
 
-/* Drop the previous pass's queued audio so a repeat-one replay starts clean:
- * the speaker DMA's auto_clear clocks silence once its last frame is out, so
- * only the BT PCM ring (up to ~740 ms of stale tail) needs a real flush; the
- * underrun bookkeeping is reset so the deliberate seam pause is not flagged
- * as an I2S write gap. Call from the task that owns PCM writes. */
+/* Drop the previous pass's queued audio so a repeat-one replay starts clean.
+ *
+ * Bluetooth: the stale tail lives in the PCM ring, so really flush it.
+ *
+ * Speaker (I2S): the DMA ring IS the only buffer, and its descriptor QUEUE and
+ * free-list are NOT reset by auto_clear (auto_clear only zeroes transmitted
+ * data). A repeat-one seam that merely left the channel running therefore kept
+ * the PREVIOUS pass's tail in the queue — and if that queue had desynced from
+ * the writer (the ring drained, the ISR dropped entries), the next write would
+ * clock stale audio or never see back-pressure and the pipeline-error detector
+ * went blind. That is exactly the I2S-only failure (Bluetooth flushes its ring
+ * here, so it never shows it). So for the speaker route we PARK the channel,
+ * refill the whole ring with silence, and re-enable: the next write starts from
+ * a clean, empty DMA. This is a single disable->enable while the channel is
+ * RUNNING (not freshly inited), the same safe cycle hw_audio_set_sample_rate
+ * uses — it cannot wedge the out-link the way the boot-time double toggle could.
+ * The underrun bookkeeping is also reset so the deliberate seam pause is not
+ * flagged as an I2S write gap. Call from the task that owns PCM writes. */
 void hw_audio_pipeline_flush(void)
 {
     s_last_write_us = 0;
     if (s_route == AUDIO_ROUTE_BT) {
         bt_audio_flush_pcm_ring();
+        return;
+    }
+    /* Speaker route: clean-restart the DMA ring. */
+    if (xSemaphoreTake(s_io_lock, pdMS_TO_TICKS(250)) == pdTRUE) {
+        if (s_tx != NULL) {
+            bool was_enabled = s_i2s_enabled;
+            if (was_enabled) {
+                if (i2s_channel_disable(s_tx) != ESP_OK) {
+                    ESP_LOGW(TAG, "I2S park failed in pipeline flush");
+                }
+                s_i2s_enabled = false;
+            }
+            /* Fill every descriptor with silence so the re-enabled channel
+             * clocks silence (not the previous pass's tail) until the next
+             * write. */
+            static const uint8_t s_zero_dma[4096] = {0};
+            for (int i = 0; i < I2S_DMA_DESC_NUM; i++) {
+                size_t loaded = 0;
+                i2s_channel_preload_data(s_tx, s_zero_dma, sizeof(s_zero_dma),
+                                         &loaded);
+                if (loaded < sizeof(s_zero_dma)) {
+                    break;   /* ring full of silence */
+                }
+            }
+            if (was_enabled) {
+                esp_err_t e = i2s_channel_enable(s_tx);
+                if (e != ESP_OK) {
+                    ESP_LOGW(TAG, "I2S re-enable failed in pipeline flush: %s",
+                             esp_err_to_name(e));
+                } else {
+                    s_i2s_enabled = true;
+                    s_rebuild_done = false;   /* fresh channel session */
+                    ESP_LOGI(TAG, "I2S flushed + re-enabled (session #%u)",
+                             (unsigned)++s_enable_count);
+                }
+            }
+        }
+        xSemaphoreGive(s_io_lock);
     }
 }
 

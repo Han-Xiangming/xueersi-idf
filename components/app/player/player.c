@@ -985,10 +985,12 @@ static void decode_loop(void)
                     s_track_errored = true;
                 }
                 else {
-                    /* Drop the previous pass's queued audio (BT PCM ring;
-                     * the speaker DMA's auto_clear handles itself) and reset
-                     * the underrun bookkeeping, then wait out the gap in this
-                     * task. The channel keeps running on auto_clear silence. */
+                    /* Clean-restart the pipeline for the next pass: BT flushes
+                     * its PCM ring, and the speaker route now parks + refills
+                     * its DMA ring with silence + re-enables (see
+                     * hw_audio_pipeline_flush) so the descriptor queue cannot
+                     * desync between passes. Then wait out the seam gap; the
+                     * channel clocks silence meanwhile. */
                     hw_audio_pipeline_flush();
                     vTaskDelay(pdMS_TO_TICKS(REPEAT_ONE_GAP_MS));
                     frame_cnt = 0;

@@ -86,11 +86,15 @@ void hw_audio_set_sample_rate(uint32_t sample_rate_hz);
  * Safe to call from any task, including while a write is in flight. */
 void hw_audio_set_player_active(bool active);
 
-/* Drop what the previous pass left queued in the output pipeline (BT PCM
- * ring) and reset the underrun bookkeeping, so the next PCM write starts a
- * clean pass. Used at repeat-one seams before the inter-pass pause; the
- * speaker DMA needs no flush (auto_clear already clocks silence once its
- * last frame is out). Call from the task that owns PCM writes. */
+/* Drop what the previous pass left queued in the output pipeline and reset the
+ * underrun bookkeeping, so the next PCM write starts a clean pass. Used at
+ * repeat-one seams before the inter-pass pause.
+ *  - Bluetooth: really flushes the stale PCM ring tail.
+ *  - Speaker (I2S): parks the channel, refills the whole DMA ring with silence
+ *    and re-enables it, so the descriptor queue is reset and the next write
+ *    starts from an empty DMA (auto_clear alone does NOT reset the queue, which
+ *    is why a bare no-op here let the queue desync and wedge on repeat).
+ * Call from the task that owns PCM writes. */
 void hw_audio_pipeline_flush(void);
 
 /* Result of a PCM write, so the caller can distinguish "streamed" from
