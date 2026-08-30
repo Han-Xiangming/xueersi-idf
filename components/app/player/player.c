@@ -884,9 +884,17 @@ static bool decode_frame(bool *rate_set)
         }
     }
 
-    /* Throughput accounting: this call's duration is what the next write's gap
-     * measures, so its average must stay below the frame budget or the ring
-     * drains. Reported every ~2 s so it is visible without flooding. */
+    /* Throughput accounting.
+     *
+     * IMPORTANT: `out` is dominated by the INTENTIONAL block on I2S DMA
+     * back-pressure — that is the mechanism that paces the decoder to the
+     * hardware clock (see the architecture comment at the top of audio.c), so
+     * counting it as work and comparing the total against the frame budget is
+     * wrong: a perfectly healthy pipeline sits at ~100% of the budget BY
+     * DESIGN (the slack is spent waiting for the DMA). Only real CPU work —
+     * the SD read + MP3Decode + the DSP before the write — must stay under
+     * the budget, so that is what is judged here; `paced` is reported for
+     * information only. */
     const int64_t t_out_done = esp_timer_get_time();
     s_tm_read_us += (uint32_t)(t_read_done - t_enter);
     s_tm_dec_us  += (uint32_t)(t_dec_done - t_read_done);
@@ -894,16 +902,17 @@ static bool decode_frame(bool *rate_set)
     s_tm_frames++;
     if (t_out_done - s_tm_last_log_us > 2000000) {
         const uint32_t n = s_tm_frames;
-        const uint32_t avg_total = (s_tm_read_us + s_tm_dec_us + s_tm_out_us) / n;
+        const uint32_t cpu_us   = (s_tm_read_us + s_tm_dec_us) / n;
+        const uint32_t paced_us = s_tm_out_us / n;
         const uint32_t budget = s_dbg_rate
             ? (uint32_t)((uint64_t)1152 * 1000000u / s_dbg_rate) : 26122u;
-        ESP_LOGI(TAG, "[TIMING] %u fr: read %u + dec %u + out %u = %u us "
-                      "(budget %u us @ %u Hz) %s",
-                 (unsigned)n,
+        ESP_LOGI(TAG, "[TIMING] %u fr: cpu %u us (read %u + dec %u) + "
+                      "paced %u us | budget %u us @ %u Hz -> cpu %u%% %s",
+                 (unsigned)n, (unsigned)cpu_us,
                  (unsigned)(s_tm_read_us / n), (unsigned)(s_tm_dec_us / n),
-                 (unsigned)(s_tm_out_us / n), (unsigned)avg_total,
-                 (unsigned)budget, (unsigned)s_dbg_rate,
-                 avg_total > budget ? "*** OVER BUDGET ***" : "ok");
+                 (unsigned)paced_us, (unsigned)budget, (unsigned)s_dbg_rate,
+                 (unsigned)(cpu_us * 100u / budget),
+                 cpu_us > budget ? "*** OVER BUDGET ***" : "ok");
         s_tm_read_us = s_tm_dec_us = s_tm_out_us = 0;
         s_tm_frames = 0;
         s_tm_last_log_us = t_out_done;
