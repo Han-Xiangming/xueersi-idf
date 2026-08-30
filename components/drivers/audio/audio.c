@@ -99,6 +99,12 @@ static int64_t s_last_gap_log_us;
 static uint32_t s_gap_count;
 static uint32_t s_enable_count;
 
+/* Set true after hw_audio_write_pcm has triggered a channel rebuild for a
+ * wedged DMA, so it will not rebuild again until the channel proves healthy
+ * (a successful write, or a fresh enable) — bounds the recovery to one attempt
+ * per channel session instead of spinning a rebuild every stalled frame. */
+static bool s_rebuild_done;
+
 /* --- Speaker-protection high-pass filter -------------------------------
  * The on-board driver is a small phone racetrack speaker (usable ~800 Hz..8 kHz,
  * Fs ≈ 880 Hz, Xmax ±0.22 mm). A 1st-order DC-blocking high-pass is inserted before
@@ -425,11 +431,16 @@ bool hw_audio_is_ready(void)
     return s_ready && (s_tx != NULL) && (s_io_lock != NULL);
 }
 
-/* Create and validate the I2S channel: std-mode init on the board pins,
- * then an enable -> park cycle to prove the config works. Leaves the
- * channel disabled (parked) so no BCLK is generated while idle (the
- * MAX98357 powers down when its clock stops). Shared by boot init and the
- * rebuild path. */
+/* Create the I2S channel: std-mode init on the board pins. Leaves the
+ * channel DISABLED (parked) so no BCLK is generated while idle (the MAX98357
+ * powers down when its clock stops). The config validity is fully checked by
+ * i2s_channel_init_std_mode() itself, so there is NO enable->disable probe
+ * here: on ESP32 the out-link DMA start/stop is asynchronous (i2s_ll_tx_stop_link
+ * sets out_link.stop with no completion wait, and i2s_ll_tx_reset's single-cycle
+ * pulse may not latch while the module clock is off), and a boot-time stop-then-
+ * restart can wedge the out-link FSM for the entire boot — the "sometimes no I2S
+ * after power-on" failure. The runtime first write enables the channel instead.
+ * Shared by boot init and the rebuild path. */
 static esp_err_t audio_create_channel(void)
 {
     i2s_chan_config_t chan_cfg = {
@@ -462,18 +473,8 @@ static esp_err_t audio_create_channel(void)
         ESP_LOGW(TAG, "I2S std init failed: %s", esp_err_to_name(err));
         return err;
     }
-    /* Validate the config once (enable -> park). From here the channel stays
-     * parked until the first PCM write of a speaker session. */
-    err = i2s_channel_enable(s_tx);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "I2S channel enable failed: %s", esp_err_to_name(err));
-        return err;
-    }
-    err = i2s_channel_disable(s_tx);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "I2S channel park failed: %s", esp_err_to_name(err));
-        return err;
-    }
+    /* Channel left PARKED (no boot-time enable->disable probe; see the
+     * function comment above for why). The first runtime write enables it. */
     s_i2s_enabled = false;
     return ESP_OK;
 }
@@ -515,21 +516,21 @@ void hw_audio_init(void)
 
 /* Troubleshooting: rebuild the I2S channel from scratch (see audio.h).
  *
- * Safety: the caller must have stopped the player first (s_player_active
- * false), otherwise the decode task could write to a channel we are tearing
- * down. All channel operations are serialized by s_io_lock; a write in
- * flight from the player task holds that lock, so acquiring it here also
- * proves no write is pending. A boot-time init failure leaves s_tx NULL,
- * and this path can still bring the channel up. */
+ * Safety: may be called while a track is playing. The only writer is the
+ * decode task, and it serializes with this rebuild through s_io_lock — a
+ * write in flight holds that lock, so taking it here also proves no write is
+ * pending. The write path triggers this only AFTER a write has returned
+ * STALLED, so the DMA is idle when we tear the channel down; the next write
+ * re-enables the fresh channel at the current rate. A boot-time init failure
+ * leaves s_tx NULL, and this path can still bring the channel up. */
 esp_err_t hw_audio_rebuild_i2s(void)
 {
     if (!s_ready || s_io_lock == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (s_player_active) {
-        ESP_LOGW(TAG, "rebuild refused: player still owns the bus");
-        return ESP_ERR_INVALID_STATE;
-    }
+    /* Safe to run mid-playback: a write in flight holds s_io_lock, so taking it
+     * here proves the DMA is idle; the caller (hw_audio_write_pcm) only
+     * triggers a rebuild after a write has returned STALLED. */
     if (xSemaphoreTake(s_io_lock, pdMS_TO_TICKS(250)) != pdTRUE) {
         ESP_LOGW(TAG, "i2s lock busy, rebuild skipped");
         return ESP_ERR_TIMEOUT;
@@ -796,7 +797,7 @@ void hw_audio_pipeline_flush(void)
  *
  * Speaker output goes DIRECTLY to the I2S DMA (no ring buffer): the bounded
  * write blocks under DMA back-pressure, which paces the decoder at exactly
- * the hardware clock rate, and the DMA (8 x 1024 frames, auto_clear) absorbs
+ * the hardware clock rate, and the DMA (12 x 1024 frames, auto_clear) absorbs
  * decode jitter. A wedged DMA surfaces as AUDIO_WRITE_STALLED; a stop/pause
  * mid-write surfaces as AUDIO_WRITE_ABANDONED. */
 audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
@@ -945,8 +946,8 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
     size_t bytes = frames * 4;
     /* Serialize with stop/park requests from other tasks: the lock is held
      * only around the driver calls, and a concurrent holder takes at most
-     * one bounded 100 ms write, so 250 ms is ample. */
-    if (xSemaphoreTake(s_io_lock, pdMS_TO_TICKS(250)) != pdTRUE) {
+     * one bounded 300 ms write, so 500 ms is ample. */
+    if (xSemaphoreTake(s_io_lock, pdMS_TO_TICKS(500)) != pdTRUE) {
         ESP_LOGW(TAG, "i2s lock busy (timeout)");
         return AUDIO_WRITE_STALLED;
     }
@@ -981,11 +982,12 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
             return AUDIO_WRITE_STALLED;
         }
         s_i2s_enabled = true;
+        s_rebuild_done = false;   /* fresh channel session: allow a rebuild */
         ESP_LOGI(TAG, "I2S enabled (session #%u)", (unsigned)++s_enable_count);
     }
     size_t w = 0;
     esp_err_t e = i2s_channel_write(s_tx, stereo_frames, bytes, &w,
-                                    pdMS_TO_TICKS(100));
+                                    pdMS_TO_TICKS(300));
     s_last_write_us = esp_timer_get_time();
     xSemaphoreGive(s_io_lock);
     /* A stop/pause landed mid-write: the partial frame is not an error. */
@@ -994,11 +996,39 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
     }
     if (e != ESP_OK || w != bytes) {
         if (++s_wr_errs >= 4) {
+            /* Classify the failure so the root cause is obvious from the log:
+             * ESP_ERR_INVALID_STATE = the channel is not enabled (the binary
+             * semaphore was never given: enable() failed, or the channel was
+             * parked); ESP_ERR_TIMEOUT = the DMA is not consuming (the write
+             * blocked the full 300 ms for a free descriptor). */
+            const char *why = (e == ESP_ERR_INVALID_STATE)
+                ? "channel not enabled (binary not given)"
+                : (e == ESP_ERR_TIMEOUT)
+                    ? "DMA not consuming (write timed out)"
+                    : esp_err_to_name(e);
             ESP_LOGE(TAG, "[ERROR] I2S write failed: %s (%u/%u bytes)",
-                     esp_err_to_name(e), (unsigned)w, (unsigned)bytes);
+                     why, (unsigned)w, (unsigned)bytes);
             s_wr_errs = 0;
+        }
+        /* A wedged DMA (channel enabled but writes keep timing out / returning
+         * zero bytes) cannot heal itself — the only recovery is a full channel
+         * rebuild. Try it ONCE per channel session (guarded by s_rebuild_done):
+         * tear the channel down and bring it back up; the next write re-enables
+         * it at the current rate. If the rebuild does not restore DMA we keep
+         * returning STALLED so the player aborts the track (and auto-advances)
+         * cleanly instead of playing silence forever. */
+        if (s_i2s_enabled && !s_rebuild_done) {
+            s_rebuild_done = true;
+            s_wr_errs = 0;
+            ESP_LOGW(TAG, "I2S write wedged -> rebuilding channel");
+            esp_err_t rb = hw_audio_rebuild_i2s();
+            if (rb != ESP_OK) {
+                ESP_LOGE(TAG, "I2S rebuild failed: %s", esp_err_to_name(rb));
+            }
         }
         return AUDIO_WRITE_STALLED;
     }
+    s_rebuild_done = false;   /* healthy write: a future wedge may rebuild */
+    s_wr_errs = 0;
     return AUDIO_WRITE_OK;
 }

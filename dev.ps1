@@ -10,7 +10,7 @@ if (-not (Test-Path $Activate)) {
     Write-Host "Regenerating IDF activate script ..." -ForegroundColor Yellow
     $Py = "C:\Users\OpenTankOfBeta\.espressif\python_env\idf6.1_py3.13_env\Scripts\python.exe"
     if (-not (Test-Path $Py)) { $Py = "python" }
-    $Out = & $Py "D:\esp\v6.1-beta1\tools\activate.py" --export
+    $Out = & $Py "D:\esp\v6.1\esp-idf\tools\activate.py" --export
     if ($LASTEXITCODE -ne 0 -or -not $Out) {
         Write-Host "Failed to generate IDF activate script" -ForegroundColor Red
         Read-Host "Press Enter to exit"
@@ -123,7 +123,7 @@ if (-not $Action) {
             default { Write-Host "Invalid choice" -ForegroundColor Yellow }
         }
     }
-} elseif ($Action -eq "help" -or $Actions -notcontains ($Action -replace '\+', '')) {
+} elseif ($Action -eq "help" -or ($Action -notmatch '\+' -and $Actions -notcontains $Action)) {
     # help, or a single unknown token with no '+' separators
     Show-Help
     exit 1

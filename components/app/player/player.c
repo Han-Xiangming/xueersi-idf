@@ -37,10 +37,11 @@
  * aborted and the player advances to the next one (or stops) instead of
  * spinning the CPU forever on a file that will never produce audio. */
 #define TRACK_MAX_DECODE_ERRS    512
-/* Consecutive AUDIO_WRITE_STALLED results that abort a track. Each stall is
- * a bounded I2S write timing out, which proves the DMA is not consuming; a
- * few in a row mean the pipeline is wedged, not just momentarily slow. */
-#define TRACK_MAX_PIPELINE_STALLS 3
+/* Consecutive AUDIO_WRITE_STALLED results that abort a track. A single stall
+ * is now just a transient (the writer self-heals a wedged DMA by rebuilding
+ * the channel), so require more of them before giving up — a momentary
+ * decode/SD hiccup must not abort a good track. */
+#define TRACK_MAX_PIPELINE_STALLS 10
 /* Consecutive tracks that failed to play before the player gives up and
  * stops (avoids cycling through a whole card of corrupt files forever). */
 #define TRACK_MAX_CONSEC_FAILS   8
@@ -48,12 +49,16 @@
  * this long, the decode task is stuck (SD read hang, BT send hang, ...) and
  * the watchdog stops playback instead of faking an endless "playing" state. */
 #define PLAYER_STALL_MS          12000
-/* Pause between repeat-one passes. The previous pass's tail (up to ~280 ms
- * in the I2S DMA / ~740 ms in the BT PCM ring) is flushed first and the
- * channel then clocks silence for this long, so the replay starts from a
- * clean boundary instead of the old ending running straight into the new
- * beginning (perceived as the previous play's audio bleeding through). */
-#define REPEAT_ONE_GAP_MS        500
+/* Pause between repeat-one passes. The previous pass's tail is flushed first
+ * and the channel then clocks silence for this long, so the replay starts
+ * from a clean boundary instead of the old ending running straight into the
+ * new beginning. MUST stay well under one DMA ring (12 x 1024 frames @ 44.1 kHz
+ * ~ 278 ms): if the gap drains the ring, the ISR overflows the descriptor
+ * queue and drops the oldest entries, which desyncs the writer from the DMA
+ * (back-pressure disappears, writes never time out, and the pipeline-error
+ * detection goes dead). 120 ms is safely below the ring and still long enough
+ * to separate the two passes audibly. */
+#define REPEAT_ONE_GAP_MS        120
 
 static const char *TAG = "player";
 
@@ -820,10 +825,11 @@ static bool decode_frame(bool *rate_set)
         wr = hw_audio_write_pcm(s_stereo, (size_t)info.outputSamps);
     }
     if (wr == AUDIO_WRITE_STALLED) {
-        /* The I2S DMA is not consuming (bounded write timed out repeatedly).
-         * Give up on the track after a few consecutive stalls — the pipeline
-         * is then wedged, and the pipeline error is the honest outcome
-         * instead of silent playback forever. */
+        /* The I2S DMA is not consuming (bounded write timed out). The writer
+         * now self-heals a wedged channel by rebuilding it (see
+         * hw_audio_write_pcm), so a one-off hitch must not abort the track:
+         * only N CONSECUTIVE stalls count. The pipeline error is the honest
+         * outcome when even the rebuild fails. */
         if (++s_pcm_stalls >= TRACK_MAX_PIPELINE_STALLS) {
             ESP_LOGE(TAG, "audio pipeline stalled %d times, aborting track",
                      s_pcm_stalls);
@@ -832,10 +838,16 @@ static bool decode_frame(bool *rate_set)
             return false;
         }
     }
-    else if (wr == AUDIO_WRITE_OK && s_last_err != PLAYER_ERR_NONE) {
-        /* First real audio progress of the new track: clear any sticky
-         * error from a previously failed track/play request. */
-        player_report_error(PLAYER_ERR_NONE);
+    else {
+        /* Any non-stalled result (OK, or ABANDONED on a pause/stop) clears the
+         * consecutive-stall streak — a brief decode/SD hiccup is not evidence
+         * the DMA is wedged. */
+        s_pcm_stalls = 0;
+        if (wr == AUDIO_WRITE_OK && s_last_err != PLAYER_ERR_NONE) {
+            /* First real audio progress of the new track: clear any sticky
+             * error from a previously failed track/play request. */
+            player_report_error(PLAYER_ERR_NONE);
+        }
     }
 
     return true;

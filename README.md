@@ -2,7 +2,7 @@
 
 这是给学而思小喵掌机（ESP32-WROVER-B 版本）移植的 **ESP-IDF / LVGL 9.5 C 固件工程**，提供 MP3 播放、SD 卡浏览、蓝牙 A2DP 音频输出、TXT 电子书阅读、背光/音量设置等功能的分页 UI。
 
-> 注意：本工程是原生 ESP-IDF C 固件，源码位于 `main/`、`components/`，构建系统为 CMake + ESP-IDF v6.1（当前使用 v6.1-beta1）。
+> 注意：本工程是原生 ESP-IDF C 固件，源码位于 `main/`、`components/`，构建系统为 CMake + ESP-IDF v6.1（正式版，IDF 路径 `D:\esp\v6.1\esp-idf`）。
 
 ## 目录
 
@@ -33,7 +33,7 @@ esptool.py --chip esp32 -b 460800 write_flash 0x0 xiaomiao-merged.bin
 
 ### 1.2 从源码构建
 
-需要 ESP-IDF v6.1（已针对 v6.1-beta1 验证）。
+需要 ESP-IDF v6.1（正式版，已验证）。
 
 ```bash
 # 在 ESP-IDF 环境下
