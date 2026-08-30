@@ -1019,15 +1019,8 @@ static void decode_loop(void)
                     break;
                 }
                 frame_cnt++;
-                /* Playback heartbeat (INFO, ~6 s at 44.1 kHz): while a track
-                 * plays, healthy decode emits nothing else, so an apparently
-                 * frozen serial log is really normal — this line proves the
-                 * decode loop is alive and producing frames. */
-                if (frame_cnt % 256 == 0) {
-                    ESP_LOGI(TAG, "playing... frame #%d (%.1f s)",
-                             frame_cnt, (float)frame_cnt * 1152.0f /
-                                        (float)(s_dbg_rate ? s_dbg_rate : 44100));
-                }
+                /* (Playback heartbeat removed: it was INFO noise every ~256
+                 * frames. Health is still observable via the [TIMING] line.) */
             }
 
             ESP_LOGI(TAG, "track ended: frames=%u (~%u ms est.), %s",

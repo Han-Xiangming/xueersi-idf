@@ -43,21 +43,6 @@
 
 static const char *TAG = "hw_audio";
 
-/* Fault-localisation traces for the "log stops with no output" failure.
- *
- * That symptom means a driver call NEVER RETURNED (every timeout path in this
- * file logs before returning), so the only way to find it is to log
- * immediately BEFORE each call that can block indefinitely — the last line the
- * console printed then names the exact hanging call. Must be ESP_LOGI or
- * higher: LOG_LOCAL_LEVEL is ESP_LOG_INFO here, so ESP_LOGD is compiled out
- * entirely and would print nothing. */
-#define AUDIO_TRACE(fmt, ...) ESP_LOGI(TAG, "[TRACE] " fmt, ##__VA_ARGS__)
-
-/* Set when the channel has just been (re)enabled and cleared once the first
- * write after it returns: gates the per-write trace so the console is not
- * flooded with one line per MP3 frame (~38/s). */
-static bool s_first_write_pending;
-
 #define AUDIO_DEFAULT_RATE  44100
 #define AUDIO_2PI           6.2831853f
 
@@ -275,11 +260,9 @@ static void audio_apply_route(audio_route_t route)
     if (audio_route_is_bt() && s_ready) {
         if (xSemaphoreTake(s_io_lock, pdMS_TO_TICKS(250)) == pdTRUE) {
             if (s_i2s_enabled) {
-                AUDIO_TRACE("apply_route: i2s_channel_disable enter");
                 if (i2s_channel_disable(s_tx) != ESP_OK) {
                     ESP_LOGW(TAG, "I2S park failed (route -> bt)");
                 }
-                AUDIO_TRACE("apply_route: i2s_channel_disable done");
                 s_i2s_enabled = false;
                 s_last_write_us = 0;
             }
@@ -431,11 +414,9 @@ void hw_audio_set_player_active(bool active)
          * to READY (i2s_common.c i2s_channel_disable). */
         if (xSemaphoreTake(s_io_lock, pdMS_TO_TICKS(250)) == pdTRUE) {
             if (s_i2s_enabled) {
-                AUDIO_TRACE("set_player_active: i2s_channel_disable enter");
                 if (i2s_channel_disable(s_tx) != ESP_OK) {
                     ESP_LOGW(TAG, "I2S park failed");
                 }
-                AUDIO_TRACE("set_player_active: i2s_channel_disable done");
                 s_i2s_enabled = false;
                 s_last_write_us = 0;
             }
@@ -469,13 +450,11 @@ static esp_err_t audio_create_channel(void)
         .dma_frame_num = 1024,
         .auto_clear = true,
     };
-    AUDIO_TRACE("i2s_new_channel: enter");
     esp_err_t err = i2s_new_channel(&chan_cfg, &s_tx, NULL);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "I2S channel init failed: %s", esp_err_to_name(err));
         return err;
     }
-    AUDIO_TRACE("i2s_new_channel: done (tx=%p)", (void *)s_tx);
 
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_DEFAULT_RATE),
@@ -489,13 +468,11 @@ static esp_err_t audio_create_channel(void)
             .din  = I2S_GPIO_UNUSED,
         },
     };
-    AUDIO_TRACE("i2s_channel_init_std_mode: enter");
     err = i2s_channel_init_std_mode(s_tx, &std_cfg);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "I2S std init failed: %s", esp_err_to_name(err));
         return err;
     }
-    AUDIO_TRACE("i2s_channel_init_std_mode: done");
     /* Channel left PARKED (no boot-time enable->disable probe; see the
      * function comment above for why). The first runtime write enables it. */
     s_i2s_enabled = false;
@@ -563,24 +540,19 @@ esp_err_t hw_audio_rebuild_i2s(void)
      * driver-side disable below is safe. */
     if (s_tx != NULL) {
         if (s_i2s_enabled) {
-            AUDIO_TRACE("rebuild: i2s_channel_disable enter");
             if (i2s_channel_disable(s_tx) != ESP_OK) {
                 ESP_LOGW(TAG, "I2S park failed before rebuild");
             }
-            AUDIO_TRACE("rebuild: i2s_channel_disable done");
             s_i2s_enabled = false;
             s_last_write_us = 0;
         }
-        AUDIO_TRACE("rebuild: i2s_del_channel enter");
         esp_err_t e = i2s_del_channel(s_tx);
         if (e != ESP_OK) {
             ESP_LOGE(TAG, "I2S channel delete failed: %s",
                      esp_err_to_name(e));
         }
-        AUDIO_TRACE("rebuild: i2s_del_channel done");
         s_tx = NULL;
     }
-    AUDIO_TRACE("rebuild: audio_create_channel enter");
     esp_err_t e = audio_create_channel();
     if (e != ESP_OK) {
         s_ready = false;              /* bus gone: block playback */
@@ -754,11 +726,9 @@ void hw_audio_set_sample_rate(uint32_t sample_rate_hz)
         return;
     }
     if (s_i2s_enabled) {
-        AUDIO_TRACE("set_sample_rate: i2s_channel_disable enter");
         if (i2s_channel_disable(s_tx) != ESP_OK) {
             ESP_LOGW(TAG, "I2S park failed before rate change");
         }
-        AUDIO_TRACE("set_sample_rate: i2s_channel_disable done");
         s_i2s_enabled = false;
         s_last_write_us = 0;
     }
@@ -824,11 +794,9 @@ void hw_audio_pipeline_flush(void)
         if (s_tx != NULL) {
             bool was_enabled = s_i2s_enabled;
             if (was_enabled) {
-                AUDIO_TRACE("flush: i2s_channel_disable enter");
                 if (i2s_channel_disable(s_tx) != ESP_OK) {
                     ESP_LOGW(TAG, "I2S park failed in pipeline flush");
                 }
-                AUDIO_TRACE("flush: i2s_channel_disable done");
                 s_i2s_enabled = false;
             }
             /* Fill every descriptor with silence so the re-enabled channel
@@ -844,9 +812,7 @@ void hw_audio_pipeline_flush(void)
                 }
             }
             if (was_enabled) {
-                AUDIO_TRACE("flush: i2s_channel_enable enter");
                 esp_err_t e = i2s_channel_enable(s_tx);
-                AUDIO_TRACE("flush: i2s_channel_enable done");
                 if (e != ESP_OK) {
                     ESP_LOGW(TAG, "I2S re-enable failed in pipeline flush: %s",
                              esp_err_to_name(e));
@@ -1060,31 +1026,19 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
      * starts ahead of PCM (no initial auto-clear blank), and after a rate
      * reconfig the first write re-enables at the new rate. */
     if (!s_i2s_enabled) {
-        AUDIO_TRACE("i2s_channel_enable: enter");
         esp_err_t e = i2s_channel_enable(s_tx);
         if (e != ESP_OK) {
             ESP_LOGW(TAG, "I2S enable failed: %s", esp_err_to_name(e));
             xSemaphoreGive(s_io_lock);
             return AUDIO_WRITE_STALLED;
         }
-        AUDIO_TRACE("i2s_channel_enable: done");
         s_i2s_enabled = true;
         s_rebuild_done = false;   /* fresh channel session: allow a rebuild */
-        s_first_write_pending = true;
         ESP_LOGI(TAG, "I2S enabled (session #%u)", (unsigned)++s_enable_count);
     }
     size_t w = 0;
-    if (s_first_write_pending) {
-        AUDIO_TRACE("i2s_channel_write: enter (first after enable, %u bytes)",
-                    (unsigned)bytes);
-    }
     esp_err_t e = i2s_channel_write(s_tx, stereo_frames, bytes, &w,
                                     pdMS_TO_TICKS(300));
-    if (s_first_write_pending) {
-        s_first_write_pending = false;
-        AUDIO_TRACE("i2s_channel_write: returned (%u/%u bytes, %s)",
-                    (unsigned)w, (unsigned)bytes, esp_err_to_name(e));
-    }
     s_last_write_us = esp_timer_get_time();
     xSemaphoreGive(s_io_lock);
     /* A stop/pause landed mid-write: the partial frame is not an error. */
