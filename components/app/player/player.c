@@ -49,6 +49,22 @@
  * this long, the decode task is stuck (SD read hang, BT send hang, ...) and
  * the watchdog stops playback instead of faking an endless "playing" state. */
 #define PLAYER_STALL_MS          12000
+/* Decode task priority: MUST stay ABOVE LVGL_TASK_PRIORITY (7, see ui.h).
+ *
+ * The decode task is the only real-time consumer here: it must refill the I2S
+ * DMA ring faster than the hardware drains it, or the stream underruns. Every
+ * millisecond it is preempted is a millisecond the ring is not refilled. On a
+ * 48 kHz track a frame is only 24 ms of audio, so a few ms of preemption per
+ * frame is enough to drain the ~256 ms ring within a second (measured as
+ * chronic "I2S write gap > 30 ms" and, once it empties, silence).
+ *
+ * LVGL is NOT real-time critical by comparison: the decode task blocks on DMA
+ * back-pressure for most of each frame, so LVGL still gets the CPU it needs —
+ * it just can no longer preempt a decode that is on the critical path.
+ *
+ * Pinned to core 1 because core 0 hosts the Bluetooth controller + stack. */
+#define PLAYER_TASK_PRIORITY     8
+#define PLAYER_TASK_CORE         1
 /* Pause between repeat-one passes. The previous pass's tail is flushed first
  * and the channel then clocks silence for this long, so the replay starts
  * from a clean boundary instead of the old ending running straight into the
@@ -731,9 +747,25 @@ static int src_read(void *out, int want)
     return (int)fread(out, 1, (size_t)want, s_src.fp);
 }
 
+/* Decode-timing instrumentation.
+ *
+ * The gap between two consecutive I2S writes IS the decode time, and it must
+ * stay BELOW the frame duration (1152 samples / sample rate = 24.0 ms at
+ * 48 kHz, 26.1 ms at 44.1 kHz) or the DMA ring drains and the stream
+ * underruns — the "plays / doesn't play" failure. Accumulated per frame and
+ * reported every ~2 s, split into the SD read, MP3Decode and the DSP+write, so
+ * the bottleneck is measured rather than guessed at. */
+static uint32_t s_tm_read_us;
+static uint32_t s_tm_dec_us;
+static uint32_t s_tm_out_us;
+static uint32_t s_tm_frames;
+static int64_t  s_tm_last_log_us;
+
 /* Decode a single frame and stream it. Returns false on EOF/error. */
 static bool decode_frame(bool *rate_set)
 {
+    const int64_t t_enter = esp_timer_get_time();
+    int64_t t_read_done = t_enter;
     if (s_bytes_left < 1024) {
         if (s_consumed > 0) {
             memmove(s_readbuf, s_readbuf + s_consumed, (size_t)s_bytes_left);
@@ -742,6 +774,7 @@ static bool decode_frame(bool *rate_set)
         int got = src_read(s_readbuf + s_bytes_left,
                            MP3_READ_CHUNK - s_bytes_left);
         s_bytes_left += got;
+        t_read_done = esp_timer_get_time();
         if (got == 0 && s_bytes_left < 2) {
             return false;   /* end of file */
         }
@@ -769,6 +802,7 @@ static bool decode_frame(bool *rate_set)
     unsigned char *p = s_readbuf + s_consumed;
     int status = MP3Decode(s_dec, &p, &s_bytes_left, s_pcm, 0);
     s_consumed = (int)(p - s_readbuf);
+    const int64_t t_dec_done = esp_timer_get_time();
 
     if (status != 0) {
         /* Skip one byte and resync. Bounded: past TRACK_MAX_DECODE_ERRS the
@@ -848,6 +882,31 @@ static bool decode_frame(bool *rate_set)
              * error from a previously failed track/play request. */
             player_report_error(PLAYER_ERR_NONE);
         }
+    }
+
+    /* Throughput accounting: this call's duration is what the next write's gap
+     * measures, so its average must stay below the frame budget or the ring
+     * drains. Reported every ~2 s so it is visible without flooding. */
+    const int64_t t_out_done = esp_timer_get_time();
+    s_tm_read_us += (uint32_t)(t_read_done - t_enter);
+    s_tm_dec_us  += (uint32_t)(t_dec_done - t_read_done);
+    s_tm_out_us  += (uint32_t)(t_out_done - t_dec_done);
+    s_tm_frames++;
+    if (t_out_done - s_tm_last_log_us > 2000000) {
+        const uint32_t n = s_tm_frames;
+        const uint32_t avg_total = (s_tm_read_us + s_tm_dec_us + s_tm_out_us) / n;
+        const uint32_t budget = s_dbg_rate
+            ? (uint32_t)((uint64_t)1152 * 1000000u / s_dbg_rate) : 26122u;
+        ESP_LOGI(TAG, "[TIMING] %u fr: read %u + dec %u + out %u = %u us "
+                      "(budget %u us @ %u Hz) %s",
+                 (unsigned)n,
+                 (unsigned)(s_tm_read_us / n), (unsigned)(s_tm_dec_us / n),
+                 (unsigned)(s_tm_out_us / n), (unsigned)avg_total,
+                 (unsigned)budget, (unsigned)s_dbg_rate,
+                 avg_total > budget ? "*** OVER BUDGET ***" : "ok");
+        s_tm_read_us = s_tm_dec_us = s_tm_out_us = 0;
+        s_tm_frames = 0;
+        s_tm_last_log_us = t_out_done;
     }
 
     return true;
@@ -1144,7 +1203,8 @@ void player_init(void)
     s_name[0] = '\0';
     /* Debug tracing is compiled in (LOG_LOCAL_LEVEL) but off by default;
      * the settings page LOG option enables it at runtime. */
-    if (xTaskCreate(player_task, "mp3_player", 16 * 1024, NULL, 6, &s_task)
+    if (xTaskCreatePinnedToCore(player_task, "mp3_player", 16 * 1024, NULL,
+                                PLAYER_TASK_PRIORITY, &s_task, PLAYER_TASK_CORE)
             != pdPASS) {
         ESP_LOGE(TAG, "[ERROR] player task create FAILED");
         s_task = NULL;
