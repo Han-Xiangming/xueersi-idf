@@ -51,10 +51,25 @@ static const char *TAG = "hw_audio";
 #define AUDIO_DEFAULT_RATE  44100
 #define AUDIO_2PI           6.2831853f
 
-/* I2S DMA ring: 12 descriptors x 1024 frames (x 4 bytes/frame, 16-bit
- * stereo) = 48 KB of buffering (~280 ms at 44.1 kHz). One descriptor-sized
- * zero chunk per descriptor is enough to silence the whole ring. */
+/* I2S DMA ring geometry.
+ *
+ * Descriptor size: the ESP32 DMA node caps a buffer at
+ * DMA_DESCRIPTOR_BUFFER_MAX_SIZE_4B_ALIGNED = (4095 - 3) = 4092 bytes, and
+ * i2s_common.c silently clamps anything larger (logging "dma frame num is out
+ * of dma buffer size"). The old value 1024 frames = 4096 bytes was therefore
+ * OUT OF RANGE and got clamped to 1023 on every channel creation.
+ *
+ * 1021 frames = 4084 bytes is inside the limit, and it is prime — coprime with
+ * the 1152 frames of one MP3 frame — which is deliberate: the decode task
+ * always writes exactly 1152 frames, so the offset at which a write ends walks
+ * the descriptor every gcd(1152, D) writes. With D = 1023 (gcd 3) a write ends
+ * exactly on a descriptor boundary every 341 writes (~8.9 s); with D = 1021
+ * (gcd 1) it takes 1021 writes (~26.6 s). See espressif/esp-idf#18916, where
+ * an ESP32 DMA transfer that exactly fills whole nodes loses its EOF event.
+ *
+ * 12 x 1021 / 44100 = 277.8 ms of buffering (was 278.4 ms) — unchanged. */
 #define I2S_DMA_DESC_NUM    12
+#define I2S_DMA_FRAME_NUM   1021
 
 /* How long the I2S write may block waiting for a free DMA descriptor (ms).
  * The wait is back-pressure: the out-EOF ISR returns one descriptor (1024
@@ -113,9 +128,10 @@ static SemaphoreHandle_t s_io_lock;
 static uint32_t s_wr_errs;
 
 /* Underflow diagnostics: the gap between consecutive speaker-path writes
- * (the decode time) must stay well under the DMA drain time (one 1024-frame
- * descriptor = ~23 ms at 44.1 kHz), otherwise the DMA runs dry between
- * frames and the amp reproduces repeated fragments / its noise floor.
+ * (the decode time) must stay well under the DMA drain time (one
+ * I2S_DMA_FRAME_NUM-frame descriptor = ~23 ms at 44.1 kHz), otherwise the DMA
+ * runs dry between frames and the amp reproduces repeated fragments / its
+ * noise floor.
  * s_last_write_us = end of the previous write (0 = parked since); a gap
  * > 30 ms is logged at WARN at most once per second. */
 static int64_t s_last_write_us;
@@ -123,11 +139,31 @@ static int64_t s_last_gap_log_us;
 static uint32_t s_gap_count;
 static uint32_t s_enable_count;
 
-/* Set true after hw_audio_write_pcm has triggered a channel rebuild for a
- * wedged DMA, so it will not rebuild again until the channel proves healthy
- * (a successful write, or a fresh enable) — bounds the recovery to one attempt
- * per channel session instead of spinning a rebuild every stalled frame. */
-static bool s_rebuild_done;
+/* Channel-rebuild recovery bookkeeping.
+ *
+ * A wedged DMA (no out-EOF interrupt -> no descriptor credits -> every write
+ * blocks its full timeout) is recovered by tearing the channel down and
+ * bringing a fresh one up. ONE attempt is not always enough: the log that
+ * pinpointed this failure showed a rebuild at t=251 s followed by a total
+ * freeze 38 s later — the new channel was created but the DMA still never ran,
+ * and because a single-shot rebuild had already been "used", nothing tried
+ * again and the device sat there dead.
+ *
+ * So the recovery is now a BOUNDED RETRY:
+ *   - up to AUDIO_MAX_REBUILD_TRIES rebuilds in a row, each logged with its
+ *     attempt number;
+ *   - the counter resets on a healthy write or a fresh enable, so a channel
+ *     that recovers gets its whole budget back next time;
+ *   - once the budget is spent we stop rebuilding and keep returning
+ *     AUDIO_WRITE_STALLED, which the player turns into a visible pipeline
+ *     error + auto-advance instead of a silently dead device.
+ *
+ * s_stall_total / s_rebuild_total are lifetime counters so a failure report
+ * shows how often the DMA actually misbehaved, not just the last event. */
+#define AUDIO_MAX_REBUILD_TRIES 3
+static uint32_t s_rebuild_tries;
+static uint32_t s_rebuild_total;
+static uint32_t s_stall_total;
 
 /* --- Speaker-protection high-pass filter -------------------------------
  * The on-board driver is a small phone racetrack speaker (usable ~800 Hz..8 kHz,
@@ -546,7 +582,7 @@ static esp_err_t audio_create_channel(void)
         .id = I2S_NUM_0,
         .role = I2S_ROLE_MASTER,
         .dma_desc_num = I2S_DMA_DESC_NUM,
-        .dma_frame_num = 1024,
+        .dma_frame_num = I2S_DMA_FRAME_NUM,
         .auto_clear = true,
     };
     esp_err_t err = i2s_new_channel(&chan_cfg, &s_tx, NULL);
@@ -719,8 +755,15 @@ esp_err_t hw_audio_rebuild_i2s(void)
     s_track_gain_sm = s_track_gain;
     s_master_gain_sm = s_master_gain;
     s_wr_errs = 0;
+    s_rebuild_total++;
     xSemaphoreGive(s_io_lock);
-    ESP_LOGI(TAG, "I2S channel rebuilt (rate %u Hz)", (unsigned)s_rate);
+    /* Logged at INFO with the lifetime total and the current sample rate: the
+     * timestamp of this line is what pinned the earlier failure (a rebuild at
+     * t=251 s, 38 s before the device froze), and the total tells whether the
+     * DMA is degrading over a session or just hiccupping once. */
+    ESP_LOGI(TAG, "I2S channel rebuilt #%u (rate %u Hz, %u stalls so far)",
+             (unsigned)s_rebuild_total, (unsigned)s_rate,
+             (unsigned)s_stall_total);
     return ESP_OK;
 }
 
@@ -1123,7 +1166,8 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
             return AUDIO_WRITE_STALLED;
         }
         s_i2s_enabled = true;
-        s_rebuild_done = false;   /* fresh channel session: allow a rebuild */
+        /* Fresh channel session: give the recovery its full budget back. */
+        s_rebuild_tries = 0;
         ESP_LOGI(TAG, "I2S enabled (session #%u)", (unsigned)++s_enable_count);
     }
     /* Write timeout, in MILLISECONDS: i2s_channel_write() converts it
@@ -1132,8 +1176,9 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
      * shorter timeout at 100 Hz).
      *
      * The wait is back-pressure: the write blocks until the out-EOF ISR
-     * returns one free descriptor (1024 frames — 23 ms at 44.1 kHz, still only
-     * 64 ms at 16 kHz). The old fixed 300 ms sat within ~4-5 descriptor times
+     * returns one free descriptor (I2S_DMA_FRAME_NUM frames — 23 ms at 44.1
+     * kHz, still only 64 ms at 16 kHz). The old fixed 300 ms sat within ~4-5
+     * descriptor times
      * of that legitimate wait, so ordinary jitter (SD read, Bluetooth
      * activity, GC) was misread as a wedged DMA and triggered a full channel
      * rebuild — the churn that wedges the ESP32 out-link. 1200 ms is far above
@@ -1159,41 +1204,73 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
         return AUDIO_WRITE_ABANDONED;
     }
     if (e != ESP_OK) {
+        s_stall_total++;
         if (++s_wr_errs >= 4) {
             /* Classify the failure so the root cause is obvious from the log:
              * ESP_ERR_INVALID_STATE = the channel is not enabled (the binary
              * semaphore was never given: enable() failed, or the channel was
              * parked); ESP_ERR_TIMEOUT = the DMA is not consuming (the write
-             * blocked the full timeout for a free descriptor). */
+             * blocked the full timeout for a free descriptor). The lifetime
+             * totals show how often the DMA really misbehaved — a single
+             * event is a hiccup, a growing s_stall_total is a wedge. */
             const char *why = (e == ESP_ERR_INVALID_STATE)
                 ? "channel not enabled (binary not given)"
                 : (e == ESP_ERR_TIMEOUT)
                     ? "DMA not consuming (write timed out)"
                     : esp_err_to_name(e);
-            ESP_LOGE(TAG, "[ERROR] I2S write failed: %s (%u/%u bytes, %u ms)",
+            ESP_LOGE(TAG, "[ERROR] I2S write failed: %s (%u/%u bytes, %u ms) "
+                          "| stalls %u, rebuilds %u/%u",
                      why, (unsigned)w, (unsigned)bytes,
-                     (unsigned)wr_timeout_ms);
+                     (unsigned)wr_timeout_ms, (unsigned)s_stall_total,
+                     (unsigned)s_rebuild_tries,
+                     (unsigned)AUDIO_MAX_REBUILD_TRIES);
             s_wr_errs = 0;
         }
         /* A wedged DMA (channel enabled but writes keep timing out / returning
          * zero bytes) cannot heal itself — the only recovery is a full channel
-         * rebuild. Try it ONCE per channel session (guarded by s_rebuild_done):
-         * tear the channel down and bring it back up; the next write re-enables
-         * it at the current rate. If the rebuild does not restore DMA we keep
-         * returning STALLED so the player aborts the track (and auto-advances)
-         * cleanly instead of playing silence forever. */
-        if (s_i2s_enabled && !s_rebuild_done) {
-            s_rebuild_done = true;
-            s_wr_errs = 0;
-            ESP_LOGW(TAG, "I2S write wedged -> rebuilding channel");
-            esp_err_t rb = hw_audio_rebuild_i2s();
-            if (rb != ESP_OK) {
-                ESP_LOGE(TAG, "I2S rebuild failed: %s", esp_err_to_name(rb));
+         * rebuild: tear the channel down and bring it back up; the next write
+         * re-enables it at the current rate.
+         *
+         * This is a BOUNDED RETRY, not a single shot. The failure that led here
+         * rebuilt the channel once and then froze for good 38 s later, because
+         * the one permitted attempt had already been spent on a channel that
+         * never came back. Now up to AUDIO_MAX_REBUILD_TRIES consecutive
+         * rebuilds are allowed; the counter resets on a healthy write (below)
+         * or a fresh enable, so a channel that recovers gets the budget back.
+         *
+         * Once the budget is spent we stop rebuilding and keep returning
+         * STALLED, so the player aborts the track and auto-advances with a
+         * visible pipeline error instead of leaving a silently dead device. */
+        if (s_i2s_enabled) {
+            if (s_rebuild_tries < AUDIO_MAX_REBUILD_TRIES) {
+                s_rebuild_tries++;
+                s_wr_errs = 0;
+                ESP_LOGW(TAG, "I2S write wedged -> rebuilding channel "
+                              "(%u/%u, stalls %u)",
+                         (unsigned)s_rebuild_tries,
+                         (unsigned)AUDIO_MAX_REBUILD_TRIES,
+                         (unsigned)s_stall_total);
+                esp_err_t rb = hw_audio_rebuild_i2s();
+                if (rb != ESP_OK) {
+                    ESP_LOGE(TAG, "I2S rebuild failed: %s", esp_err_to_name(rb));
+                }
+            }
+            else if (s_rebuild_tries == AUDIO_MAX_REBUILD_TRIES) {
+                /* Budget exhausted: say so (once, by bumping the counter past
+                 * the threshold) rather than rebuilding forever. */
+                s_rebuild_tries++;
+                ESP_LOGE(TAG, "[ERROR] I2S still wedged after %u rebuilds "
+                              "(%u stalled writes): no more recovery, "
+                              "aborting to the player",
+                         (unsigned)AUDIO_MAX_REBUILD_TRIES,
+                         (unsigned)s_stall_total);
             }
         }
         return AUDIO_WRITE_STALLED;
     }
-    s_rebuild_done = false;   /* healthy write: a future wedge may rebuild */
+    /* Healthy write: the DMA is producing credits again, so restore the full
+     * rebuild budget — the next wedge (if any) gets a fresh set of attempts. */
+    s_rebuild_tries = 0;
     s_wr_errs = 0;
     return AUDIO_WRITE_OK;
 }
