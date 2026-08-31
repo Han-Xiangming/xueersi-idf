@@ -14,17 +14,22 @@
  * auto_clear) is the jitter buffer and paces the decoder by back-pressure,
  * so decode and hardware clock can never run away from each other.
  *
- * Channel lifecycle is a simple on/off:
- *   - parked (disabled) while idle or on the Bluetooth route: no BCLK/LRC
- *     is generated and the MAX98357 drops into its power-down state, so
- *     there is no idle current draw;
- *   - enabled by the first PCM write of a speaker session — AFTER the
- *     sample-rate reconfig, so the clock never starts ahead of the data;
- *   - parked again by hw_audio_set_player_active(false) or a route switch.
+ * Channel lifecycle: the channel is enabled ONCE, by the first PCM write, and
+ * then left RUNNING for the whole session. It is only ever stopped when audio
+ * is genuinely not in use — switching the route to Bluetooth — or to rebuild it
+ * after a fault.
+ *
+ * It is deliberately NOT parked between tracks or on pause/stop: on ESP32 the
+ * out-link stop is asynchronous and the following start's reset pulse may not
+ * latch, so a stop-then-restart can wedge the DMA for the rest of the boot
+ * (see the block comment above hw_audio_set_player_active). Idle output is
+ * handled by auto_clear instead, which zeroes each descriptor as it is
+ * transmitted, so an un-fed ring clocks out digital silence.
+ *
  * All channel operations are serialized by s_io_lock, and the IDF driver
  * itself releases an in-flight write when the channel is disabled
  * (i2s_common.c: i2s_channel_disable sets the state to READY and waits for
- * the write loop to exit), so stopping or re-routing from any task is safe.
+ * the write loop to exit), so re-routing or rebuilding from any task is safe.
  */
 #define LOG_LOCAL_LEVEL ESP_LOG_INFO    /* keep detailed audio tracing out unless explicitly set to DEBUG at compile time */
 #include "board_config.h"
@@ -51,6 +56,24 @@ static const char *TAG = "hw_audio";
  * zero chunk per descriptor is enough to silence the whole ring. */
 #define I2S_DMA_DESC_NUM    12
 
+/* How long the I2S write may block waiting for a free DMA descriptor (ms).
+ * The wait is back-pressure: the out-EOF ISR returns one descriptor (1024
+ * frames) at a time — 23 ms at 44.1 kHz, only 64 ms even at 16 kHz — so this
+ * leaves a very large margin for SD/BT jitter while still surfacing a genuine
+ * wedge quickly, and stays far below the player's 12 s stall watchdog. */
+#define I2S_WRITE_TIMEOUT_MS    1200
+
+/* Timeout for EVERY s_io_lock acquisition (ms). It must exceed the longest
+ * time a writer can hold the lock, i.e. I2S_WRITE_TIMEOUT_MS: a contender
+ * that gives up shorter SILENTLY SKIPS its own state change (park, rate
+ * switch, route switch, rebuild), which desyncs our s_i2s_enabled shadow flag
+ * from the driver's real channel state. That desync is what made
+ * i2s_del_channel() refuse to delete a RUNNING channel and, after the handle
+ * was dropped anyway, killed audio for the rest of the boot. Every lock taker
+ * therefore uses this one bound; the 250 ms figures were shorter than the
+ * 300 ms write they were competing with. */
+#define AUDIO_IO_LOCK_TIMEOUT_MS    (I2S_WRITE_TIMEOUT_MS + 300)
+
 /* Speaker-protection high-pass cutoff (Hz).
  *
  * Current speaker specs (racetrack phone unit):
@@ -74,10 +97,11 @@ static volatile bool s_player_active;    /* MP3 player owns the I2S bus */
 static audio_route_t s_route = AUDIO_ROUTE_SPEAKER;
 
 /* Tracks whether the I2S channel is currently enabled (generating BCLK/LRC).
- * The channel is parked (i2s_channel_disable) whenever nothing is being
- * played or the audio is routed to Bluetooth, so the MAX98357 drops into
- * its power-down state — it shuts down ~64k BCLK cycles after the clock
- * stops. All reads/writes are serialized by s_io_lock. */
+ * Once enabled it stays enabled for the whole session: the channel is only
+ * parked when audio is routed to Bluetooth, or while being rebuilt after a
+ * fault (see the block comment above hw_audio_set_player_active — parking and
+ * restarting at runtime is what can wedge the ESP32 out-link). All
+ * reads/writes are serialized by s_io_lock. */
 static bool s_i2s_enabled;
 
 /* Serializes all channel operations (enable/disable/rate-reconfig/write).
@@ -258,7 +282,8 @@ static void audio_apply_route(audio_route_t route)
     audio_dsp_reset();
     s_vol_gain_sm = s_vol_gain;   /* no fade-in on route switch */
     if (audio_route_is_bt() && s_ready) {
-        if (xSemaphoreTake(s_io_lock, pdMS_TO_TICKS(250)) == pdTRUE) {
+        if (xSemaphoreTake(s_io_lock,
+                           pdMS_TO_TICKS(AUDIO_IO_LOCK_TIMEOUT_MS)) == pdTRUE) {
             if (s_i2s_enabled) {
                 if (i2s_channel_disable(s_tx) != ESP_OK) {
                     ESP_LOGW(TAG, "I2S park failed (route -> bt)");
@@ -388,28 +413,50 @@ static void audio_dsp_reset(void)
     s_lim_gain = 32768;
 }
 
-/* Fill every DMA descriptor with silence while the channel is READY (parked)
- * or RUNNING. The descriptors' buffers are DRAM, so this works regardless of
- * channel state; the next enable clocks out silence instead of a previous
- * track's tail. Each descriptor holds 1024 frames x 4 bytes = 4096 bytes, so
- * one chunk per descriptor silences the whole ring. Caller holds s_io_lock
- * and s_tx != NULL. */
-static void audio_silence_dma_ring(void)
-{
-    static const uint8_t s_zero_dma[4096] = {0};
-    for (int i = 0; i < I2S_DMA_DESC_NUM; i++) {
-        size_t loaded = 0;
-        i2s_channel_preload_data(s_tx, s_zero_dma, sizeof(s_zero_dma), &loaded);
-        if (loaded < sizeof(s_zero_dma)) {
-            break;   /* ring full of silence */
-        }
-    }
-}
+/* (The DMA-ring preload helper that used to live here is gone: it only existed
+ * to hide a previous track's tail across a park, and the channel is no longer
+ * parked at runtime — auto_clear zeroes each descriptor as it is transmitted,
+ * so the ring erases its own tail. See the block comment below.) */
 
-/* Mark/unmark the MP3 player as the owner of the I2S bus. On release the
- * channel is parked immediately (BCLK stops, the MAX98357 powers down); on
- * claim only the flags/DSP are set up — the channel is actually enabled by
- * the first PCM write, so the clock never starts ahead of the data. */
+/* ---------------------------------------------------------------------------
+ * WHY THE I2S CHANNEL IS NEVER STOPPED AT RUNTIME
+ *
+ * On ESP32 the I2S out-link stop is ASYNCHRONOUS: i2s_tx_channel_stop() (and
+ * i2s_ll_tx_stop_link) sets out_link.stop with no completion wait, and the
+ * next i2s_tx_channel_start() re-arms the link with i2s_hal_tx_reset() /
+ * i2s_hal_tx_reset_dma(), whose single-cycle pulse may not latch while the
+ * module clock is off. A stop-then-restart can therefore leave the out-link
+ * FSM wedged — the DMA never runs again, so:
+ *
+ *   - no out-EOF interrupt ever fires,
+ *   - i2s_channel_disable() resets the TX descriptor credit queue and
+ *     i2s_channel_enable() does NOT refill it (only the RX path is reset),
+ *   - so i2s_channel_write() blocks on xQueueReceive() for a credit that can
+ *     never arrive, times out, and returns STALLED for the rest of the boot.
+ *
+ * That is exactly the reported failure: "sometimes fine after power-on, later
+ * playback dead, log goes quiet, only over I2S". Bluetooth is never affected
+ * because it never touches the I2S DMA (bt_audio_write_pcm() goes straight to
+ * the A2DP ring).
+ *
+ * The fix is structural: enable the channel ONCE (on the first write) and
+ * leave it RUNNING for the whole session. Idle output is handled by
+ * auto_clear = true — i2s_dma_tx_callback() memsets each descriptor buffer
+ * after it has been transmitted, so an un-fed ring clocks out true digital
+ * silence (no buzz) and the previous track's tail is erased as the ring
+ * drains, with no stop/start at all.
+ *
+ * Cost: BCLK keeps running while idle, so the MAX98357 stays out of shutdown
+ * (a few mA). That is the deliberate trade for not gambling on the out-link.
+ * The channel is still parked when the speaker is genuinely not in use for a
+ * long time — i.e. when the route switches to Bluetooth.
+ * ------------------------------------------------------------------------- */
+
+/* Mark/unmark the MP3 player as the owner of the I2S bus. On claim only the
+ * flags/DSP are set up — the channel is enabled by the first PCM write, so
+ * the clock never starts ahead of the data. On release the channel is NOT
+ * parked (see the block comment above): it keeps clocking auto_clear silence
+ * so a later resume needs no out-link restart. */
 void hw_audio_set_player_active(bool active)
 {
     /* 原则3：audio 未 ready（I2S/互斥锁未建好）时禁止启动播放。 */
@@ -426,31 +473,21 @@ void hw_audio_set_player_active(bool active)
         ESP_LOGI(TAG, "[PLAYER] audio pipeline ready");
     }
     else {
-        /* Park the channel. Safe against a concurrent write: the lock
-         * serializes with the in-flight i2s_channel_write, and the IDF
-         * driver itself releases that write when the channel state flips
-         * to READY (i2s_common.c i2s_channel_disable). */
-        if (xSemaphoreTake(s_io_lock, pdMS_TO_TICKS(250)) == pdTRUE) {
-            if (s_i2s_enabled) {
-                if (i2s_channel_disable(s_tx) != ESP_OK) {
-                    ESP_LOGW(TAG, "I2S park failed");
-                }
-                s_i2s_enabled = false;
-                s_last_write_us = 0;
-            }
-            /* Clear the DMA ring's residual audio now. The descriptor buffers
-             * still hold the PREVIOUS track's tail after a park, and the next
-             * hw_audio_write_pcm re-enables the channel from this ring — so
-             * without this the old tail clocks out first as "余音" on the next
-             * track. Silencing leaves a clean, silent ring ready for re-enable.
-             * Harmless on pause too (the channel is parked, so silence is what
-             * the gap plays anyway). */
-            if (s_tx != NULL) {
-                audio_silence_dma_ring();
-            }
-            xSemaphoreGive(s_io_lock);
-        }
-        ESP_LOGD(TAG, "player inactive: I2S parked");
+        /* Leave the channel RUNNING — see the block comment above this
+         * function. Parking it here was the out-link stop/start that could
+         * wedge the DMA for the rest of the boot.
+         *
+         * Nothing else is needed for a clean stop: s_player_active = false
+         * makes every hw_audio_write_pcm() return immediately, and auto_clear
+         * zeroes each descriptor as it is transmitted, so the queued tail is
+         * replaced by silence and the ring drains by itself. That is also what
+         * removes the "余音" of the previous track — by the time the next track
+         * starts (a button press later) the ring is silent.
+         *
+         * The underrun bookkeeping is reset so the deliberate idle gap is not
+         * counted as a write gap. */
+        s_last_write_us = 0;
+        ESP_LOGD(TAG, "player inactive: I2S left running (auto_clear silence)");
     }
 }
 
@@ -481,11 +518,19 @@ static esp_err_t audio_create_channel(void)
     esp_err_t err = i2s_new_channel(&chan_cfg, &s_tx, NULL);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "I2S channel init failed: %s", esp_err_to_name(err));
+        s_tx = NULL;   /* invariant: on any failure s_tx stays NULL */
         return err;
     }
 
+    /* Clock the fresh channel at the CURRENT rate, not the compile-time
+     * default: hw_audio_rebuild_i2s() can run mid-track, and s_rate is only
+     * pushed to the hardware by hw_audio_set_sample_rate() — which the player
+     * calls once per track, so it would NOT be re-applied after a rebuild.
+     * Initialising at AUDIO_DEFAULT_RATE therefore left a 48 kHz (or 32 kHz)
+     * track playing through a 44.1 kHz clock: correct audio, wrong pitch. */
+    const uint32_t init_rate = (s_rate != 0) ? s_rate : AUDIO_DEFAULT_RATE;
     i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_DEFAULT_RATE),
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(init_rate),
         .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
                                                      I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
@@ -499,6 +544,12 @@ static esp_err_t audio_create_channel(void)
     err = i2s_channel_init_std_mode(s_tx, &std_cfg);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "I2S std init failed: %s", esp_err_to_name(err));
+        /* Tear the half-built channel down again: leaving a valid but
+         * UNINITIALIZED handle in s_tx makes the next rebuild start from a
+         * dirty state (and i2s_new_channel() would then find no free channel).
+         * On any failure s_tx must be NULL so a retry is always clean. */
+        i2s_del_channel(s_tx);
+        s_tx = NULL;
         return err;
     }
     /* Channel left PARKED (no boot-time enable->disable probe; see the
@@ -553,31 +604,63 @@ void hw_audio_init(void)
  * leaves s_tx NULL, and this path can still bring the channel up. */
 esp_err_t hw_audio_rebuild_i2s(void)
 {
-    if (!s_ready || s_io_lock == NULL) {
+    /* Only the mutex is a prerequisite. s_ready is deliberately NOT checked:
+     * a failed rebuild sets s_ready = false, and this function IS the recovery
+     * for exactly that state — gating it on s_ready would make audio
+     * unrecoverable for the rest of the boot (see player_play()). */
+    if (s_io_lock == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
     /* Safe to run mid-playback: a write in flight holds s_io_lock, so taking it
      * here proves the DMA is idle; the caller (hw_audio_write_pcm) only
      * triggers a rebuild after a write has returned STALLED. */
-    if (xSemaphoreTake(s_io_lock, pdMS_TO_TICKS(250)) != pdTRUE) {
+    if (xSemaphoreTake(s_io_lock,
+                       pdMS_TO_TICKS(AUDIO_IO_LOCK_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGW(TAG, "i2s lock busy, rebuild skipped");
         return ESP_ERR_TIMEOUT;
     }
     /* Park the old channel (if any) before tearing it down. A wedged DMA
      * surfaces as a timed-out write that already released the lock, so the
-     * driver-side disable below is safe. */
+     * driver-side disable below is safe.
+     *
+     * The disable is deliberately UNCONDITIONAL, not gated on our s_i2s_enabled
+     * shadow flag: i2s_del_channel() REFUSES to delete a RUNNING channel
+     * (ESP_ERR_INVALID_STATE), so any desync between the shadow flag and the
+     * driver's real state left a RUNNING channel here, the delete failed, and
+     * the old code then nulled s_tx ANYWAY — leaking the registered driver
+     * channel. Every later i2s_new_channel() then failed with ESP_ERR_NOT_FOUND
+     * ("no free channel"), s_ready was forced false, and audio was dead for the
+     * REST OF THE BOOT with no way back. That is the "plays at first, then
+     * nothing, only over I2S" failure. Disabling unconditionally removes the
+     * desync class entirely (ESP_ERR_INVALID_STATE just means "already
+     * parked"), so the delete always succeeds. */
     if (s_tx != NULL) {
-        if (s_i2s_enabled) {
-            if (i2s_channel_disable(s_tx) != ESP_OK) {
-                ESP_LOGW(TAG, "I2S park failed before rebuild");
-            }
-            s_i2s_enabled = false;
-            s_last_write_us = 0;
+        esp_err_t de = i2s_channel_disable(s_tx);
+        if (de != ESP_OK && de != ESP_ERR_INVALID_STATE) {
+            /* The channel may still be RUNNING. i2s_del_channel() frees the
+             * descriptor buffers and DELETES msg_queue before it frees the
+             * interrupt (see i2s_common.c): tearing that down without a
+             * confirmed stop lets the still-enabled out-EOF ISR touch freed
+             * memory, which crashes or locks the CPU solid. Keep the channel
+             * and give up on this rebuild instead. */
+            ESP_LOGE(TAG, "I2S park failed before rebuild: %s (aborting)",
+                     esp_err_to_name(de));
+            xSemaphoreGive(s_io_lock);
+            return de;
         }
+        s_i2s_enabled = false;
+        s_last_write_us = 0;
         esp_err_t e = i2s_del_channel(s_tx);
         if (e != ESP_OK) {
-            ESP_LOGE(TAG, "I2S channel delete failed: %s",
+            /* NEVER drop the handle on a failed delete: the driver still owns
+             * that channel, and losing the only pointer to it leaks it for
+             * good (no future i2s_new_channel() can ever succeed). Keeping the
+             * old channel means playback continues on a working bus instead of
+             * silently killing audio for the rest of the session. */
+            ESP_LOGE(TAG, "I2S channel delete failed: %s (keeping channel)",
                      esp_err_to_name(e));
+            xSemaphoreGive(s_io_lock);
+            return e;
         }
         s_tx = NULL;
     }
@@ -587,6 +670,10 @@ esp_err_t hw_audio_rebuild_i2s(void)
         xSemaphoreGive(s_io_lock);
         return e;
     }
+    /* The channel is back, so the bus is usable again even if a previous
+     * rebuild had marked it dead. Without this the recovery in player_play()
+     * could rebuild successfully and still be told audio is not ready. */
+    s_ready = true;
     /* Recompute everything that depends on the (possibly changed) sample
      * rate and start the DSP history clean, settled at the current gains
      * (no fade-in on the first track after the rebuild). */
@@ -740,40 +827,20 @@ float hw_audio_get_master_gain_db(void)
 /* Reconfigure the I2S sample rate. Applied IMMEDIATELY from the calling task
  * (the MP3 player's decode task — the only user), so the new clock is in
  * place before the first PCM of a track reaches the DMA; there is no
- * deferred/pending rate that a pause/stop could lose. The driver requires
- * the READY (disabled) state for a reconfig, so a running channel is parked
- * first — the next write re-enables it at the new rate. */
+ * deferred/pending rate that a pause/stop could lose.
+ *
+ * The driver requires the READY (disabled) state for a reconfig, so the old
+ * implementation parked the channel and let the next write re-enable it — a
+ * full out-link stop-then-restart, the cycle that can wedge the ESP32
+ * out-link for the rest of the boot. Instead we now adopt the new rate and
+ * REBUILD the channel, so the new clock runs on a never-enabled channel whose
+ * first start is the reliable path (the same one that works after power-on).
+ * Only a genuine rate change reaches this code; a same-rate track returns at
+ * the top, so a uniform library never cycles the channel at all. */
 void hw_audio_set_sample_rate(uint32_t sample_rate_hz)
 {
     if (!s_ready || sample_rate_hz == 0 || sample_rate_hz == s_rate) {
         return;
-    }
-    if (xSemaphoreTake(s_io_lock, pdMS_TO_TICKS(250)) != pdTRUE) {
-        ESP_LOGW(TAG, "i2s lock busy, rate change skipped (%u Hz)",
-                 (unsigned)sample_rate_hz);
-        return;
-    }
-    if (s_i2s_enabled) {
-        if (i2s_channel_disable(s_tx) != ESP_OK) {
-            ESP_LOGW(TAG, "I2S park failed before rate change");
-        }
-        s_i2s_enabled = false;
-        s_last_write_us = 0;
-    }
-    /* Fill the DMA ring with silence while the channel is READY: the next
-     * enable clocks out whatever the descriptors hold, and stale samples
-     * recorded at the OLD rate would come out as a pitch-shifted squeal at
-     * the new clock (this is the audible chirp at every track change). Each
-     * descriptor holds 1024 frames x 4 bytes = 4096 bytes, so one chunk per
-     * descriptor silences the whole ring. */
-    audio_silence_dma_ring();
-    i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate_hz);
-    esp_err_t e = i2s_channel_reconfig_std_clock(s_tx, &clk);
-    xSemaphoreGive(s_io_lock);
-    if (e != ESP_OK) {
-        ESP_LOGE(TAG, "I2S rate reconfig to %u Hz failed: %s",
-                 (unsigned)sample_rate_hz, esp_err_to_name(e));
-        return;   /* keep the previous clock; playback may be off-pitch */
     }
     s_rate = sample_rate_hz;
     audio_set_hpf_coeff(s_rate);
@@ -781,26 +848,27 @@ void hw_audio_set_sample_rate(uint32_t sample_rate_hz)
     if (audio_route_is_bt()) {
         bt_audio_set_sample_rate(sample_rate_hz);
     }
-    ESP_LOGI(TAG, "I2S rate -> %u Hz", (unsigned)s_rate);
+    ESP_LOGI(TAG, "I2S rate -> %u Hz (rebuilding channel)", (unsigned)s_rate);
+    if (hw_audio_rebuild_i2s() != ESP_OK) {
+        ESP_LOGE(TAG, "I2S rebuild for rate change failed: playback may be "
+                      "off-pitch until the next track");
+    }
 }
 
 /* Drop the previous pass's queued audio so a repeat-one replay starts clean.
  *
  * Bluetooth: the stale tail lives in the PCM ring, so really flush it.
  *
- * Speaker (I2S): the DMA ring IS the only buffer, and its descriptor QUEUE and
- * free-list are NOT reset by auto_clear (auto_clear only zeroes transmitted
- * data). A repeat-one seam that merely left the channel running therefore kept
- * the PREVIOUS pass's tail in the queue — and if that queue had desynced from
- * the writer (the ring drained, the ISR dropped entries), the next write would
- * clock stale audio or never see back-pressure and the pipeline-error detector
- * went blind. That is exactly the I2S-only failure (Bluetooth flushes its ring
- * here, so it never shows it). So for the speaker route we PARK the channel,
- * refill the whole ring with silence, and re-enable: the next write starts from
- * a clean, empty DMA. This is a single disable->enable while the channel is
- * RUNNING (not freshly inited), the same safe cycle hw_audio_set_sample_rate
- * uses — it cannot wedge the out-link the way the boot-time double toggle could.
- * The underrun bookkeeping is also reset so the deliberate seam pause is not
+ * Speaker (I2S): NOTHING is done to the channel. This used to park it, refill
+ * the whole DMA ring with silence and re-enable it — a full out-link
+ * stop/start on EVERY repeat-one seam, which is precisely the cycle that can
+ * wedge the ESP32 out-link for the rest of the boot (see the block comment
+ * above hw_audio_set_player_active). It was also unnecessary: auto_clear
+ * zeroes each descriptor once the DMA has transmitted it, so as the ring
+ * drains the old pass's tail is replaced by silence on its own, and the new
+ * pass is written straight behind it. No stop/start, no chirp, no wedge.
+ *
+ * The underrun bookkeeping is reset so the deliberate seam pause is not
  * flagged as an I2S write gap. Call from the task that owns PCM writes. */
 void hw_audio_pipeline_flush(void)
 {
@@ -809,35 +877,8 @@ void hw_audio_pipeline_flush(void)
         bt_audio_flush_pcm_ring();
         return;
     }
-    /* Speaker route: clean-restart the DMA ring. */
-    if (xSemaphoreTake(s_io_lock, pdMS_TO_TICKS(250)) == pdTRUE) {
-        if (s_tx != NULL) {
-            bool was_enabled = s_i2s_enabled;
-            if (was_enabled) {
-                if (i2s_channel_disable(s_tx) != ESP_OK) {
-                    ESP_LOGW(TAG, "I2S park failed in pipeline flush");
-                }
-                s_i2s_enabled = false;
-            }
-            /* Fill every descriptor with silence so the re-enabled channel
-             * clocks silence (not the previous pass's tail) until the next
-             * write. */
-            audio_silence_dma_ring();
-            if (was_enabled) {
-                esp_err_t e = i2s_channel_enable(s_tx);
-                if (e != ESP_OK) {
-                    ESP_LOGW(TAG, "I2S re-enable failed in pipeline flush: %s",
-                             esp_err_to_name(e));
-                } else {
-                    s_i2s_enabled = true;
-                    s_rebuild_done = false;   /* fresh channel session */
-                    ESP_LOGI(TAG, "I2S flushed + re-enabled (session #%u)",
-                             (unsigned)++s_enable_count);
-                }
-            }
-        }
-        xSemaphoreGive(s_io_lock);
-    }
+    /* Speaker route: the channel keeps running; auto_clear drains it to
+     * silence. Deliberately no i2s_channel_disable()/enable() here. */
 }
 
 /* Stream decoded 16-bit stereo PCM (L,R interleaved). `frames` = number of
@@ -881,7 +922,8 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
     if (bt_out) {
         /* Park the speaker path while Bluetooth plays: no BCLK, amp off. */
         if (s_i2s_enabled) {
-            if (xSemaphoreTake(s_io_lock, pdMS_TO_TICKS(250)) == pdTRUE) {
+            if (xSemaphoreTake(s_io_lock,
+                               pdMS_TO_TICKS(AUDIO_IO_LOCK_TIMEOUT_MS)) == pdTRUE) {
                 if (s_i2s_enabled) {
                     i2s_channel_disable(s_tx);
                     s_i2s_enabled = false;
@@ -1008,9 +1050,11 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
 
     size_t bytes = frames * 4;
     /* Serialize with stop/park requests from other tasks: the lock is held
-     * only around the driver calls, and a concurrent holder takes at most
-     * one bounded 300 ms write, so 500 ms is ample. */
-    if (xSemaphoreTake(s_io_lock, pdMS_TO_TICKS(500)) != pdTRUE) {
+     * only around the driver calls, and a concurrent holder takes at most one
+     * bounded I2S_WRITE_TIMEOUT_MS write, so AUDIO_IO_LOCK_TIMEOUT_MS (which
+     * is defined above it) is always ample. */
+    if (xSemaphoreTake(s_io_lock,
+                       pdMS_TO_TICKS(AUDIO_IO_LOCK_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGW(TAG, "i2s lock busy (timeout)");
         return AUDIO_WRITE_STALLED;
     }
@@ -1048,29 +1092,53 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
         s_rebuild_done = false;   /* fresh channel session: allow a rebuild */
         ESP_LOGI(TAG, "I2S enabled (session #%u)", (unsigned)++s_enable_count);
     }
+    /* Write timeout, in MILLISECONDS: i2s_channel_write() converts it
+     * internally with pdMS_TO_TICKS(), so passing pdMS_TO_TICKS(300) here
+     * double-converted the value (harmless at the current 1 kHz tick, a 10x
+     * shorter timeout at 100 Hz).
+     *
+     * The wait is back-pressure: the write blocks until the out-EOF ISR
+     * returns one free descriptor (1024 frames — 23 ms at 44.1 kHz, still only
+     * 64 ms at 16 kHz). The old fixed 300 ms sat within ~4-5 descriptor times
+     * of that legitimate wait, so ordinary jitter (SD read, Bluetooth
+     * activity, GC) was misread as a wedged DMA and triggered a full channel
+     * rebuild — the churn that wedges the ESP32 out-link. 1200 ms is far above
+     * any real back-pressure wait yet still well under the 12 s player stall
+     * watchdog, so a genuine wedge still surfaces. */
+    const uint32_t wr_timeout_ms = I2S_WRITE_TIMEOUT_MS;
     size_t w = 0;
     esp_err_t e = i2s_channel_write(s_tx, stereo_frames, bytes, &w,
-                                    pdMS_TO_TICKS(300));
+                                    wr_timeout_ms);
     s_last_write_us = esp_timer_get_time();
     xSemaphoreGive(s_io_lock);
     /* A stop/pause landed mid-write: the partial frame is not an error. */
     if (!s_player_active) {
         return AUDIO_WRITE_ABANDONED;
     }
-    if (e != ESP_OK || w != bytes) {
+    /* The driver exits its write loop with ESP_OK and a SHORT byte count when
+     * the channel stops being RUNNING underneath it (stop / pause / route
+     * switch: i2s_common.c breaks on state != RUNNING). That is a normal
+     * teardown, NOT a wedged DMA — classifying it as a pipeline error made a
+     * user stop look like a hardware fault and rebuilt the channel for
+     * nothing. Only a genuine driver error is a fault. */
+    if (e == ESP_OK && w != bytes) {
+        return AUDIO_WRITE_ABANDONED;
+    }
+    if (e != ESP_OK) {
         if (++s_wr_errs >= 4) {
             /* Classify the failure so the root cause is obvious from the log:
              * ESP_ERR_INVALID_STATE = the channel is not enabled (the binary
              * semaphore was never given: enable() failed, or the channel was
              * parked); ESP_ERR_TIMEOUT = the DMA is not consuming (the write
-             * blocked the full 300 ms for a free descriptor). */
+             * blocked the full timeout for a free descriptor). */
             const char *why = (e == ESP_ERR_INVALID_STATE)
                 ? "channel not enabled (binary not given)"
                 : (e == ESP_ERR_TIMEOUT)
                     ? "DMA not consuming (write timed out)"
                     : esp_err_to_name(e);
-            ESP_LOGE(TAG, "[ERROR] I2S write failed: %s (%u/%u bytes)",
-                     why, (unsigned)w, (unsigned)bytes);
+            ESP_LOGE(TAG, "[ERROR] I2S write failed: %s (%u/%u bytes, %u ms)",
+                     why, (unsigned)w, (unsigned)bytes,
+                     (unsigned)wr_timeout_ms);
             s_wr_errs = 0;
         }
         /* A wedged DMA (channel enabled but writes keep timing out / returning
