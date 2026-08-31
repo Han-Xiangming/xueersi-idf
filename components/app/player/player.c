@@ -668,8 +668,20 @@ static void parse_id3v2(void)
     hw_audio_set_track_gain_db(gain);
 }
 
+/* Forward declaration: open_track() must be able to release a previous pass. */
+static void close_track(void);
+
 static bool open_track(void)
 {
+    /* Release anything left over from a previous pass BEFORE overwriting the
+     * handles. open_track() is reachable without a matching close_track():
+     * the repeat-one seam rewinds the source IN PLACE (s_src.fp and s_dec stay
+     * valid) and then re-enters the track loop, which calls open_track() again.
+     * Overwriting them leaked one file descriptor AND one heap-allocated helix
+     * decoder per loop, so repeat-one managed only a handful of passes before
+     * fopen()/MP3InitDecoder() started failing — the "单曲循环" failure. */
+    close_track();
+
     s_src.fp = fopen(s_path, "rb");
     if (s_src.fp == NULL) {
         ESP_LOGE(TAG, "open %s failed", s_path);
@@ -1030,15 +1042,19 @@ static void decode_loop(void)
                      s_stop_req ? "stopped by user"
                                 : s_track_errored ? "aborted (error)"
                                                   : "reached EOF");
-            /* Single-track loop: replay the SAME file IN PLACE — rewind the
-             * source, rebuild the decoder, reset the decode state and start
-             * decoding again. No request round-trip (which would re-open the
-             * file and stop/start the clock) is involved; instead the old
-             * pass's tail is flushed and the task waits out REPEAT_ONE_GAP_MS
-             * while the channel clocks silence, so the replay starts from a
-             * clean boundary rather than the previous pass's ending bleeding
-             * straight into it. Only a clean EOF replays: a corrupt/pipeline
-             * failure falls through to the error path. */
+            /* Single-track loop: replay the SAME file. rewind_track() rewinds
+             * the source and rebuilds the decoder, then the `continue` below
+             * re-enters the OUTER track loop (the inner decode while has
+             * already closed here), so open_track() opens the same path again
+             * — it now releases the previous pass first (see open_track), so
+             * nothing leaks across passes.
+             *
+             * The seam pause lets the previous pass's tail drain out of the DMA
+             * ring (auto_clear turns it into silence) before the new pass's PCM
+             * is queued, so the ending does not bleed into the replay. The
+             * clock is NOT stopped and restarted — see the out-link note in
+             * audio.c. Only a clean EOF replays: a corrupt/pipeline failure
+             * falls through to the error path. */
             if (!s_stop_req && !s_new_req && !s_track_errored &&
                 s_repeat == PLAYER_REPEAT_ONE) {
                 if (!rewind_track()) {
@@ -1046,18 +1062,12 @@ static void decode_loop(void)
                     s_track_errored = true;
                 }
                 else {
-                    /* Clean-restart the pipeline for the next pass: BT flushes
-                     * its PCM ring, and the speaker route now parks + refills
-                     * its DMA ring with silence + re-enables (see
-                     * hw_audio_pipeline_flush) so the descriptor queue cannot
-                     * desync between passes. Then wait out the seam gap; the
-                     * channel clocks silence meanwhile. */
+                    /* BT flushes its PCM ring; the speaker route just drains
+                     * (see hw_audio_pipeline_flush). */
                     hw_audio_pipeline_flush();
                     vTaskDelay(pdMS_TO_TICKS(REPEAT_ONE_GAP_MS));
-                    frame_cnt = 0;
-                    rate_set = false;
                     ESP_LOGI(TAG, "repeat one: replaying '%s'", s_name);
-                    continue;   /* back into the decode while: same file */
+                    continue;   /* re-enter the track loop with the same file */
                 }
             }
             close_track();
@@ -1123,9 +1133,13 @@ static void decode_loop(void)
         continue;
     }
     /* Decode loop is leaving for good (stop / watchdog / too many failures):
-     * release the I2S bus so the amp powers down and the BT route can take
-     * over. (Track switches deliberately do NOT park — see close_track().) */
+     * release the I2S bus and PARK it, so the amp powers down, the out-EOF
+     * interrupt stops and the BT route can take over. This is the ONE place a
+     * stop/start cycle is acceptable — continuous playback (track switches,
+     * pause/resume, single-track loop) deliberately never parks; see
+     * hw_audio_park() and close_track(). */
     hw_audio_set_player_active(false);
+    hw_audio_park();
     s_state = PLAYER_IDLE;
     s_in_decode_loop = false;
 }

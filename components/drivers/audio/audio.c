@@ -491,6 +491,40 @@ void hw_audio_set_player_active(bool active)
     }
 }
 
+/* Really stop the I2S channel: park it and disable the out-EOF interrupt.
+ *
+ * Call this ONLY when audio is genuinely finished — when the decode loop exits
+ * (stop / watchdog / give-up). It is deliberately NOT called on pause or
+ * between tracks: every disable/enable is an out-link stop-then-restart, the
+ * cycle that can wedge the ESP32 DMA (see the block comment above
+ * hw_audio_set_player_active).
+ *
+ * It also matters for interrupt exposure: while the channel is enabled the
+ * out-EOF ISR fires ~43 times/s FOREVER, so leaving it running around the
+ * clock (which is what plain "never park" would do) keeps that ISR in play
+ * during long idle periods too. Stopping here keeps continuous playback —
+ * including single-track loop and list auto-advance — completely free of
+ * stop/start cycles while still powering the amp down when playback ends. */
+void hw_audio_park(void)
+{
+    if (!s_ready || s_tx == NULL) {
+        return;
+    }
+    if (xSemaphoreTake(s_io_lock,
+                       pdMS_TO_TICKS(AUDIO_IO_LOCK_TIMEOUT_MS)) == pdTRUE) {
+        if (s_i2s_enabled) {
+            if (i2s_channel_disable(s_tx) != ESP_OK) {
+                ESP_LOGW(TAG, "I2S park failed");
+            }
+            s_i2s_enabled = false;
+            s_last_write_us = 0;
+            ESP_LOGD(TAG, "I2S parked (session #%u ended)",
+                     (unsigned)s_enable_count);
+        }
+        xSemaphoreGive(s_io_lock);
+    }
+}
+
 bool hw_audio_is_ready(void)
 {
     return s_ready && (s_tx != NULL) && (s_io_lock != NULL);

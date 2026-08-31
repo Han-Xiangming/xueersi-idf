@@ -81,10 +81,18 @@ float hw_audio_get_master_gain_db(void);
 void hw_audio_set_sample_rate(uint32_t sample_rate_hz);
 
 /* Mark/unmark the MP3 player as the owner of the I2S bus. Claiming only
- * arms the pipeline (the channel is enabled by the first PCM write);
- * releasing parks the channel immediately (BCLK stops, amp powers down).
- * Safe to call from any task, including while a write is in flight. */
+ * arms the pipeline (the channel is enabled by the first PCM write).
+ * Releasing does NOT park the channel: it keeps clocking auto_clear silence so
+ * pause/resume and track switches need no out-link stop/start (see the note
+ * in audio.c). Safe to call from any task, including while a write is in
+ * flight. */
 void hw_audio_set_player_active(bool active);
+
+/* Really park the I2S channel (BCLK stops, amp powers down, out-EOF interrupt
+ * disabled). Call ONLY when playback is finished for good — i.e. when the
+ * decode loop exits — never on pause or between tracks. Safe to call from any
+ * task; a no-op when the channel is already parked. */
+void hw_audio_park(void);
 
 /* Drop what the previous pass left queued in the output pipeline and reset the
  * underrun bookkeeping, so the next PCM write starts a clean pass. Used at
