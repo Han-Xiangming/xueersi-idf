@@ -1013,10 +1013,20 @@ static void decode_loop(void)
                      * stale notify here is harmless; only a real resume
                      * (player_toggle clears s_pause_req), a stop, or a new
                      * track request (UI next/prev while paused) exits. The
-                     * 2 s timeout still lets the WDT feed run while paused. */
+                     * 2 s timeout still lets the WDT feed run while paused.
+                     *
+                     * s_decode_beat_ms is deliberately NOT refreshed in here.
+                     * A real pause puts s_state in PLAYER_PAUSED, which the
+                     * stall watchdog skips, so refreshing bought nothing for
+                     * the legitimate case — while it did hide the broken one:
+                     * a pause flag left stuck with s_state still PLAYING spun
+                     * here forever, silent and audio-less, with the beat kept
+                     * fresh so the watchdog stayed quiet and the RTC watchdog
+                     * kept being fed (no reset either) — the "frozen log,
+                     * never recovers" failure. Letting the beat go stale makes
+                     * that state visible and self-recovering instead. */
+                    ESP_LOGI(TAG, "paused: waiting for resume");
                     while (s_pause_req && !s_stop_req && !s_new_req) {
-                        s_decode_beat_ms =
-                            (uint32_t)(esp_timer_get_time() / 1000);
 #if defined(CONFIG_ESP_TASK_WDT_EN)
                         esp_task_wdt_reset();
 #endif
@@ -1140,6 +1150,15 @@ static void decode_loop(void)
      * hw_audio_park() and close_track(). */
     hw_audio_set_player_active(false);
     hw_audio_park();
+    /* Never leave a pause request behind for the next session: several exits
+     * from the loop above are silent (a user stop, an empty list, ...), so a
+     * leftover s_pause_req would make the NEXT play request sit in the pause
+     * wait forever — silent, audio-less, and invisible to both watchdogs.
+     * Logging the exit reason makes any such silent stop diagnosable. */
+    s_pause_req = false;
+    ESP_LOGI(TAG, "decode loop exit: stop=%u new=%u errored=%u pause=%u",
+             (unsigned)s_stop_req, (unsigned)s_new_req,
+             (unsigned)s_track_errored, (unsigned)s_pause_req);
     s_state = PLAYER_IDLE;
     s_in_decode_loop = false;
 }
@@ -1203,6 +1222,10 @@ static void player_watch_task(void *arg)
          * they always land even when logging is dead. */
         player_report_error(PLAYER_ERR_STALL);
         s_stop_req = true;
+        /* Also drop any pause request: a decode loop spinning in its pause
+         * wait exits on s_stop_req, but leaving the flag set would re-pause
+         * the very next play request. */
+        s_pause_req = false;
         hw_audio_set_player_active(false);   /* release I2S: no fake silence */
         s_state = PLAYER_IDLE;
         if (s_task != NULL) {
@@ -1480,6 +1503,16 @@ void player_play(const char *path)
     s_new_name[blen] = '\0';
 
     s_new_req = true;
+    /* An explicit play request always means "make sound now": clear a stale
+     * pause. s_pause_req survives a stop (nothing clears it on the stop path),
+     * so pressing pause, then stop, then play again could otherwise start the
+     * new track with the pause flag still set — the decode loop would spin in
+     * its pause wait forever: no audio, no logs, and because that wait keeps
+     * refreshing s_decode_beat_ms the stall watchdog never fires and the RTC
+     * watchdog keeps being fed, so the device looks silently dead and never
+     * reboots. The decode loop's own s_new_req handling clears it too; this
+     * closes the window where s_new_req is consumed elsewhere. */
+    s_pause_req = false;
     /* Interrupt a running track only from outside the decode loop. A
      * self-call (single-track replay / list auto-advance) runs after the
      * track already ended, so it must NOT set s_stop_req: if it did, a user
