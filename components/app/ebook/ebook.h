@@ -5,8 +5,8 @@
  * scanned recursively) and lays them out into fixed 8-line pages with the 16px CJK font. Pagination is
  * deterministic (independent of LVGL), so forward/backward flips and the
  * background page-count task always agree. Reading position is remembered
- * per book in NVS (page offset + page number) and restored on open. See
- * docs/ebook.md.
+ * per book on the SD card (identified by a content fingerprint, not by its
+ * path) and restored on open. See docs/ebook.md.
  */
 #pragma once
 
@@ -34,24 +34,49 @@ const char *ebook_scan_name(int idx);  /* NUL-terminated, no path */
  * else the folder's basename. */
 const char *ebook_current_src_name(void);
 
+/* How the position of a freshly opened book was restored. Lets the UI say
+ * whether the position is exactly where the reader left it or only an
+ * approximation after the file changed. */
+typedef enum {
+    EBOOK_RESUME_NONE = 0,   /* nothing saved, or nothing usable: page 1 */
+    EBOOK_RESUME_EXACT,      /* the saved offset still holds the same text */
+    EBOOK_RESUME_DRIFT,      /* the text moved; re-located via its context */
+    EBOOK_RESUME_PERCENT,    /* the text is gone; fell back to the percentage */
+} ebook_resume_t;
+
 bool ebook_open(int idx);              /* open book idx, position at page 1 */
 void ebook_close(void);
 
 /* Reading progress. After ebook_open() returns true, ebook_resume_percent()
  * is the byte progress (0..100) of the saved position the book was restored
- * to, or 0 when it opened at page 1. ebook_progress_flush() persists the
- * current position immediately (debounced saves happen automatically on
- * flips); call it when leaving the reader page. */
+ * to, or 0 when it opened at page 1, and ebook_resume_kind() says how that
+ * position was found.
+ *
+ * ebook_progress_flush() persists the current position right away and returns
+ * whether the card accepted it (debounced saves happen automatically on
+ * flips); call it when leaving the reader page. ebook_save_failed() reports
+ * the sticky result of the last save attempt. */
 uint32_t ebook_resume_percent(void);
-void ebook_progress_flush(void);
+ebook_resume_t ebook_resume_kind(void);
+bool ebook_save_failed(void);
+bool ebook_progress_flush(void);
+/* Erase all saved reading positions from the card, including the legacy v1
+ * path-hash table. Use to wipe residual progress that resolves to the wrong
+ * book. Safe to call at any time (serialized with the save path); the caller
+ * should be on the UI task. */
+void ebook_progress_clear_all(void);
 
 /* Jump to the byte percentage (0..100) of the open book: backs up to the
- * nearest line start, lays the page that contains the target, estimates the
- * page number and arms a progress save. Returns false when no book is open.
+ * nearest line start, lays the page that contains the target, takes the page
+ * number from the page-start table when it already covers that offset and
+ * arms a progress save. Returns false when no book is open.
  * 0% re-opens from the beginning. */
 bool ebook_jump_percent(int pct);
 
-int  ebook_page(void);                 /* current page, 1-based */
+/* Current page, 1-based. Until the background count has laid the book out,
+ * this is the value carried over from the restore/jump; it is replaced by the
+ * exact page number as soon as that walk lands. */
+int  ebook_page(void);
 int  ebook_page_count(void);           /* total pages; 0 until counted */
 uint32_t ebook_count_version(void);    /* bumps when the count lands/changes */
 int  ebook_percent(void);              /* byte progress 0..100 */

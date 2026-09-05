@@ -73,13 +73,16 @@ typedef enum {
     SETTING_STANDBY,
     SETTING_RESCAN,
     SETTING_RESET,
+    SETTING_CLEAR_PROG,
     SETTING_COUNT,
 } setting_item_t;
 
 /* Match the playlist row spacing (26px, starting at y=38) so the two
  * list-style pages line up visually. Seven rows: spacing compressed to
  * 24px so the last row (y=182, glyph ends ~198) clears the y=204 hint. */
-static const int s_setting_y[SETTING_COUNT] = {38, 62, 86, 110, 134, 158, 182};
+/* Eight rows: spacing compressed to 20px (from 24) so the last row (y=178,
+ * glyph ends ~194) still clears the y=204 hint. */
+static const int s_setting_y[SETTING_COUNT] = {38, 58, 78, 98, 118, 138, 158, 178};
 
 /* Cache-existence state shown by the "重建列表" settings item. We must NOT
  * call player_cache_exists() (a FATFS stat()) every refresh — it runs on
@@ -99,12 +102,14 @@ static const char *ui_set_bt_text(void);
 static const char *ui_set_sleep_text(void);
 static const char *ui_set_rescan_text(void);
 static const char *ui_set_reset_text(void);
+static const char *ui_set_clear_text(void);
 static void ui_set_vol_lr(int dir);
 static void ui_set_gain_lr(int dir);
 static void ui_set_bl_lr(int dir);
 static void ui_set_bt_lr(int dir);
 static void ui_set_sleep_lr(int dir);
 static void ui_set_rescan_enter(void);
+static void ui_set_clear_enter(void);
 static void ui_set_reset_enter(void);
 static void ui_set_bt_enter(void);
 
@@ -125,6 +130,7 @@ static const setting_entry_t s_settings_table[SETTING_COUNT] = {
     [SETTING_STANDBY]     = {"息屏",    ui_set_sleep_text, ui_set_sleep_lr, NULL},
     [SETTING_RESCAN]      = {"重建播放列表", ui_set_rescan_text, NULL,       ui_set_rescan_enter},
     [SETTING_RESET]       = {"重置NVS", ui_set_reset_text, NULL,             ui_set_reset_enter},
+    [SETTING_CLEAR_PROG]  = {"清除阅读进度", ui_set_clear_text, NULL,        ui_set_clear_enter},
 };
 
 /* Backlight brightness (0..100 %), driven via PWM on PIN_NUM_LCD_BL.
@@ -921,6 +927,20 @@ static void ui_set_reset_enter(void)
     ui_refresh();
     nvs_flash_erase();
     esp_restart();
+}
+
+static const char *ui_set_clear_text(void)
+{
+    return "按A清除";
+}
+
+static void ui_set_clear_enter(void)
+{
+    /* Wipe all saved reading positions (v2 + legacy v1) so books that were
+     * resuming to the wrong place start fresh at page 1. */
+    ebook_progress_clear_all();
+    set_action("已清除进度");
+    ui_refresh();
 }
 
 static void ui_build_settings(lv_obj_t *page)
@@ -2409,12 +2429,19 @@ static void ui_action(void)
             break;
         }
         const uint32_t resume = ebook_resume_percent();
+        const ebook_resume_t rkind = ebook_resume_kind();
         copy_book_name(s_eb_open_name, sizeof(s_eb_open_name),
                        ebook_scan_name(s_eb_sel));
         ui_enter_page(UI_PAGE_EBOOK_READ);
         if (resume > 0) {
-            char buf[24];
-            snprintf(buf, sizeof(buf), "已续读 %u%%", (unsigned)resume);
+            /* Say how the position was found: an exact restore and a
+             * re-location after the file changed are very different news.
+             * Kept short — the toast buffer is 32 bytes (CJK = 3 B/glyph). */
+            const char *fmt = (rkind == EBOOK_RESUME_EXACT)   ? "已续读 %u%%"
+                            : (rkind == EBOOK_RESUME_DRIFT)   ? "已重新定位 %u%%"
+                            :                                   "文件已变 跳至 %u%%";
+            char buf[32];
+            snprintf(buf, sizeof(buf), fmt, (unsigned)resume);
             set_action(buf);
         }
         break;
@@ -2727,7 +2754,9 @@ else if (s_ui.page_id == UI_PAGE_EBOOK_LIST) {
                 ui_refresh();
             }
             else {
-                ebook_progress_flush();      /* persist the position right now */
+                /* Persist the position right now and report a card that
+                 * refused the write instead of losing it silently. */
+                const bool saved = ebook_progress_flush();
                 /* Rebuild the list page, then restore the browsing position
                  * (source + selected book) and the list view, so coming back
                  * from a book lands exactly where the user left off instead
@@ -2745,6 +2774,9 @@ else if (s_ui.page_id == UI_PAGE_EBOOK_LIST) {
                 s_paint_eb_src_top = -1;
                 ui_mark_dirty();
                 ui_refresh();
+                if (!saved) {
+                    set_action("进度保存失败");
+                }
             }
         }
         else {
