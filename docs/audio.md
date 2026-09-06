@@ -57,7 +57,7 @@ MP3 解码（helix） ──> hw_audio_write_pcm() → 按路由分发
 ```
 
 - 停止/暂停：`hw_audio_set_player_active(false)` 立即禁用通道（停 BCLK），解码任务下次写返回 `AUDIO_WRITE_ABANDONED`，瞬时静音、无缓冲残留。
-- **采样率即时生效**：`hw_audio_set_sample_rate()` 由解码任务同步执行（运行中先驻车 → `i2s_channel_reconfig_std_clock` → 下个写帧再启用），新曲目的时钟必然先于数据就位；不存在旧架构"待应用 rate 被暂停清掉"导致整曲变调的问题，重配返回值也会被检查并上报。
+- **采样率即时生效（重建通道）**：`hw_audio_set_sample_rate()` 由解码任务同步执行，通过 `hw_audio_rebuild_i2s()` 重建通道到新速率（删旧通道、建新通道、首帧写入再启用）。ESP-IDF v6.1 要求 `i2s_channel_reconfig_std_clock()` 在 READY（未启动）态调用，运行中的通道需先 `i2s_channel_disable`；而同句柄 disable→enable 正是会卡死 ESP32 DMA 的 out-link stop/start，因此**不**走热重配，改用"重建通道"——新通道的首次启用是开机即可靠的路径，也是驱动自身的卡死恢复手段，故混采样率播放列表在曲目接缝处换速不会把总线永久卡死。仅当采样率真的变化才走到这里（同速率曲目直接返回），同速率曲库永不重建通道。新曲时钟先于该曲首帧 PCM 就位，无旧架构"待应用 rate 被暂停清掉"导致整曲变调的问题。
 - **播放时钟对齐（取舍说明）**：MP3 解码速率精确而 I2S BCLK（APLL 派生）仅 ppm 级精度，旧架构用 ring+feed+插样主动抵消漂移；直写模式下该漂移由 DMA 吸收，最坏表现为长时间播放中偶发一次约几十 ms 的欠载静音（`auto_clear` 兜底、自恢复），远轻于旧架构概率性整首无声。
 - **通道生命周期**：启用仅发生在首个 PCM 写帧（采样率重配之后），BCLK 永不先于数据启动（无起始 auto-clear 空白）；禁用发生在停止/暂停/切到蓝牙路由时。全部通道操作（enable/disable/重配/写）由 `s_io_lock` 互斥锁串行，跨任务停止安全（IDF 驱动在 `i2s_channel_disable` 中置 READY 并等待在途写循环退出）。
 - 蓝牙路由时 I2S 通道保持驻车（见 §1），蓝牙侧由 A2DP 流控自行定钟。

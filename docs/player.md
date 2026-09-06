@@ -45,26 +45,27 @@ FATFS 目录遍历在 SDSPI 上耗时数十 ms，故列表由**独立扫描任�
 | `player_play(name)` | 播放 `/sdcard/Music/<name>`；运行中调用则切换曲目 |
 | `player_toggle()` | 播放 ⇄ 暂停 |
 | `player_stop()` | 停止；先释放 I2S 归属（`hw_audio_set_player_active(false)`）使解码背压立即退出，再通知任务 |
-| `player_repeat_mode()` | 当前循环模式（`PLAYER_REPEAT_ALL` 列表循环 / `PLAYER_REPEAT_ONE` 单曲循环） |
-| `player_repeat_toggle()` | 切换循环模式（UI 播放页按 Select 键触发） |
+| `player_repeat_mode()` | 当前循环模式（`PLAYER_REPEAT_ALL` 列表循环 / `PLAYER_REPEAT_ONE` 单曲循环 / `PLAYER_REPEAT_RANDOM` 随机播放） |
+| `player_repeat_toggle()` | 切换循环模式（UI 播放页按 Select 键触发）：列表→单曲→随机→列表 |
 
-- 暂停/停止不阻塞：`hw_audio_write_pcm()` 的环形缓冲背压在 `s_player_active=false` 时立即放弃剩余数据。
+- 暂停/停止不阻塞：`hw_audio_write_pcm()` 在 `s_player_active=false` 时直接返回放弃剩余数据。
 - 播放进度（字节偏移百分比）对 VBR MP3 不准确，UI 不展示（`player.h` 注释明示）。
-- 采样率随首帧变化：`hw_audio_set_sample_rate()` 由解码任务调用，I2S 重配在 audio feed 任务内串行执行。
+- 采样率随首帧变化：`hw_audio_set_sample_rate()` 由解码任务同步调用，I2S 通过重建通道换速（见 `docs/audio.md` §2）。
 
 ## 4. 循环模式与曲目切换
 
 - 曲目**自然播放结束（EOF）**时的行为由循环模式决定（播放页按 Select 键切换，右上角状态栏显示当前模式）：
   - `PLAYER_REPEAT_ALL`（列表循环，默认）：切到列表下一首，末尾回绕到第一首；当前曲目不在列表（`s_index < 0`）或列表为空时停止。
   - `PLAYER_REPEAT_ONE`（单曲循环）：按当前曲目路径从头重播，不依赖播放列表。实现为**原地重绕**（`rewind_track()`）：`fseek` 回文件头 → 重建 helix 解码器（`MP3FreeDecoder` + `MP3InitDecoder`，避免第二遍复用残留的 bit-reservoir/VBR/重同步状态）→ 复位游标与看门狗 → 重新跳过 ID3v2 标签并拾取 ReplayGain → 重武装 I2S 管线。整个过程不停 I2S 时钟、不重开文件，循环**无缝**；重绕失败（seek/解码器重建失败）则落入错误路径自动切下一首，损坏文件不会死循环。
-- 播放器没有手动播放列表导航 API：`player_play()` 每次都是新曲目；AVRCP 的 NEXT/PREV 回调在 main.c 中被忽略（仅记日志）。
+  - `PLAYER_REPEAT_RANDOM`（随机播放）：播放一个随机条目，列表多于一首时绝不重复刚结束的那首；列表仅一首时退化到该首。手动"下一曲"同样走随机（绝不重复当前），"上一曲"保持顺序以便用户随时回退。模式决策集中在 `decide_next_index()`，自然结束与手动切歌共用同一份逻辑，不会分叉。
+- 手动导航：`player_play()` / `player_play_index()` / `player_next()` / `player_prev()` 均可从 UI 或蓝牙页触发切歌；AVRCP 的 NEXT/PREV 回调在 main.c 中被忽略（仅记日志，播放器无远端列表同步）。
 
 ## 5. 与其它模块的接口
 
 ```text
 main.c:       player_init()（创建任务）；AVRCP PLAY/PAUSE/STOP → player_toggle/stop
 ui.c:         播放器页构建/轮询时读 player_scan_count/name/version；按键 → player_play/toggle/stop
-audio.c:      hw_audio_set_sample_rate() 随 MP3 采样率重配 I2S；PCM 经 256KB 环形
-              缓冲由 feed 任务写 I2S；蓝牙连接时路由到 A2DP（见 audio.md）
+audio.c:      hw_audio_set_sample_rate() 随 MP3 采样率热重配 I2S（不停通道）；
+              PCM 由解码任务 DSP 后直写 I2S DMA（无 ring/feed 任务）；蓝牙连接时路由到 A2DP（见 audio.md）
 bt_audio.c:   蓝牙开启且已连接时，PCM 经音量后路由到 A2DP 而非 I2S（见 audio.md）
 ```

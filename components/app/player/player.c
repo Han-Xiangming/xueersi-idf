@@ -87,6 +87,8 @@ static volatile player_repeat_t s_repeat = PLAYER_REPEAT_ALL;
 static char s_path[PLAYER_PATH_LEN];        /* full path: /sdcard/Music/<name> */
 static char s_name[MP3_NAME_LEN];
 static int s_index = -1;          /* list index of the loaded track (-1 = none) */
+static int s_new_index = -1;       /* explicit list index of the pending play
+                                   * request (-1 = derive from path at reload) */
 static volatile bool s_stop_req;
 static volatile bool s_pause_req;
 static volatile bool s_new_req;
@@ -671,6 +673,10 @@ static void parse_id3v2(void)
 /* Forward declaration: open_track() must be able to release a previous pass. */
 static void close_track(void);
 
+/* Forward declaration: decide_next_index() is the single source of truth for
+ * mode-based track selection; decode_loop() (defined above) calls it. */
+static int decide_next_index(player_repeat_t mode, int ended_index, int cnt);
+
 static bool open_track(void)
 {
     /* Release anything left over from a previous pass BEFORE overwriting the
@@ -950,17 +956,25 @@ static void decode_loop(void)
             s_path[sizeof(s_path) - 1] = '\0';
             strncpy(s_name, s_new_name, sizeof(s_name) - 1);
             s_name[sizeof(s_name) - 1] = '\0';
-            /* Resolve the loaded path back to its list index so the UI can
-             * drive next/prev and list-loop works. A path missing from the
-             * (possibly stale) list yields -1, which is harmless for
-             * index-based navigation and just disables auto-advance. */
-            s_index = -1;
-            for (int k = 0; k < s_playlist->count; k++) {
-                if (strcmp(s_playlist->items[k].path, s_path) == 0) {
-                    s_index = k;
-                    break;
+            /* 显式 index 优先：手动切歌/自动连播/错误前进都经 player_play_index
+             * 写入 s_new_index，重载时直接采用，避免依赖路径回查。路径回查仅在
+             * 列表被扫描任务换源/重排时可能失败，导致 s_index=-1，进而 list-loop/
+             * 单曲/随机 在 I2S 下全部失效。无显式 index（直接 player_play(path)）
+             * 时退回路径回查以保持兼容。 */
+            if (s_new_index >= 0) {
+                s_index = s_new_index;
+            } else {
+                s_index = -1;
+                for (int k = 0; k < s_playlist->count; k++) {
+                    if (strcmp(s_playlist->items[k].path, s_path) == 0) {
+                        s_index = k;
+                        break;
+                    }
                 }
             }
+            s_new_index = -1;
+            ESP_LOGI(TAG, "[MODE] play req: '%s' (idx=%d, repeat=%d)",
+                     s_name, s_index, (int)s_repeat);
             /* A pending user stop must survive: player_stop() clears
              * s_new_req, so this block only runs when the request is real. */
             s_stop_req = false;
@@ -1052,21 +1066,22 @@ static void decode_loop(void)
                      s_stop_req ? "stopped by user"
                                 : s_track_errored ? "aborted (error)"
                                                   : "reached EOF");
-            /* Single-track loop: replay the SAME file. rewind_track() rewinds
-             * the source and rebuilds the decoder, then the `continue` below
-             * re-enters the OUTER track loop (the inner decode while has
-             * already closed here), so open_track() opens the same path again
-             * — it now releases the previous pass first (see open_track), so
-             * nothing leaks across passes.
-             *
-             * The seam pause lets the previous pass's tail drain out of the DMA
-             * ring (auto_clear turns it into silence) before the new pass's PCM
-             * is queued, so the ending does not bleed into the replay. The
-             * clock is NOT stopped and restarted — see the out-link note in
-             * audio.c. Only a clean EOF replays: a corrupt/pipeline failure
-             * falls through to the error path. */
+            /* 单曲循环也走显式 index：直接用当前曲目 index 重播，与 list-loop /
+             * 随机 共用 decide_next_index + player_play_index 的连播路径，三种模式
+             * 行为一致。s_index 现在恒为待播曲目的显式下标，可安全按 index 重开
+             * 当前曲目。seam 停顿（先 flush 再延时）保留，避免上一遍尾音渗入重播；
+             * 仅当曲目不在列表（无显式 index）时退回原地 rewind 兜底。 */
             if (!s_stop_req && !s_new_req && !s_track_errored &&
                 s_repeat == PLAYER_REPEAT_ONE) {
+                if (s_index >= 0) {
+                    ESP_LOGI(TAG, "repeat one: replaying by index %d '%s'",
+                             s_index, s_name);
+                    hw_audio_pipeline_flush();
+                    vTaskDelay(pdMS_TO_TICKS(REPEAT_ONE_GAP_MS));
+                    player_play_index(s_index);   /* 显式 index 重播当前曲目 */
+                    continue;   /* 重载块按 s_new_index 重开当前曲目 */
+                }
+                /* 兜底：当前曲目不在列表（无显式 index）时原地 rewind */
                 if (!rewind_track()) {
                     ESP_LOGE(TAG, "repeat-one rewind failed for '%s'", s_name);
                     s_track_errored = true;
@@ -1100,47 +1115,36 @@ static void decode_loop(void)
                          s_fail_count);
                 break;
             }
-            int cnt = s_playlist->count;
-            if (cnt > 0 && s_index >= 0) {
-                int next = (s_index + 1) % cnt;
-                player_play(s_playlist->items[next].path);
-                continue;
+            const int cnt = s_playlist->count;
+            if (cnt <= 0) {
+                break;   /* no list to advance to: stop with the error visible */
             }
-            break;   /* no list to advance to: stop with the error visible */
+            /* 与自然结束一致：错误前进也走显式 index + decide_next_index，
+             * 让随机/单曲（错误时落到下一曲）在错误分支同样生效。 */
+            const int next = decide_next_index(s_repeat, s_index, cnt);
+            if (next < 0) {
+                break;
+            }
+            player_play_index(next);
+            continue;
         }
         s_fail_count = 0;
 
-        /* Natural end of track: in list-loop mode advance to the next entry,
-         * wrapping at the end; in random mode play a random entry (never the
-         * one that just ended when the list holds more than one track, and
-         * no dependence on s_index). (Single-track loop never gets here: it
-         * replays the file in place inside the track block above.) If the
-         * list is empty, just stop. */
-        int cnt = s_playlist->count;
-        if (cnt <= 0) {
+        /* Natural end of track: pick the next entry from the repeat mode.
+         * (Single-track loop never reaches here: it replays the file in place
+         * inside the track block above.) decide_next_index() returns -1 to
+         * stop when the list is empty or the mode is list-loop but the current
+         * track is not in the list (s_index < 0) — no auto-advance into the
+         * void. */
+        const int cnt = s_playlist->count;
+        const int next = decide_next_index(s_repeat, s_index, cnt);
+        if (next < 0) {
             break;
         }
-        int next;
-        if (s_repeat == PLAYER_REPEAT_RANDOM) {
-            if (cnt > 1) {
-                do {
-                    next = (int)(esp_random() % (uint32_t)cnt);
-                } while (next == s_index);
-            }
-            else {
-                next = 0;
-            }
-        }
-        else {
-            if (s_index < 0) {
-                break;
-            }
-            next = (s_index + 1) % cnt;
-        }
-        player_play(s_playlist->items[next].path);
-        /* Self-call: only s_new_req is set; the loop top picks up the new
-         * track. Re-run rather than break so the next song starts. */
-        continue;
+        ESP_LOGI(TAG, "[MODE] natural end: repeat=%d from %d -> %d (cnt=%d)",
+                 (int)s_repeat, s_index, next, cnt);
+        player_play_index(next);   /* 显式 index：重载块直接采用，模式一致 */
+        continue;   /* loop top picks up s_new_req and starts the next song */
     }
     /* Decode loop is leaving for good (stop / watchdog / too many failures):
      * release the I2S bus and PARK it, so the amp powers down, the out-EOF
@@ -1473,6 +1477,7 @@ void player_play(const char *path)
         if (hw_audio_rebuild_i2s() != ESP_OK || !hw_audio_is_ready()) {
             ESP_LOGE(TAG, "[ERROR] play requested but audio not ready, ignored");
             player_report_error(PLAYER_ERR_AUDIO);
+            s_new_index = -1;   /* 丢弃本次显式 index，避免泄漏到后续直接 player_play(path) */
             return;
         }
         ESP_LOGI(TAG, "I2S rebuilt, continuing play request");
@@ -1493,6 +1498,18 @@ void player_play(const char *path)
         snprintf(full, sizeof(full), PLAYER_ROOT "/%s", path);
     }
     snprintf(s_new_path, sizeof(s_new_path), "%s", full);
+
+    /* 记录显式列表下标（仅当调用方未通过 player_play_index 显式给出时按路径回查）：
+     * 重载块会优先采用 s_new_index，确保自动连播始终基于确定的 index 而非依赖
+     * 重载时的路径回查（后者在列表被扫描任务换源/重排时可能失败）。 */
+    if (s_new_index < 0) {
+        for (int k = 0; k < player_scan_count(); k++) {
+            if (strcmp(player_scan_path(k), s_new_path) == 0) {
+                s_new_index = k;
+                break;
+            }
+        }
+    }
 
     /* Display name = basename of the path. Bounded copy (FATFS LFN caps the
      * leaf name at 255 bytes) so GCC's -Wformat-truncation stays quiet. */
@@ -1534,6 +1551,9 @@ void player_play_index(int i)
     if (i < 0 || i >= player_scan_count()) {
         return;
     }
+    /* 显式给出列表下标：重载块优先采用该 index 而非路径回查，保证自动连播/
+     * 错误前进始终基于确定的 index（见 decode_loop 重载块）。 */
+    s_new_index = i;
     /* Play by absolute path from the (immutable) playlist snapshot. The index
      * itself is read-only here — callers may only SELECT an entry, never
      * reorder the list. */
@@ -1564,27 +1584,55 @@ static int player_step(int dir)
     return (cur + dir + cnt) % cnt;
 }
 
+/* Single source of truth for "which track plays next at a natural end / on a
+ * manual next". Handles every repeat mode so the decode-loop natural-end block
+ * and player_next() cannot drift apart:
+ *   - ALL : next entry, wrapping at the end; -1 (stop) if the list is empty or
+ *           the ended track is not in the list (s_index < 0).
+ *   - RANDOM: a random entry, never the just-ended one when the list holds more
+ *           than one; the single-element list degenerates to track 0.
+ *   - ONE is NOT handled here: single-track loop replays the file IN PLACE
+ *           (rewind_track) before this function is ever reached, so callers
+ *           must branch on PLAYER_REPEAT_ONE separately.
+ * Pure (no playback state touched): safe to call from any task. */
+static int decide_next_index(player_repeat_t mode, int ended_index, int cnt)
+{
+    if (cnt <= 0) {
+        return -1;
+    }
+    if (mode == PLAYER_REPEAT_RANDOM) {
+        if (cnt > 1) {
+            int n;
+            do {
+                n = (int)(esp_random() % (uint32_t)cnt);
+            } while (n == ended_index);
+            return n;
+        }
+        return 0;
+    }
+    /* PLAYER_REPEAT_ALL (and any unknown mode): sequential, wrapping. */
+    if (ended_index < 0) {
+        return -1;
+    }
+    return (ended_index + 1) % cnt;
+}
+
 int player_next(void)
 {
     /* In random mode a manual next picks a random entry (never the current
      * one when the list holds more than one); prev stays sequential so the
-     * user can always step back through the list order. */
+     * user can always step back through the list order. Both go through
+     * decide_next_index() so manual navigation and natural-end auto-advance
+     * share one mode decision. */
     if (s_repeat == PLAYER_REPEAT_RANDOM) {
         const int cnt = player_scan_count();
         if (cnt <= 0) {
             return -1;
         }
         const int cur = player_current_index();
-        int i;
-        if (cnt > 1) {
-            do {
-                i = (int)(esp_random() % (uint32_t)cnt);
-            } while (i == cur);
-        }
-        else {
-            i = 0;
-        }
-        if (s_state != PLAYER_IDLE) {
+        const int i = decide_next_index(s_repeat, cur, cnt);
+        if (i >= 0 && s_state != PLAYER_IDLE) {
+            ESP_LOGI(TAG, "[MODE] manual next (random): %d -> %d", cur, i);
             player_play_index(i);
         }
         return i;

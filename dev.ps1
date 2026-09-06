@@ -3,7 +3,7 @@ param(
     [string]$Port = ""
 )
 
-$Actions = @("build", "flash", "monitor", "menuconfig", "erase", "size", "clean")
+$Actions = @("build", "flash", "monitor", "menuconfig", "erase", "size", "clean", "reconfigure")
 
 $Activate = 'C:\Users\OpenTankOfBeta\.espressif\activate.ps1'
 if (-not (Test-Path $Activate)) {
@@ -50,6 +50,7 @@ function Show-Help {
     Write-Host "  erase        erase flash"
     Write-Host "  size         show firmware size"
     Write-Host "  clean        full clean"
+    Write-Host "  reconfigure  rerun cmake (for Kconfig/component changes)"
     Write-Host "Examples:" -ForegroundColor Cyan
     Write-Host "  .\dev.ps1 build+flash"
     Write-Host "  .\dev.ps1 build+flash+monitor -p COM3"
@@ -65,17 +66,19 @@ function Show-Menu {
     Write-Host " 5. Erase flash"
     Write-Host " 6. Size"
     Write-Host " 7. Full clean"
+    Write-Host " 8. Reconfigure (cmake)"
     Write-Host " 0. Exit"
 }
 
 function Run-Action([string]$Name) {
     switch ($Name) {
-        "build"     { idf.py build }
-        "monitor"   { if (-not $Port) { $Port = Get-Port }; if ($Port) { idf.py -p $Port monitor } }
-        "menuconfig"{ idf.py menuconfig }
-        "erase"     { if (-not $Port) { $Port = Get-Port }; if ($Port) { idf.py -p $Port erase-flash } }
-        "size"      { idf.py size }
-        "clean"     { idf.py fullclean }
+        "build"        { idf.py build }
+        "reconfigure"  { idf.py reconfigure }
+        "monitor"      { if (-not $Port) { $Port = Get-Port }; if ($Port) { idf.py -p $Port monitor } }
+        "menuconfig"   { idf.py menuconfig }
+        "erase"        { if (-not $Port) { $Port = Get-Port }; if ($Port) { idf.py -p $Port erase-flash } }
+        "size"         { idf.py size }
+        "clean"        { idf.py fullclean }
         "flash" {
             if (-not $Port) { $Port = Get-Port }
             if ($Port) {
@@ -105,6 +108,7 @@ if (-not $Action) {
                     "5" { Run-Action "erase" }
                     "6" { Run-Action "size" }
                     "7" { Run-Action "clean" }
+                    "8" { Run-Action "reconfigure" }
                     "0" { exit 0 }
                     default { Write-Host "Invalid choice: $C" -ForegroundColor Yellow }
                 }
@@ -119,6 +123,7 @@ if (-not $Action) {
             "5" { Run-Action "erase" }
             "6" { Run-Action "size" }
             "7" { Run-Action "clean" }
+            "8" { Run-Action "reconfigure" }
             "0" { exit 0 }
             default { Write-Host "Invalid choice" -ForegroundColor Yellow }
         }

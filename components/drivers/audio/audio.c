@@ -719,6 +719,27 @@ esp_err_t hw_audio_rebuild_i2s(void)
     s_track_gain_sm = s_track_gain;
     s_master_gain_sm = s_master_gain;
     s_wr_errs = 0;
+
+    /* Warm up the new channel: enable + write one descriptor of silence so
+     * the DMA is truly RUNNING before the decode task resumes. This avoids
+     * the "first write after rebuild races enable" race that caused silent
+     * track switches on speaker route. */
+    {
+        esp_err_t e = i2s_channel_enable(s_tx);
+        if (e == ESP_OK) {
+            s_i2s_enabled = true;
+            s_rebuild_done = false;
+            s_enable_count++;
+            static int16_t silence[1024 * 2] = {0};
+            size_t bw;
+            i2s_channel_write(s_tx, silence, sizeof(silence), &bw, pdMS_TO_TICKS(100));
+            ESP_LOGI(TAG, "I2S channel warmed up after rebuild (rate %u Hz)", (unsigned)s_rate);
+        } else {
+            ESP_LOGE(TAG, "I2S enable failed during warmup: %s", esp_err_to_name(e));
+            s_i2s_enabled = false;
+        }
+    }
+
     xSemaphoreGive(s_io_lock);
     ESP_LOGI(TAG, "I2S channel rebuilt (rate %u Hz)", (unsigned)s_rate);
     return ESP_OK;
@@ -863,14 +884,15 @@ float hw_audio_get_master_gain_db(void)
  * place before the first PCM of a track reaches the DMA; there is no
  * deferred/pending rate that a pause/stop could lose.
  *
- * The driver requires the READY (disabled) state for a reconfig, so the old
- * implementation parked the channel and let the next write re-enable it — a
- * full out-link stop-then-restart, the cycle that can wedge the ESP32
- * out-link for the rest of the boot. Instead we now adopt the new rate and
- * REBUILD the channel, so the new clock runs on a never-enabled channel whose
- * first start is the reliable path (the same one that works after power-on).
- * Only a genuine rate change reaches this code; a same-rate track returns at
- * the top, so a uniform library never cycles the channel at all. */
+ * ESP-IDF v6.1 only allows i2s_channel_reconfig_std_clock() in the READY
+ * (not-started) state, so a running channel must be disabled first — but a
+ * disable->enable on the SAME handle is the out-link stop/start that can wedge
+ * the ESP32 DMA (see the block comment above hw_audio_set_player_active). We
+ * therefore switch rate by REBUILDING the channel (a fresh channel whose first
+ * enable is the reliable power-on path, and the driver's own wedge-recovery):
+ * the bus can never be left permanently dead by a rate change. A uniform-rate
+ * library never reaches this code (same-rate tracks return at the top), so it
+ * never cycles the channel at all. */
 void hw_audio_set_sample_rate(uint32_t sample_rate_hz)
 {
     if (!s_ready || sample_rate_hz == 0 || sample_rate_hz == s_rate) {
@@ -881,7 +903,27 @@ void hw_audio_set_sample_rate(uint32_t sample_rate_hz)
     audio_set_loudness_coeff(s_rate);
     if (audio_route_is_bt()) {
         bt_audio_set_sample_rate(sample_rate_hz);
+        return;
     }
+    /* Speaker route: adopt the new rate by REBUILDING the channel
+     * (hw_audio_rebuild_i2s: i2s_channel_disable -> i2s_del_channel ->
+     * i2s_new_channel -> init_std_mode at s_rate -> first enable on next PCM
+     * write). This is deliberate and the SAFE choice:
+     *   - ESP-IDF v6.1 requires a channel to be in the READY (not-started)
+     *     state before i2s_channel_reconfig_std_clock() may be called; a
+     *     running channel must be disabled first. But a disable->enable on the
+     *     SAME channel handle is exactly the out-link stop/start that can wedge
+     *     the ESP32 DMA (see the block comment above hw_audio_set_player_active)
+     *     — so a live reconfig is NOT an option.
+     *   - A rebuild instead throws the old channel away and creates a brand-new
+     *     one whose first enable is the reliable path (the same one that works
+     *     after power-on); it is also the driver's own wedge-RECOVERY. So a rate
+     *     change at a track seam takes the recovery-shaped path and cannot leave
+     *     the bus in a wedged, permanently-dead state.
+     * The only writer is the decode task, serialized with the rebuild through
+     * s_io_lock, so a rebuild mid-track is safe. A uniform-rate library never
+     * reaches this code (same-rate tracks return at the top), so it never cycles
+     * the channel at all. */
     ESP_LOGI(TAG, "I2S rate -> %u Hz (rebuilding channel)", (unsigned)s_rate);
     if (hw_audio_rebuild_i2s() != ESP_OK) {
         ESP_LOGE(TAG, "I2S rebuild for rate change failed: playback may be "
@@ -1125,6 +1167,15 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
         s_i2s_enabled = true;
         s_rebuild_done = false;   /* fresh channel session: allow a rebuild */
         ESP_LOGI(TAG, "I2S enabled (session #%u)", (unsigned)++s_enable_count);
+
+        /* Warm up: push one small silent chunk so the DMA is fully primed
+         * before real audio frames arrive. Prevents first-frame drop after
+         * enable/rebuild. */
+        {
+            static int16_t silence[512] = {0};  /* 256 stereo frames ~5.8 ms */
+            size_t bw;
+            i2s_channel_write(s_tx, silence, sizeof(silence), &bw, pdMS_TO_TICKS(50));
+        }
     }
     /* Write timeout, in MILLISECONDS: i2s_channel_write() converts it
      * internally with pdMS_TO_TICKS(), so passing pdMS_TO_TICKS(300) here

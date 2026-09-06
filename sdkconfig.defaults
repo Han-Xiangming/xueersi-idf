@@ -1,93 +1,183 @@
-CONFIG_LV_CONF_SKIP=y
-CONFIG_FREERTOS_HZ=1000
-CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
-CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
-CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
-# CONFIG_ESPTOOLPY_FLASHMODE_DIO is not set
-CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
-CONFIG_ESPTOOLPY_FLASHFREQ="80m"
-# CONFIG_ESPTOOLPY_FLASHSIZE_2MB is not set
-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
-CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
-CONFIG_PARTITION_TABLE_OFFSET=0x9000
-CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
-CONFIG_COMPILER_OPTIMIZATION_PERF=y
+# This file was generated using idf.py save-defconfig or menuconfig [D] key. It can be edited manually.
+# Espressif IoT Development Framework (ESP-IDF) 6.1.0 Project Minimal Configuration
+#
+
+#
+# Bootloader config
+#
 CONFIG_BOOTLOADER_COMPILER_OPTIMIZATION_PERF=y
-CONFIG_SPIRAM=y
-CONFIG_SPIRAM_MODE_QUAD=y
-CONFIG_SPIRAM_TYPE_AUTO=y
-CONFIG_SPIRAM_SPEED_80M=y
-CONFIG_SPIRAM_SPEED=80
-CONFIG_SPIRAM_OCCUPY_VSPI_HOST=y
-CONFIG_SPIRAM_USE_MALLOC=y
-# Allow EXT_RAM_BSS_ATTR statics to live in PSRAM (frees internal DRAM).
-CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
-# Duplicate-load/store cache workaround (rev1+ silicon): the legacy MEMW
-# strategy is a well-known source of silent full freezes with PSRAM + ISRs.
-CONFIG_SPIRAM_CACHE_WORKAROUND_STRATEGY_DUPLDST=y
-# CONFIG_SPIRAM_CACHE_WORKAROUND_STRATEGY_MEMW is not set
-CONFIG_LV_COLOR_DEPTH_16=y
-CONFIG_LV_DEF_REFR_PERIOD=16
-CONFIG_LV_DPI_DEF=60
-CONFIG_LV_USE_DRAW_SW=y
-CONFIG_LV_DRAW_SW_SUPPORT_RGB565=y
-CONFIG_LV_DRAW_SW_SUPPORT_RGB565_SWAPPED=y
-CONFIG_LV_FONT_MONTSERRAT_10=y
-# CONFIG_LV_FONT_MONTSERRAT_12 is not set
-# CONFIG_LV_FONT_MONTSERRAT_14 is not set
-# CONFIG_LV_FONT_MONTSERRAT_18 is not set
-CONFIG_LV_FONT_DEFAULT_MONTSERRAT_10=y
-# CONFIG_LV_USE_CHART is not set
-# CONFIG_LV_USE_SYSMON is not set
-# CONFIG_LV_USE_PERF_MONITOR is not set
-CONFIG_LV_USE_PERF_MONITOR_LOG_MODE=n
-# CONFIG_LV_BUILD_EXAMPLES is not set
-# CONFIG_LV_BUILD_DEMOS is not set
-# CONFIG_LV_USE_DEMO_WIDGETS is not set
-# CONFIG_LV_USE_DEMO_BENCHMARK is not set
-# v6.x: SPI master IRAM options only visible when FreeRTOS itself is in IRAM.
-CONFIG_FREERTOS_IN_IRAM=y
-CONFIG_SPI_MASTER_IN_IRAM=y
-CONFIG_SPI_MASTER_ISR_IN_IRAM=y
-# Audio ISR into IRAM: the PSRAM cache workaround disables flash cache while
-# copying to PSRAM; a flash-resident I2S ISR in that window hangs the system.
-CONFIG_I2S_ISR_IRAM_SAFE=y
-CONFIG_I2S_CTRL_FUNC_IN_IRAM=y
-# Same for the console UART ISR: logging during playback is exactly when a
-# PSRAM copy window can lock the CPU inside a flash-resident TX/RX ISR.
-CONFIG_UART_ISR_IN_IRAM=y
+# end of Bootloader config
 
-# Task WDT panic: a true hang (busy or blocked, incl. a wedged SD read that
-# no software can recover) reboots the device after 5 s instead of leaving
-# it dead. The player task feeds the WDT every <=2 s in every healthy state
-# (idle wait, pause wait, per decode frame), so nothing normal trips it.
-CONFIG_ESP_TASK_WDT_PANIC=y
+#
+# Serial flasher config
+#
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+# end of Serial flasher config
 
-# Bluetooth: classic BR/EDR only, Bluedroid host, A2DP (source role used).
+#
+# Partition Table
+#
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_OFFSET=0x9000
+# end of Partition Table
+
+#
+# Compiler options
+#
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+# end of Compiler options
+
+#
+# Component config
+#
+
+#
+# Bluetooth
+#
 CONFIG_BT_ENABLED=y
-CONFIG_BT_BLUEDROID_ENABLED=y
-CONFIG_BT_CLASSIC_ENABLED=y
-CONFIG_BT_A2DP_ENABLE=y
-CONFIG_BT_AVRCP_ENABLED=y
-# CONFIG_BT_BLE_ENABLED is not set
-CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=y
-# CONFIG_BTDM_CTRL_MODE_BTDM is not set
+
+#
+# Bluedroid Options
+#
 CONFIG_BT_BTC_TASK_STACK_SIZE=4096
 CONFIG_BT_BTU_TASK_STACK_SIZE=4608
-# DRAM relief: Bluedroid's big static control blocks (~60KB .bss) become
-# heap-allocated, and BT allocations go to PSRAM first.
-CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY=y
+CONFIG_BT_CLASSIC_ENABLED=y
+CONFIG_BT_A2DP_ENABLE=y
 CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST=y
-# Two ACL links: pairing triggers a cross-connection (the sink dials back
-# while our own SDP/AVDTP channel is still up), which momentarily needs a
-# second link; with only 1 the controller rejects it (0x09 Conn Limit).
-CONFIG_BTDM_CTRL_BR_EDR_MAX_ACL_CONN=2
-CONFIG_BTDM_CTRL_BR_EDR_MAX_SYNC_CONN=0
+CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY=y
+# end of Bluedroid Options
 
-# FATFS: long file names from heap (FF_USE_LFN=3) + UTF-8 API encoding
-# (FF_LFN_UNICODE=2) so readdir() returns UTF-8 names. Required to list
-# Chinese filenames from the SD card; the 16px CJK font already covers
-# 4E00-9FFF and kana, so no font change is needed.
-CONFIG_FATFS_LFN_HEAP=y
+#
+# Controller Options
+#
+CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=y
+# end of Controller Options
+# end of Bluetooth
+
+#
+# ESP-Driver:I2S Configurations
+#
+CONFIG_I2S_ISR_IRAM_SAFE=y
+CONFIG_I2S_CTRL_FUNC_IN_IRAM=y
+# end of ESP-Driver:I2S Configurations
+
+#
+# ESP-Driver:SPI Configurations
+#
+CONFIG_SPI_MASTER_IN_IRAM=y
+# end of ESP-Driver:SPI Configurations
+
+#
+# ESP-Driver:UART Configurations
+#
+CONFIG_UART_ISR_IN_IRAM=y
+# end of ESP-Driver:UART Configurations
+
+#
+# ESP PSRAM
+#
+CONFIG_SPIRAM=y
+
+#
+# SPI RAM config
+#
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+
+#
+# SPIRAM cache workaround debugging
+#
+CONFIG_SPIRAM_CACHE_WORKAROUND_STRATEGY_DUPLDST=y
+# end of SPIRAM cache workaround debugging
+# end of SPI RAM config
+# end of ESP PSRAM
+
+#
+# ESP System Settings
+#
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_TASK_WDT_PANIC=y
+# end of ESP System Settings
+
+#
+# FAT Filesystem support
+#
 CONFIG_FATFS_API_ENCODING_UTF_8=y
+# end of FAT Filesystem support
+
+#
+# FreeRTOS
+#
+
+#
+# Kernel
+#
+CONFIG_FREERTOS_HZ=1000
+# end of Kernel
+
+#
+# Port
+#
+CONFIG_FREERTOS_IN_IRAM=y
+# end of Port
+# end of FreeRTOS
+
+#
+# LVGL configuration
+#
+
+#
+# Memory Settings
+#
+CONFIG_LV_USE_CLIB_MALLOC=y
+# end of Memory Settings
+
+#
+# HAL Settings
+#
+CONFIG_LV_DEF_REFR_PERIOD=16
+CONFIG_LV_DPI_DEF=60
+# end of HAL Settings
+
+#
+# Font Usage
+#
+
+#
+# Enable built-in fonts
+#
+CONFIG_LV_FONT_MONTSERRAT_14=n
+# end of Enable built-in fonts
+
+CONFIG_LV_FONT_DEFAULT_MONTSERRAT_10=y
+# end of Font Usage
+
+#
+# Widget Usage
+#
+CONFIG_LV_USE_CHART=n
+# end of Widget Usage
+
+#
+# 3rd Party Libraries
+#
+CONFIG_LV_USE_TINY_TTF=y
+CONFIG_LV_TINY_TTF_FILE_SUPPORT=y
+CONFIG_LV_TINY_TTF_CACHE_GLYPH_CNT=256
+# end of 3rd Party Libraries
+
+#
+# Examples
+#
+CONFIG_LV_BUILD_EXAMPLES=n
+# end of Examples
+
+#
+# Demos
+#
+CONFIG_LV_BUILD_DEMOS=n
+# end of Demos
+# end of LVGL configuration
+# end of Component config
