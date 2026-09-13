@@ -35,6 +35,8 @@
 #include "board_config.h"
 #include "audio.h"
 #include "bt_audio.h"
+#include "speex/speex_resampler.h"   /* OUTSIDE_SPEEX + FIXED_POINT: self-contained
+                                     * fixed-point arbitrary-rate resampler */
 
 #include <math.h>
 #include <string.h>
@@ -98,22 +100,38 @@ static uint32_t s_rate = AUDIO_DEFAULT_RATE;
  * stop/start cycle that wedged the ESP32 DMA ("plays at first, then nothing,
  * only over I2S"). See hw_audio_set_sample_rate(). */
 
-/* Linear-interpolation resampler state (decoder rate -> fixed I2S rate). */
-typedef struct {
-    uint32_t step;        /* Q16: src_rate/out_rate, phase advance per output */
-    uint16_t phase;       /* 0..65535 position within the current input interval */
-    int16_t  last_l;      /* carried lower (L) sample across chunks */
-    int16_t  last_r;      /* carried lower (R) sample across chunks */
-    bool     have_last;   /* whether last_l/last_r hold a valid sample */
-} resamp_t;
-static resamp_t s_resamp;
-static bool     s_resamp_active;   /* true: src_rate != s_rate, resample on write */
+/* SpeexDSP fixed-point resampler state (decoder rate -> fixed I2S rate).
+ * Recreated per track (its history is the seam boundary), so no sample bleeds
+ * across tracks. Under OUTSIDE_SPEEX + FIXED_POINT it is a self-contained,
+ * arbitrary-rate resampler (cubic-interpolated sinc).
+ *
+ * QUALITY NOTE: quality scales the FIR filter length (and sinc-table size), so
+ * it scales CPU ~linearly. On ESP32 (no FPU; fixed-point MACs) q5 processes one
+ * 1152-sample stereo frame in ~22 ms — more than the 24 ms of audio it emits,
+ * so the decode task becomes the bottleneck, the 279 ms DMA ring drains, and
+ * "I2S write gap" underrun warnings appear. q2 (filt_len 16) is ~4x cheaper,
+ * still a true windowed-sinc (vastly better than the old linear interpolator),
+ * and leaves huge real-time slack; q1 (filt_len 8) is even faster if needed. */
+#define RESAMP_QUALITY     2      /* 0..10; ESP32 sweet spot (fast + sinc quality) */
+static SpeexResamplerState *s_resamp = NULL;  /* NULL => bypass */
+static bool                s_resamp_active;   /* true: src_rate != s_rate */
 
-/* Resampler output scratch. It is the DSP+DMA source (like s_stereo), so PSRAM
- * is fine and keeps DRAM free. Sized for the largest realistic upsample ratio
- * (8 kHz -> 44.1 kHz ~5.5x) on a 1152-frame MP3 chunk, plus headroom. */
+/* Resampler output scratch (interleaved L/R int16). It is the DSP+DMA source,
+ * so PSRAM is fine and keeps DRAM free. Sized for the largest realistic
+ * upsample ratio (8 kHz -> 44.1 kHz ~5.5x) on a 1152-frame MP3 chunk, plus
+ * headroom. */
 #define RESAMP_MAX_FRAMES  7680
 EXT_RAM_BSS_ATTR static int16_t s_rs_buf[RESAMP_MAX_FRAMES * 2];
+
+/* Tear down the resampler and drop to bypass (frees DRAM, no resampling). */
+static void resamp_free(void)
+{
+    if (s_resamp != NULL) {
+        speex_resampler_destroy(s_resamp);
+        s_resamp = NULL;
+    }
+    s_resamp_active = false;
+}
 static volatile bool s_player_active;    /* MP3 player owns the I2S bus */
 
 /* Active output route: a single, explicit either/or selection. Only
@@ -290,6 +308,7 @@ static bool audio_route_is_bt(void)
 /* Forward declarations (defined later in this file). */
 static void audio_update_vol_gain(void);
 static void audio_dsp_reset(void);
+static void resamp_free(void);
 static void hw_audio_on_bt_conn_state(bool connected);
 
 /* Apply a route change: switch the active volume slot to the new route and
@@ -302,6 +321,9 @@ static void audio_apply_route(audio_route_t route)
         return;
     }
     s_route = route;
+    if (audio_route_is_bt()) {
+        resamp_free();   /* speaker resampler not needed while BT owns output */
+    }
     s_volume = audio_route_is_bt() ? s_vol_bt : s_vol_speaker;
     audio_update_vol_gain();
     audio_dsp_reset();
@@ -932,18 +954,30 @@ void hw_audio_set_sample_rate(uint32_t sample_rate_hz)
     /* Speaker route: arm the resampler (or bypass when the decoder rate
      * already matches the fixed I2S rate). The DSP coefficients stay at the
      * fixed I2S rate (s_rate) because all PCM is resampled to it before the
-     * DSP chain runs. Reset the resampler at each track's first frame so no
-     * sample bleeds across the seam. */
+     * DSP chain runs. The resampler is recreated per track call, which also
+     * resets its history at the seam so no sample bleeds across tracks. */
     if (sample_rate_hz == s_rate) {
-        s_resamp_active = false;   /* 1:1: bypass, zero overhead */
+        resamp_free();             /* 1:1: bypass, zero overhead */
         return;
     }
-    s_resamp.step = (uint32_t)((uint64_t)sample_rate_hz * 65536u / s_rate);
-    s_resamp.phase = 0;
-    s_resamp.have_last = false;
+    /* (Re)create the SpeexDSP resampler for this track's rate -> fixed I2S rate.
+     * It is a self-contained fixed-point arbitrary-rate resampler, so no custom
+     * (buggy) ratio math is needed. */
+    resamp_free();
+    int err = 0;
+    s_resamp = speex_resampler_init(2, sample_rate_hz, s_rate,
+                                    RESAMP_QUALITY, &err);
+    if (err != 0 || s_resamp == NULL) {
+        ESP_LOGE(TAG, "speex resampler init failed (rate %u, err %d)",
+                 (unsigned)sample_rate_hz, err);
+        s_resamp = NULL;
+        s_resamp_active = false;   /* fallback: bypass (wrong pitch, no crash) */
+        return;
+    }
+    speex_resampler_skip_zeros(s_resamp);   /* drop startup latency padding */
     s_resamp_active = true;
-    ESP_LOGI(TAG, "resampler armed: %u -> %u Hz (step=%u)",
-             (unsigned)sample_rate_hz, (unsigned)s_rate, (unsigned)s_resamp.step);
+    ESP_LOGI(TAG, "resampler armed: %u -> %u Hz (speex q=%d)",
+             (unsigned)sample_rate_hz, (unsigned)s_rate, RESAMP_QUALITY);
 }
 
 /* Drop the previous pass's queued audio so a repeat-one replay starts clean.
@@ -973,56 +1007,42 @@ void hw_audio_pipeline_flush(void)
 }
 
 /* Resample `pairs_in` stereo L/R pairs (decoder native rate) to the fixed I2S
- * rate using linear interpolation. State (phase + one carried sample) persists
- * across calls, so the resampled stream is continuous across MP3 frames.
- * Returns the number of output pairs written into `out` (at most
- * RESAMP_MAX_FRAMES). Caller guarantees pairs_in > 0 when s_resamp_active. */
+ * rate via SpeexDSP (2-channel interleaved int16). State persists inside the
+ * SpeexResamplerState across calls, so the resampled stream is continuous
+ * across MP3 frames; the resampler is recreated per track to reset that history
+ * at the seam. Returns the number of output pairs written into `out` (at most
+ * RESAMP_MAX_FRAMES). Caller guarantees pairs_in > 0 and s_resamp != NULL. */
 static size_t resamp_process_pairs(const int16_t *in, size_t pairs_in,
                                    int16_t *out)
 {
-    size_t out_pairs = 0;
-    size_t p = 0;
+    const spx_int16_t *src = (const spx_int16_t *)in;
+    spx_int16_t *dst = (spx_int16_t *)out;
+    spx_uint32_t produced = 0;
+    spx_uint32_t consumed = 0;
 
-    if (!s_resamp.have_last) {
-        /* Seed the "lower" sample with the first input pair; the first emitted
-         * sample then equals the first input (phase 0 -> lerp returns last). */
-        s_resamp.last_l = in[0];
-        s_resamp.last_r = in[1];
-        s_resamp.have_last = true;
-        p = 1;
-    }
-
-    while (p < pairs_in) {
-        if (out_pairs >= RESAMP_MAX_FRAMES) {
-            break;   /* defensive: never overflow the scratch buffer */
+    /* Feed the whole frame; SpeexDSP buffers internally and emits as much output
+     * as fits. Loop only if the output scratch filled before all input was
+     * consumed (won't happen for our 8k..48k / 1152-sample frames). */
+    while (consumed < (spx_uint32_t)pairs_in) {
+        spx_uint32_t in_arg  = (spx_uint32_t)pairs_in - consumed;
+        spx_uint32_t out_arg = RESAMP_MAX_FRAMES - produced;
+        if (out_arg == 0) {
+            break;   /* defensive: output scratch exhausted */
         }
-        int32_t cur_l = in[2 * p];
-        int32_t cur_r = in[2 * p + 1];
-        uint16_t phase = s_resamp.phase;
-        /* out = lerp(last, cur, phase/65536) */
-        int32_t ol = ((int32_t)s_resamp.last_l * (65536 - phase)
-                      + cur_l * (int32_t)phase) >> 16;
-        int32_t or_ = ((int32_t)s_resamp.last_r * (65536 - phase)
-                       + cur_r * (int32_t)phase) >> 16;
-        out[2 * out_pairs]     = (int16_t)ol;
-        out[2 * out_pairs + 1] = (int16_t)or_;
-        out_pairs++;
-
-        uint32_t np = (uint32_t)phase + s_resamp.step;   /* Q16 advance */
-        while (np >= 65536u) {
-            np -= 65536u;
-            s_resamp.last_l = (int16_t)cur_l;
-            s_resamp.last_r = (int16_t)cur_r;
-            p++;
-            if (p >= pairs_in) {
-                break;
-            }
-            cur_l = in[2 * p];
-            cur_r = in[2 * p + 1];
+        int err = speex_resampler_process_interleaved_int(
+            s_resamp, src + consumed * 2, &in_arg,
+            dst + produced * 2, &out_arg);
+        consumed += in_arg;
+        produced += out_arg;
+        if (err != 0 || in_arg == 0) {
+            break;   /* error or no progress -> stop */
         }
-        s_resamp.phase = (uint16_t)(np & 0xFFFFu);
     }
-    return out_pairs;
+    if (consumed < (spx_uint32_t)pairs_in) {
+        ESP_LOGW(TAG, "resampler: dropped %u input pairs (scratch full)",
+                 (unsigned)((spx_uint32_t)pairs_in - consumed));
+    }
+    return (size_t)produced;
 }
 
 /* Stream decoded 16-bit stereo PCM (L,R interleaved). `frames` = number of
@@ -1067,7 +1087,7 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
      * is skipped here. dsp_buf/dsp_frames are what the DSP chain + DMA run on. */
     int16_t *dsp_buf = stereo_frames;
     size_t   dsp_frames = frames;
-    if (!bt_out && s_resamp_active) {
+    if (!bt_out && s_resamp_active && s_resamp != NULL) {
         dsp_frames = resamp_process_pairs(stereo_frames, frames, s_rs_buf);
         dsp_buf = s_rs_buf;
     }
