@@ -367,14 +367,25 @@ static int      s_paint_src_sel = -1;
 #define LIST_SCROLL_MS   220
 #define LIST_SCROLL_GAP  8
 #define LIST_LINE_W      (LCD_H_RES - 32)
+/* Status-bar (pl_prog) text width: it spans the full 320px line minus the
+ * 8px page margin on each side (ui_label() sizes it to LCD_H_RES - 16). */
+#define PROG_LINE_W      (LCD_H_RES - 16)
+/* Marquee scratch buffer. Must hold a status-bar "source·track" string, i.e.
+ * two MP3_NAME_LEN-sized names concatenated, so size it generously. */
+#define MQ_SRC_LEN       (MP3_NAME_LEN * 2 + 8)
 typedef struct {
     int ofs;            /* current scroll offset, in characters */
     uint32_t at;        /* timestamp of last step (ms) */
-    char src[MP3_NAME_LEN];
+    char src[MQ_SRC_LEN];
     bool scrolling;
 } ui_marquee_t;
 static ui_marquee_t s_mp3_mq;
 static ui_marquee_t s_eb_mq;
+/* Status-bar now-playing marquee (active while a track is loaded). */
+static ui_marquee_t s_prog_mq;
+/* True once pl_prog has been switched to left-align for scrolling, so we don't
+ * re-set the style every refresh. */
+static bool s_prog_align_left = false;
 
 /* Ebook book-list page: same 4-row layout as the MP3 page. */
 #define EBOOK_LIST_ROWS 6
@@ -605,23 +616,23 @@ static int ui_text_px_width(const char *text)
  * should keep refreshing until it returns false (name fits / finished a loop
  * and is now static). */
 static bool ui_marquee_step(ui_marquee_t *mq, char *out, size_t out_size,
-                            const char *name)
+                            int max_w, const char *name)
 {
     if (name == NULL) {
         name = "";
     }
     int w = ui_text_px_width(name);
-    if (w <= LIST_LINE_W) {
+    if (w <= max_w) {
         mq->scrolling = false;
         mq->ofs = 0;
         snprintf(out, out_size, "%s", name);
         return false;
     }
     /* Need to scroll. */
-    if (mq->src[0] == '\0' || strncmp(mq->src, name, MP3_NAME_LEN) != 0) {
+    if (mq->src[0] == '\0' || strncmp(mq->src, name, MQ_SRC_LEN) != 0) {
         /* New/changed name: (re)start from the beginning. */
-        strncpy(mq->src, name, MP3_NAME_LEN - 1);
-        mq->src[MP3_NAME_LEN - 1] = '\0';
+        strncpy(mq->src, name, MQ_SRC_LEN - 1);
+        mq->src[MQ_SRC_LEN - 1] = '\0';
         mq->ofs = 0;
     }
     mq->scrolling = true;
@@ -669,6 +680,22 @@ static void ui_label_set(lv_obj_t *label, const char *text)
         return;                       /* unchanged — skip the LVGL set */
     }
     lv_label_set_text(label, text);
+}
+
+/* Set the status-bar (pl_prog) text. Switches alignment between center (short
+ * static labels) and left (scrolling now-playing name), and clears the
+ * status-bar marquee flag for static labels so we stop forcing refreshes. */
+static void ui_pl_prog(const char *text, bool left)
+{
+    if (s_prog_align_left != left) {
+        lv_obj_set_style_text_align(s_ui.pl_prog,
+            left ? LV_TEXT_ALIGN_LEFT : LV_TEXT_ALIGN_CENTER, 0);
+        s_prog_align_left = left;
+    }
+    if (!left) {
+        s_prog_mq.scrolling = false;
+    }
+    ui_label_set(s_ui.pl_prog, text);
 }
 
 /* Step the master volume by `dir` (+1/-1): 1% steps while at/below 10%,
@@ -1785,6 +1812,89 @@ static void ui_panel_activate(void)
     ui_mark_dirty();
 }
 
+static void ui_refresh_prog_marquee(void)
+{
+    /* Driven every UI tick (even when the page is not dirty) so the
+     * now-playing line keeps scrolling without forcing a full-page repaint.
+     * A full repaint every frame would keep the main loop busy and starve
+     * the button poller, making the B key require a long press — the
+     * regression introduced with the status-bar marquee. Here we only touch
+     * pl_prog, so the rest of the page stays idle. */
+    if (s_in_menu || s_ui.page_id != UI_PAGE_PLAYER || !s_ui.pl_prog) {
+        return;
+    }
+    if (player_state() == PLAYER_IDLE) {
+        return;                         /* idle text is set by ui_paint */
+    }
+    const char *src = player_current_src_name();
+    char prefix[MP3_NAME_LEN + 4];
+    snprintf(prefix, sizeof(prefix), "[%s] ", src);
+    int track_max = PROG_LINE_W - ui_text_px_width(prefix);
+    if (track_max < 8) {
+        track_max = 8;                  /* guard a very long source name */
+    }
+    const char *track = strip_ext(player_current_name());
+    char track_buf[MQ_SRC_LEN];
+    ui_marquee_step(&s_prog_mq, track_buf, sizeof(track_buf), track_max, track);
+    char prog[MQ_SRC_LEN + MP3_NAME_LEN + 4];
+    snprintf(prog, sizeof(prog), "%s%s", prefix, track_buf);
+    ui_pl_prog(prog, s_prog_mq.scrolling);
+}
+
+static void ui_refresh_list_marquee(void)
+{
+    /* Driven every UI tick (even when the page is not dirty) so a selected
+     * list-row marquee keeps scrolling without forcing a full-page repaint.
+     * A full repaint every frame would keep the main loop busy and starve the
+     * button poller, making the A key (play selected / enter) require a long
+     * press on long filenames — the same regression the status-bar marquee had.
+     * Here we only touch the selected row's text label, so the rest of the page
+     * stays idle and all keys stay responsive. Mirrors ui_refresh_prog_marquee(). */
+    if (s_ui.page_id == UI_PAGE_PLAYER && s_pv == PV_LIST
+        && player_state() != PLAYER_PLAYING) {
+        if (!s_mp3_mq.scrolling) {
+            return;                     /* selected name fits / no scroll */
+        }
+        int top = s_mp3_sel - 1;
+        if (top < 0) {
+            top = 0;
+        }
+        if (top > s_mp3_count - MP3_LIST_ROWS) {
+            top = MAX(0, s_mp3_count - MP3_LIST_ROWS);
+        }
+        int i = s_mp3_sel - top;
+        if (i < 0 || i >= MP3_LIST_ROWS) {
+            return;                     /* selected row off-screen */
+        }
+        static char out[MP3_NAME_LEN];
+        ui_marquee_step(&s_mp3_mq, out, sizeof(out), LIST_LINE_W,
+                        strip_ext(player_scan_name(s_mp3_sel)));
+        ui_label_set(s_ui.pl_text[i], out);
+    }
+    else if (s_ui.page_id == UI_PAGE_EBOOK_LIST) {
+        if (!s_eb_mq.scrolling) {
+            return;
+        }
+        int count = ebook_scan_count();
+        int top = s_eb_sel - 1;
+        if (top < 0) {
+            top = 0;
+        }
+        if (top > count - EBOOK_LIST_ROWS) {
+            top = MAX(0, count - EBOOK_LIST_ROWS);
+        }
+        int i = s_eb_sel - top;
+        if (i < 0 || i >= EBOOK_LIST_ROWS) {
+            return;
+        }
+        static char name[64];
+        copy_book_name(name, sizeof(name), ebook_scan_name(s_eb_sel));
+        static char out[64];
+        ui_marquee_step(&s_eb_mq, out, sizeof(out), LIST_LINE_W, name);
+        ui_label_set(s_ui.eb_text[i], out);
+    }
+}
+
 void ui_refresh(void)
 {
     ui_settings_flush();
@@ -1800,6 +1910,16 @@ void ui_refresh(void)
      * refreshing until ui_set_hint() clears it on expiry, even if nothing else
      * changed. */
     bool toast_active = (s_action_until_ms != 0);
+
+    /* Keep the now-playing marquee alive even when the page is otherwise idle
+     * (no full repaint): only pl_prog is touched, so the main loop stays free
+     * and the B key stays responsive. */
+    ui_refresh_prog_marquee();
+
+    /* Same idea for a selected list-row marquee (long filename in the track /
+     * book list): scroll it via a pinpoint label update instead of forcing a
+     * full repaint, so the A key stays responsive while browsing. */
+    ui_refresh_list_marquee();
 
     if (ui_external_changed()) {
         s_ui_dirty = true;             /* Bluetooth/player/SD changed via callback */
@@ -1913,7 +2033,7 @@ void ui_refresh(void)
                 s_paint_mp3_top = top;
             }
             ui_label_set(s_ui.status, "--");
-            ui_label_set(s_ui.pl_prog, "选择播放来源");
+            ui_pl_prog("选择播放来源", false);
             ui_set_hint("上/下选 A进入 B返回");
             break;
         }
@@ -1957,7 +2077,7 @@ void ui_refresh(void)
                     }
                     else {
                         ui_marquee_step(&s_mp3_mq, s_pl_name_buf,
-                                        sizeof(s_pl_name_buf),
+                                        sizeof(s_pl_name_buf), LIST_LINE_W,
                                         strip_ext(player_scan_name(idx)));
                     }
                 }
@@ -2004,25 +2124,24 @@ void ui_refresh(void)
         ui_label_set(s_ui.status, stbuf);
         if (st == PLAYER_IDLE) {
             if (player_scan_busy()) {
-                ui_label_set(s_ui.pl_prog, "加载中...");
+                ui_pl_prog("加载中...", false);
             }
             else {
-                ui_label_set(s_ui.pl_prog, s_mp3_count
+                const char *idle_msg = s_mp3_count
                              ? (player_repeat_mode() == PLAYER_REPEAT_ONE
                                 ? "循环:单曲"
                                 : player_repeat_mode() == PLAYER_REPEAT_RANDOM
                                       ? "循环:随机" : "循环:列表")
-                             : "无MP3文件");
+                             : "无MP3文件";
+                ui_pl_prog(idle_msg, false);
             }
         }
         else {
-            /* Now-playing line: source name + track name (no extension). */
-            char prog[28];
-            snprintf(prog, sizeof(prog), "[%s]%s",
-                     player_current_src_name(),
-                     strip_ext(player_current_name()));
-            prog[27] = '\0';
-            ui_label_set(s_ui.pl_prog, prog);
+            /* Now-playing line is driven by ui_refresh_prog_marquee() every
+             * tick (it only touches pl_prog, keeping the main loop free so the
+             * B key stays responsive). Re-run it here on a dirty repaint so a
+             * track change initialises the scroll immediately. */
+            ui_refresh_prog_marquee();
         }
         if (st == PLAYER_PLAYING) {
             ui_set_hint("左/右切歌 上/下音量 A暂停 Select循环");
@@ -2214,7 +2333,8 @@ void ui_refresh(void)
                 if (sel) {
                     /* Selected row scrolls its name if wider than the line. */
                     ui_marquee_step(&s_eb_mq, s_eb_name_buf,
-                                    sizeof(s_eb_name_buf), s_eb_name_buf);
+                                    sizeof(s_eb_name_buf), LIST_LINE_W,
+                                    s_eb_name_buf);
                 }
                 else {
                     /* Same as the MP3 list: never clobber s_eb_mq.scrolling from
@@ -2310,18 +2430,12 @@ void ui_refresh(void)
     }
     ui_refresh_battery();
     ui_refresh_player_panel();
-    /* Keep refreshing while a selected list row is still scrolling, otherwise
-     * the marquee freezes after a single step (s_ui_dirty would be cleared).
-     * During playback the MP3 marquee is intentionally frozen, so it must not
-     * force refreshes. */
-    if ((s_ui.page_id == UI_PAGE_PLAYER && s_mp3_mq.scrolling
-         && player_state() != PLAYER_PLAYING) ||
-        (s_ui.page_id == UI_PAGE_EBOOK_LIST && s_eb_mq.scrolling)) {
-        s_ui_dirty = true;
-    }
-    else {
-        s_ui_dirty = false;             /* painted; wait for next change */
-    }
+    /* List-row / now-playing marquees no longer force a repaint: they are
+     * advanced every tick by ui_refresh_prog_marquee() / ui_refresh_list_marquee()
+     * via pinpoint label updates (see ui_refresh()). So once painted we simply
+     * clear the dirty flag and let the main loop go idle, which keeps every key
+     * responsive while a long filename scrolls. */
+    s_ui_dirty = false;                 /* painted; wait for next change */
 }
 
 static void ui_action(void)
