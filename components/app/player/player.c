@@ -951,16 +951,14 @@ static bool decode_frame(bool *rate_set)
     if (t_out_done - s_tm_last_log_us > 2000000) {
         const uint32_t n = s_tm_frames;
         const uint32_t cpu_us   = (s_tm_read_us + s_tm_dec_us) / n;
-        const uint32_t paced_us = s_tm_out_us / n;
+        const uint32_t paced_ms = (s_tm_out_us / n + 500) / 1000;
         const uint32_t budget = s_dbg_rate
             ? (uint32_t)((uint64_t)1152 * 1000000u / s_dbg_rate) : 26122u;
-        ESP_LOGI(TAG, "[TIMING] %u fr: cpu %u us (read %u + dec %u) + "
-                      "paced %u us | budget %u us @ %u Hz -> cpu %u%% %s",
-                 (unsigned)n, (unsigned)cpu_us,
-                 (unsigned)(s_tm_read_us / n), (unsigned)(s_tm_dec_us / n),
-                 (unsigned)paced_us, (unsigned)budget, (unsigned)s_dbg_rate,
+        ESP_LOGI(TAG, "[TIMING] %u fr: %u%% paced %ums %s",
+                 (unsigned)n,
                  (unsigned)(cpu_us * 100u / budget),
-                 cpu_us > budget ? "*** OVER BUDGET ***" : "ok");
+                 (unsigned)paced_ms,
+                 cpu_us > budget ? "OVER" : "ok");
         s_tm_read_us = s_tm_dec_us = s_tm_out_us = 0;
         s_tm_frames = 0;
         s_tm_last_log_us = t_out_done;

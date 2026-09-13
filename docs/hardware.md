@@ -57,7 +57,7 @@ ESP32（WROVER-B，PSRAM 8MB）@ 240MHz
 - **直写 I2S**：MP3 解码任务 DSP 后就地 `i2s_channel_write()` 直写 DMA（无环形缓冲/feed 任务），DMA 背压即解码节拍；`hw_audio_set_sample_rate()` 同步重配，首个 PCM 写帧才启用通道（时钟不先于数据）。
 - **DSP 链（喇叭路由，逐样本定点）**：800Hz 保护高通 → 800Hz 响度低音架（boost 0→+9dB 随音量下降）→ 主音量（~5ms 平滑）→ 软限幅（防削波）。蓝牙路由只加音量、全频段。
 - 音量：初始化预计算 **401 项** Q15 对数锥度表（0.1dB 步进，0~-40dB），喇叭与蓝牙各一独立槽位，`hw_audio_set_volume()` 即时生效并平滑渐变。
-- **通道驻车**：空闲或蓝牙路由时通道禁用（MAX98357 掉电省流），停止/暂停立即驻车；所有通道操作由互斥锁串行，跨任务停止安全。
+- **通道驻车**：蓝牙路由或停止（B 键 / 看门狗）时通道禁用（MAX98357 掉电省流）；停止时先靠 `auto_clear` 把 DMA 环形缓冲排净成静音再 disable，避免上一首尾音回放（「余音」）；暂停不关通道。所有通道操作由互斥锁串行，跨任务停止安全。
 - 路由互斥：蓝牙开启且已连接 → 仅走 BT（I2S 不喂数据，喇叭静音）；否则走喇叭；播放器经 `hw_audio_set_player_active()` 声明总线归属。
 - 详见 `docs/audio.md`。
 
@@ -72,7 +72,7 @@ esp_log_level_set("BT_L2CAP", WARN)     降噪（BT 拥塞回调日志泛滥，�
   → nvs_flash_init
   → hw_buttons_init()        GPIO + 消抖
   → hw_lcd_init()            SPI/panel/ST7789 初始化
-  → hw_audio_init()          I2S + MAX98357 + 环形缓冲 + feed 任务
+  → hw_audio_init()          I2S + MAX98357（直写 DMA，无 feed 任务）
   → bt_audio_init()          环形缓冲（不碰蓝牙控制器）
   → 注册 AVRCP 回调（cmd / volume）
   → hw_sd_try_mount()        SD 挂载（可失败）

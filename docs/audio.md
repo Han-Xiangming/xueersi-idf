@@ -14,8 +14,8 @@ MP3 解码（helix） ──> hw_audio_write_pcm() → 按路由分发
 - 输出 DAC：MAX98357 单声道 Class-D，I2S 标准模式（16-bit 立体声，只写 DOUT 声道），引脚 BCLK=32 / LRC=15 / DIN=21，无 MCLK。
 - 蓝牙输出：A2DP Source，SBC 编码由 Bluedroid 完成（见 `docs/bluetooth.md`）。
 - **路由互斥**：蓝牙连接时只走蓝牙，I2S 不喂数据（喇叭静音），解码任务由 BT 环形缓冲的阻塞发送单一时钟驱动，避免双时钟漂移丢音。
-- **直写 I2S（无中间层）**：MP3 解码任务在 DSP 后就地 `i2s_channel_write()` 直写 I2S DMA——没有环形缓冲、没有 feed 任务、没有任务间握手。I2S DMA（8×1024 帧，`auto_clear`）即抖动缓冲，写阻塞的背压把解码节奏钉死在硬件时钟上，解码与硬件不会互相跑飞。
-- **通道驻车（简单开关）**：空闲或蓝牙路由时通道保持禁用（停 BCLK/LRC），MAX98357 在时钟停止后进入掉电（约 64k BCLK 周期后关断）——菜单待机不空耗。播放时由首个 PCM 帧的写入启用通道（采样率重配之后，时钟永不先于数据启动）；停止/切路由时立即驻车。所有通道操作由 `s_io_lock` 互斥锁串行化，IDF 驱动本身会在通道禁用时放行在途写调用（`i2s_channel_disable` 置 READY 并等写循环退出），因此任意任务随时可停。
+- **直写 I2S（无中间层）**：MP3 解码任务在 DSP 后就地 `i2s_channel_write()` 直写 I2S DMA——没有环形缓冲、没有 feed 任务、没有任务间握手。I2S DMA（12×1024 帧，`auto_clear`）即抖动缓冲，写阻塞的背压把解码节奏钉死在硬件时钟上，解码与硬件不会互相跑飞。
+- **通道驻车（简单开关）**：空闲或蓝牙路由时通道保持禁用（停 BCLK/LRC），MAX98357 在时钟停止后进入掉电（约 64k BCLK 周期后关断）——菜单待机不空耗。播放时由首个 PCM 帧的写入启用通道（采样率重配之后，时钟永不先于数据启动）；**切到蓝牙路由时立即驻车**（喇叭静音、MAX98357 掉电）。**停止（B 键退出解码循环 / 看门狗停摆）先排净余音**：`hw_audio_set_player_active(false)` 并不立即关通道，而是让解码任务下一帧写返回 `AUDIO_WRITE_ABANDONED` 即时静音；整圈 DMA 环形缓冲（12×1024 帧）靠 `auto_clear` 把已传输描述符清零、在「下次播放之前」自然排净成静音，`hw_audio_park()` 再 `i2s_channel_disable()` 冻结的是静音而非上一首尾音（见 §4）。暂停同理不关通道。所有通道操作由 `s_io_lock` 互斥锁串行化，IDF 驱动本身会在通道禁用时放行在途写调用（`i2s_channel_disable` 置 READY 并等写循环退出），因此任意任务随时可停。
 
 ## 2. 音量模型
 
@@ -51,12 +51,12 @@ MP3 解码（helix） ──> hw_audio_write_pcm() → 按路由分发
 ## 4. 解码/输出解耦（防爆音与欠载）
 
 ```text
-直写：hw_audio_write_pcm() 就地 DSP → i2s_channel_write()（100ms 有界超时）
-  I2S DMA（8×1024 帧 ≈ 186ms @44.1kHz，auto_clear 欠载自动静音）即抖动缓冲
+直写：hw_audio_write_pcm() 就地 DSP → i2s_channel_write()（1200ms 有界超时）
+  I2S DMA（12×1024 帧 ≈ 279ms @44.1kHz，auto_clear 欠载自动静音）即抖动缓冲
   DMA 写阻塞的背压 = 解码任务的自然节拍（写不满则 DMA 空转，绝无超前）
 ```
 
-- 停止/暂停：`hw_audio_set_player_active(false)` 立即禁用通道（停 BCLK），解码任务下次写返回 `AUDIO_WRITE_ABANDONED`，瞬时静音、无缓冲残留。
+- 停止/暂停：`hw_audio_set_player_active(false)` 声明播放器不再写数据，解码任务下一帧写返回 `AUDIO_WRITE_ABANDONED` 即时静音；但通道**不立即禁用**——靠 `auto_clear` 把整圈 DMA 环形缓冲在「下次播放之前」排净成静音（否则上一首尾音会在下一首重新使能通道时被回放，即「余音」）。整段停止（B 键 / 看门狗）由 `hw_audio_park()` 在排净后才 `i2s_channel_disable()`。
 - **采样率处理（软件重采样，不重建通道）**：I2S 通道在初始化时以**单一固定速率**（`AUDIO_DEFAULT_RATE`，当前 44100 Hz）创建并启用一次，之后整段会话**绝不**因采样率变化而 disable/rebuild。解码任务每曲首帧调用 `hw_audio_set_sample_rate()` 仅声明解码器的原生码率；若该码率与固定 I2S 速率不同，`hw_audio_write_pcm()` 在写 DMA 前用 **SpeexDSP 定点重采样器**（cubic-interpolated sinc，`RESAMP_QUALITY=2`，每曲重建以重置接缝历史，同速率曲库直接旁路，零开销）把 PCM 重采样到固定速率。这样曲目接缝处的换速只是一次重采样，不触碰 I2S 通道——彻底消除了"运行通道 disable→enable"这一会卡死 ESP32 DMA 的 out-link stop/start（即"首曲有声、之后整片无声、仅 I2S 受影响"的失败模式：随机/单曲循环选到不同码率文件时原本会在接缝触发通道重建）。变调问题不存在：重采样保证音高正确，且 DSP 链系数始终按固定 I2S 速率计算。仅当 DMA 真卡死时 `hw_audio_write_pcm()` 才走 `hw_audio_rebuild_i2s()` 自愈（极少触发）。
 - **播放时钟对齐（取舍说明）**：MP3 解码速率精确而 I2S BCLK（APLL 派生）仅 ppm 级精度，旧架构用 ring+feed+插样主动抵消漂移；直写模式下该漂移由 DMA 吸收，最坏表现为长时间播放中偶发一次约几十 ms 的欠载静音（`auto_clear` 兜底、自恢复），远轻于旧架构概率性整首无声。
 - **通道生命周期**：启用仅发生在首个 PCM 写帧（采样率重配之后），BCLK 永不先于数据启动（无起始 auto-clear 空白）；禁用发生在停止/暂停/切到蓝牙路由时。全部通道操作（enable/disable/重配/写）由 `s_io_lock` 互斥锁串行，跨任务停止安全（IDF 驱动在 `i2s_channel_disable` 中置 READY 并等待在途写循环退出）。

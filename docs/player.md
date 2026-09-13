@@ -44,11 +44,12 @@ FATFS 目录遍历在 SDSPI 上耗时数十 ms，故列表由**独立扫描任�
 | `player_current_name()` | 当前载入曲目名（空闲为 ""） |
 | `player_play(name)` | 播放 `/sdcard/Music/<name>`；运行中调用则切换曲目 |
 | `player_toggle()` | 播放 ⇄ 暂停 |
-| `player_stop()` | 停止；先释放 I2S 归属（`hw_audio_set_player_active(false)`）使解码背压立即退出，再通知任务 |
+| `player_stop()` | 停止；释放 I2S 归属（`hw_audio_set_player_active(false)`）使解码背压立即退出并即时静音，解码循环退出时 `hw_audio_park()` 先把整圈 DMA 环形缓冲排净成静音再 disable（避免下一首回放上首尾音），再通知任务 |
 | `player_repeat_mode()` | 当前循环模式（`PLAYER_REPEAT_ALL` 列表循环 / `PLAYER_REPEAT_ONE` 单曲循环 / `PLAYER_REPEAT_RANDOM` 随机播放） |
 | `player_repeat_toggle()` | 切换循环模式（UI 播放页按 Select 键触发）：列表→单曲→随机→列表 |
 
 - 暂停/停止不阻塞：`hw_audio_write_pcm()` 在 `s_player_active=false` 时直接返回放弃剩余数据。
+- 解码健壮性：除「无同步字 / 解码错误过多（512 次）」外，新增**零进度护栏**——连续 16 帧「解码成功但既没消耗字节也没产出样本」的畸形帧判定为损坏并跳过该曲，专门防 libhelix 在特定帧上原地自旋（CPU 跑满、把停顿看门狗饿死、无任何日志的「静默冻结」）。解码任务同时订阅 ESP 任务看门狗（5s 卡死即带 backtrace 重启）作为最后兜底。
 - 播放进度（字节偏移百分比）对 VBR MP3 不准确，UI 不展示（`player.h` 注释明示）。
 - 采样率随首帧变化：`hw_audio_set_sample_rate()` 由解码任务同步调用，I2S 通过重建通道换速（见 `docs/audio.md` §2）。
 

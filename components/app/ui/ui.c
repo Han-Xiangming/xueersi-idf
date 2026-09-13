@@ -671,20 +671,13 @@ static void ui_label_set(lv_obj_t *label, const char *text)
     lv_label_set_text(label, text);
 }
 
-/* Step the master volume by `dir` (+1/-1) with fine control near silence:
- * below 10% the step is 1% (quiet speech is very sensitive there), above it
- * the given coarse step applies. Boundary cases resolve to the fine step so
- * e.g. 10% - coarse lands on 9%, not 0%/5%. */
-static void ui_volume_step(int dir, int coarse)
+/* Step the master volume by `dir` (+1/-1): 1% steps while at/below 10%,
+ * 5% steps above 10% — same scheme as the backlight control. */
+static void ui_volume_step(int dir)
 {
     int v = (int)hw_audio_get_volume();
-    int step = (v < 10 || (v == 10 && dir < 0)) ? 1 : coarse;
+    int step = (v <= 10) ? 1 : 5;
     v += dir * step;
-    /* Snap coarse upward moves onto multiples of the coarse step once out of
-     * the fine zone (9% + coarse -> 10%, keeps the scale tidy). */
-    if (step == 1 && dir > 0 && v > 10) {
-        v = 10;
-    }
     hw_audio_set_volume((uint8_t)MAX(0, MIN(v, 100)));
 }
 
@@ -838,10 +831,9 @@ static const char *ui_set_reset_text(void)
 
 static void ui_set_vol_lr(int dir)
 {
-    /* 1% steps below 10% for fine control, else 10%. */
-    ui_volume_step(dir, 10);
+    /* 1% steps within 0..10, else 5% — matches the backlight control. */
+    ui_volume_step(dir);
     ui_settings_mark_dirty(SETTINGS_DIRTY_VOLUME);
-    set_action(ui_set_vol_text());
 }
 
 static void ui_set_gain_lr(int dir)
@@ -851,24 +843,17 @@ static void ui_set_gain_lr(int dir)
     db = MAX(-12, MIN(db, 12));
     hw_audio_set_master_gain_db((float)db);
     ui_settings_mark_dirty(SETTINGS_DIRTY_GAIN);
-    set_action(ui_set_gain_text());
 }
 
 static void ui_set_bl_lr(int dir)
 {
-    /* Same stepping as volume: 1% steps at/below 10% (down), else 10%. */
+    /* 1% steps within 0..10, else 5% steps. */
     int v = (int)s_backlight;
-    int step = (v < 10 || (v == 10 && dir < 0)) ? 1 : 10;
+    int step = (v <= 10) ? 1 : 5;
     v += dir * step;
-    /* Snap coarse upward moves onto multiples of 10 once out of the fine
-     * zone (9% + coarse -> 10%), keeping the scale tidy like volume. */
-    if (step == 1 && dir > 0 && v > 10) {
-        v = 10;
-    }
     s_backlight = (uint8_t)MAX(0, MIN(v, 100));
     hw_lcd_set_backlight(s_backlight);
     ui_settings_mark_dirty(SETTINGS_DIRTY_BACKL);
-    set_action(ui_set_bl_text());
 }
 
 static void ui_set_bt_lr(int dir)
@@ -892,7 +877,6 @@ static void ui_set_sleep_lr(int dir)
     s_standby_opt = (standby_opt_t)opt;
     hw_lcd_set_standby_timeout((uint32_t)s_standby_opts[s_standby_opt] * 1000);
     ui_settings_mark_dirty(SETTINGS_DIRTY_STBY);
-    set_action(ui_set_sleep_text());
 }
 
 /* A-press (enter) callbacks. */
@@ -2489,8 +2473,8 @@ static void ui_adjust(int step)
         if (player_state() == PLAYER_PLAYING ||
             player_state() == PLAYER_PAUSED) {
             /* While a track plays, up/down adjusts the output volume
-             * (1% steps below 10%, else 5%). */
-            ui_volume_step(step, 5);
+             * (1% steps within 0..10, else 5% — same as the backlight). */
+            ui_volume_step(step);
             ui_settings_mark_dirty(SETTINGS_DIRTY_VOLUME);
             char buf[24];
             snprintf(buf, sizeof(buf), "音量 %u%%",
