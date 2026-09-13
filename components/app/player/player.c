@@ -105,6 +105,13 @@ static int s_no_sync_refills;
 static int s_track_errs;
 /* Consecutive AUDIO_WRITE_STALLED results in the current track. */
 static int s_pcm_stalls;
+/* Consecutive decode frames that made NO progress (0 bytes consumed AND 0
+ * samples produced) yet returned success. A healthy track always advances the
+ * file pointer or emits audio, so a streak of pure no-progress frames means the
+ * decoder is looping on a malformed frame; without this guard it spins here at
+ * 100% CPU forever, starving the stall watchdog and (if the task WDT is not
+ * subscribed) freezing the device silently. */
+static int s_no_prog;
 /* Consecutive tracks that failed to play (open/decode/pipeline). */
 static int s_fail_count;
 /* Set when the current track is being aborted because of an error (as
@@ -707,6 +714,7 @@ static bool open_track(void)
     s_no_sync_refills = 0;   /* fresh track: restart sync-word watchdog */
     s_track_errs = 0;        /* fresh track: restart decode-error watchdog */
     s_pcm_stalls = 0;        /* fresh track: restart pipeline-stall watchdog */
+    s_no_prog = 0;           /* fresh track: restart no-progress watchdog */
     return true;
 }
 
@@ -752,6 +760,7 @@ static bool rewind_track(void)
     s_no_sync_refills = 0;   /* fresh pass: restart sync-word watchdog */
     s_track_errs = 0;        /* fresh pass: restart decode-error watchdog */
     s_pcm_stalls = 0;        /* fresh pass: restart pipeline-stall watchdog */
+    s_no_prog = 0;           /* fresh pass: restart no-progress watchdog */
     s_dbg_frames = 0;
     parse_id3v2();           /* re-skip the tag + pick up ReplayGain again */
     hw_audio_set_player_active(true); /* re-arm the pipeline */
@@ -817,9 +826,11 @@ static bool decode_frame(bool *rate_set)
     s_consumed += offset;
     s_bytes_left -= offset;
 
+    int cons_pre_decode = s_consumed;
     unsigned char *p = s_readbuf + s_consumed;
     int status = MP3Decode(s_dec, &p, &s_bytes_left, s_pcm, 0);
     s_consumed = (int)(p - s_readbuf);
+    int consumed_this = s_consumed - cons_pre_decode;
     const int64_t t_dec_done = esp_timer_get_time();
 
     if (status != 0) {
@@ -850,6 +861,25 @@ static bool decode_frame(bool *rate_set)
 
     MP3FrameInfo info;
     MP3GetLastFrameInfo(s_dec, &info);
+    /* No-progress guard: a frame that is reported decoded OK yet consumed no
+     * bytes AND produced no samples is pathological (e.g. a malformed frame the
+     * decoder loops on). Without this, compute_frame would re-sync onto the same
+     * bytes and spin at 100% CPU forever, starving the stall watchdog and — if
+     * the task WDT is not subscribed — freezing the device with no log. A
+     * healthy track always advances the file or emits audio, so a short streak
+     * of pure no-progress frames is unmistakably corrupt. */
+    if (info.outputSamps == 0 && consumed_this == 0) {
+        if (++s_no_prog >= 16) {
+            ESP_LOGE(TAG, "decode made no progress for %d frames, aborting '%s'",
+                     s_no_prog, s_name);
+            s_track_errored = true;
+            player_report_error(PLAYER_ERR_CORRUPT);
+            return false;
+        }
+    }
+    else {
+        s_no_prog = 0;
+    }
     if (!*rate_set && info.samprate > 0) {
         hw_audio_set_sample_rate((uint32_t)info.samprate);
         *rate_set = true;
@@ -1262,16 +1292,36 @@ void player_init(void)
         ESP_LOGE(TAG, "[ERROR] player watchdog task create FAILED");
     }
 #if defined(CONFIG_ESP_TASK_WDT_EN)
-    /* Last-resort backstop: a decode task busy-hung for 5 s trips the task
-     * WDT (it logs the hung task and, depending on config, reboots). The
-     * decode loop feeds it on every frame; blocked waits are bounded so a
-     * paused player keeps feeding too. The stall watchdog above is the
-     * actual recovery path — the WDT only catches what it cannot. */
+    /* Last-resort backstop: subscribe the decode task to the TASK WDT so a
+     * busy-hang inside decode_frame (a spin in the MP3 decoder on a malformed
+     * frame, or a blocking SD read) trips the WDT and reboots the chip with a
+     * backtrace instead of freezing silently forever. The decode loop feeds it
+     * on every frame; a paused player keeps feeding too, so only a true hang
+     * trips it. The stall watchdog (a normal-priority task) CANNOT catch a 100%
+     * CPU spin because the spinning task starves it — the WDT is a hardware
+     * timer ISR and fires regardless of task scheduling, which is exactly why
+     * it, not the stall watchdog, is the real safety net here. */
     if (s_task != NULL) {
         esp_err_t werr = esp_task_wdt_add(s_task);
+        if (werr == ESP_ERR_INVALID_STATE) {
+            /* WDT not yet initialized: bring it up with the Kconfig timeout,
+             * then retry the subscription. */
+            esp_task_wdt_config_t cfg = {
+                .timeout_ms     = (uint32_t)CONFIG_ESP_TASK_WDT_TIMEOUT_S * 1000U,
+                .idle_core_mask = 0,
+                .trigger_panic  = true,
+            };
+            if (esp_task_wdt_init(&cfg) == ESP_OK) {
+                werr = esp_task_wdt_add(s_task);
+            }
+        }
         if (werr != ESP_OK) {
-            ESP_LOGW(TAG, "task WDT subscribe failed: %s",
+            ESP_LOGE(TAG, "task WDT subscribe FAILED: %s "
+                          "(decode hang will NOT reboot!)",
                      esp_err_to_name(werr));
+        } else {
+            ESP_LOGI(TAG, "decode task subscribed to task WDT "
+                          "(%ds hang -> reboot)", CONFIG_ESP_TASK_WDT_TIMEOUT_S);
         }
     }
 #endif
