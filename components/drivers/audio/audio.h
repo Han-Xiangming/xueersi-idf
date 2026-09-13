@@ -74,10 +74,13 @@ void hw_audio_set_track_gain_db(float gain_db);
 void hw_audio_set_master_gain_db(float gain_db);
 float hw_audio_get_master_gain_db(void);
 
-/* Reconfigure the I2S sample rate (e.g. to match an MP3 file's rate).
- * Applied immediately from the calling task; a running channel is parked
- * for the reconfig and re-enabled by the next PCM write, so the new clock
- * is always in place before the first data of a track. */
+/* Declare the DECODER's native sample rate for the current track (e.g. an
+ * MP3 file's rate). The I2S channel itself runs at ONE fixed rate (set once at
+ * init); decoded PCM is resampled to it inside hw_audio_write_pcm, so a rate
+ * change NEVER disables/rebuilds the channel — this removes the in-playback
+ * out-link stop/start that wedged the ESP32 DMA on mixed-rate playlists.
+ * Call once per track (its first decoded frame). A no-op when the decoder rate
+ * already matches the fixed I2S rate. */
 void hw_audio_set_sample_rate(uint32_t sample_rate_hz);
 
 /* Mark/unmark the MP3 player as the owner of the I2S bus. Claiming only

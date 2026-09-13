@@ -45,6 +45,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "esp_attr.h"          /* EXT_RAM_BSS_ATTR for the resampler scratch */
 
 static const char *TAG = "hw_audio";
 
@@ -89,6 +90,30 @@ static const char *TAG = "hw_audio";
 static i2s_chan_handle_t s_tx;
 static volatile bool s_ready;
 static uint32_t s_rate = AUDIO_DEFAULT_RATE;
+
+/* The I2S channel is created at this ONE rate and is NEVER rebuilt for a
+ * sample-rate change: decoded PCM is resampled to it in hw_audio_write_pcm
+ * instead. Keeping the out-link enabled once for the whole session removes the
+ * only in-playback disable/enable (the rate-change rebuild) — the out-link
+ * stop/start cycle that wedged the ESP32 DMA ("plays at first, then nothing,
+ * only over I2S"). See hw_audio_set_sample_rate(). */
+
+/* Linear-interpolation resampler state (decoder rate -> fixed I2S rate). */
+typedef struct {
+    uint32_t step;        /* Q16: src_rate/out_rate, phase advance per output */
+    uint16_t phase;       /* 0..65535 position within the current input interval */
+    int16_t  last_l;      /* carried lower (L) sample across chunks */
+    int16_t  last_r;      /* carried lower (R) sample across chunks */
+    bool     have_last;   /* whether last_l/last_r hold a valid sample */
+} resamp_t;
+static resamp_t s_resamp;
+static bool     s_resamp_active;   /* true: src_rate != s_rate, resample on write */
+
+/* Resampler output scratch. It is the DSP+DMA source (like s_stereo), so PSRAM
+ * is fine and keeps DRAM free. Sized for the largest realistic upsample ratio
+ * (8 kHz -> 44.1 kHz ~5.5x) on a 1152-frame MP3 chunk, plus headroom. */
+#define RESAMP_MAX_FRAMES  7680
+EXT_RAM_BSS_ATTR static int16_t s_rs_buf[RESAMP_MAX_FRAMES * 2];
 static volatile bool s_player_active;    /* MP3 player owns the I2S bus */
 
 /* Active output route: a single, explicit either/or selection. Only
@@ -879,56 +904,46 @@ float hw_audio_get_master_gain_db(void)
     return s_master_gain_db;
 }
 
-/* Reconfigure the I2S sample rate. Applied IMMEDIATELY from the calling task
- * (the MP3 player's decode task — the only user), so the new clock is in
- * place before the first PCM of a track reaches the DMA; there is no
- * deferred/pending rate that a pause/stop could lose.
+/* Declare the DECODER's native sample rate for the current track.
  *
- * ESP-IDF v6.1 only allows i2s_channel_reconfig_std_clock() in the READY
- * (not-started) state, so a running channel must be disabled first — but a
- * disable->enable on the SAME handle is the out-link stop/start that can wedge
- * the ESP32 DMA (see the block comment above hw_audio_set_player_active). We
- * therefore switch rate by REBUILDING the channel (a fresh channel whose first
- * enable is the reliable power-on path, and the driver's own wedge-recovery):
- * the bus can never be left permanently dead by a rate change. A uniform-rate
- * library never reaches this code (same-rate tracks return at the top), so it
- * never cycles the channel at all. */
+ * The I2S channel runs at ONE FIXED rate (s_rate, set once at init) for the
+ * whole session. Decoded PCM is resampled to that rate inside
+ * hw_audio_write_pcm, so a rate change NEVER rebuilds/disables the channel —
+ * which removes the in-playback out-link stop/start that wedged the ESP32 DMA
+ * ("plays at first, then nothing, only over I2S" on the second track of a
+ * mixed-rate playlist; BT was unaffected because it bypasses I2S entirely).
+ *
+ * This is the fix for the random-loop / single-loop silence: those modes pick
+ * arbitrary or repeat files whose rate differs from the previous track, which
+ * used to trigger hw_audio_rebuild_i2s() at the seam. With a fixed I2S rate the
+ * channel is enabled once and never torn down between tracks, so the DMA cannot
+ * wedge. Correct pitch is preserved by the resampler. */
 void hw_audio_set_sample_rate(uint32_t sample_rate_hz)
 {
-    if (!s_ready || sample_rate_hz == 0 || sample_rate_hz == s_rate) {
+    if (sample_rate_hz == 0) {
         return;
     }
-    s_rate = sample_rate_hz;
-    audio_set_hpf_coeff(s_rate);
-    audio_set_loudness_coeff(s_rate);
     if (audio_route_is_bt()) {
+        /* BT takes the original PCM; the SBC encoder handles its own rate.
+         * No resampling, no I2S channel involved. */
         bt_audio_set_sample_rate(sample_rate_hz);
         return;
     }
-    /* Speaker route: adopt the new rate by REBUILDING the channel
-     * (hw_audio_rebuild_i2s: i2s_channel_disable -> i2s_del_channel ->
-     * i2s_new_channel -> init_std_mode at s_rate -> first enable on next PCM
-     * write). This is deliberate and the SAFE choice:
-     *   - ESP-IDF v6.1 requires a channel to be in the READY (not-started)
-     *     state before i2s_channel_reconfig_std_clock() may be called; a
-     *     running channel must be disabled first. But a disable->enable on the
-     *     SAME channel handle is exactly the out-link stop/start that can wedge
-     *     the ESP32 DMA (see the block comment above hw_audio_set_player_active)
-     *     — so a live reconfig is NOT an option.
-     *   - A rebuild instead throws the old channel away and creates a brand-new
-     *     one whose first enable is the reliable path (the same one that works
-     *     after power-on); it is also the driver's own wedge-RECOVERY. So a rate
-     *     change at a track seam takes the recovery-shaped path and cannot leave
-     *     the bus in a wedged, permanently-dead state.
-     * The only writer is the decode task, serialized with the rebuild through
-     * s_io_lock, so a rebuild mid-track is safe. A uniform-rate library never
-     * reaches this code (same-rate tracks return at the top), so it never cycles
-     * the channel at all. */
-    ESP_LOGI(TAG, "I2S rate -> %u Hz (rebuilding channel)", (unsigned)s_rate);
-    if (hw_audio_rebuild_i2s() != ESP_OK) {
-        ESP_LOGE(TAG, "I2S rebuild for rate change failed: playback may be "
-                      "off-pitch until the next track");
+    /* Speaker route: arm the resampler (or bypass when the decoder rate
+     * already matches the fixed I2S rate). The DSP coefficients stay at the
+     * fixed I2S rate (s_rate) because all PCM is resampled to it before the
+     * DSP chain runs. Reset the resampler at each track's first frame so no
+     * sample bleeds across the seam. */
+    if (sample_rate_hz == s_rate) {
+        s_resamp_active = false;   /* 1:1: bypass, zero overhead */
+        return;
     }
+    s_resamp.step = (uint32_t)((uint64_t)sample_rate_hz * 65536u / s_rate);
+    s_resamp.phase = 0;
+    s_resamp.have_last = false;
+    s_resamp_active = true;
+    ESP_LOGI(TAG, "resampler armed: %u -> %u Hz (step=%u)",
+             (unsigned)sample_rate_hz, (unsigned)s_rate, (unsigned)s_resamp.step);
 }
 
 /* Drop the previous pass's queued audio so a repeat-one replay starts clean.
@@ -955,6 +970,59 @@ void hw_audio_pipeline_flush(void)
     }
     /* Speaker route: the channel keeps running; auto_clear drains it to
      * silence. Deliberately no i2s_channel_disable()/enable() here. */
+}
+
+/* Resample `pairs_in` stereo L/R pairs (decoder native rate) to the fixed I2S
+ * rate using linear interpolation. State (phase + one carried sample) persists
+ * across calls, so the resampled stream is continuous across MP3 frames.
+ * Returns the number of output pairs written into `out` (at most
+ * RESAMP_MAX_FRAMES). Caller guarantees pairs_in > 0 when s_resamp_active. */
+static size_t resamp_process_pairs(const int16_t *in, size_t pairs_in,
+                                   int16_t *out)
+{
+    size_t out_pairs = 0;
+    size_t p = 0;
+
+    if (!s_resamp.have_last) {
+        /* Seed the "lower" sample with the first input pair; the first emitted
+         * sample then equals the first input (phase 0 -> lerp returns last). */
+        s_resamp.last_l = in[0];
+        s_resamp.last_r = in[1];
+        s_resamp.have_last = true;
+        p = 1;
+    }
+
+    while (p < pairs_in) {
+        if (out_pairs >= RESAMP_MAX_FRAMES) {
+            break;   /* defensive: never overflow the scratch buffer */
+        }
+        int32_t cur_l = in[2 * p];
+        int32_t cur_r = in[2 * p + 1];
+        uint16_t phase = s_resamp.phase;
+        /* out = lerp(last, cur, phase/65536) */
+        int32_t ol = ((int32_t)s_resamp.last_l * (65536 - phase)
+                      + cur_l * (int32_t)phase) >> 16;
+        int32_t or_ = ((int32_t)s_resamp.last_r * (65536 - phase)
+                       + cur_r * (int32_t)phase) >> 16;
+        out[2 * out_pairs]     = (int16_t)ol;
+        out[2 * out_pairs + 1] = (int16_t)or_;
+        out_pairs++;
+
+        uint32_t np = (uint32_t)phase + s_resamp.step;   /* Q16 advance */
+        while (np >= 65536u) {
+            np -= 65536u;
+            s_resamp.last_l = (int16_t)cur_l;
+            s_resamp.last_r = (int16_t)cur_r;
+            p++;
+            if (p >= pairs_in) {
+                break;
+            }
+            cur_l = in[2 * p];
+            cur_r = in[2 * p + 1];
+        }
+        s_resamp.phase = (uint16_t)(np & 0xFFFFu);
+    }
+    return out_pairs;
 }
 
 /* Stream decoded 16-bit stereo PCM (L,R interleaved). `frames` = number of
@@ -993,7 +1061,17 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
 
     const int32_t g_target = s_vol_gain;    /* Q15 target logarithmic gain */
     int32_t g = s_vol_gain_sm;              /* smoothed gain to apply */
-    size_t n = frames * 2;
+
+    /* Speaker path: resample the decoder's native rate to the fixed I2S rate
+     * before DSP. BT takes the original PCM (SBC encodes its own rate), so it
+     * is skipped here. dsp_buf/dsp_frames are what the DSP chain + DMA run on. */
+    int16_t *dsp_buf = stereo_frames;
+    size_t   dsp_frames = frames;
+    if (!bt_out && s_resamp_active) {
+        dsp_frames = resamp_process_pairs(stereo_frames, frames, s_rs_buf);
+        dsp_buf = s_rs_buf;
+    }
+    size_t n = dsp_frames * 2;
 
     if (bt_out) {
         /* Park the speaker path while Bluetooth plays: no BCLK, amp off. */
@@ -1045,7 +1123,7 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
      * (L = even index, R = odd index). */
     for (size_t i = 0; i < n; i++) {
         int ch = (int)(i & 1);
-        int32_t x = stereo_frames[i];
+        int32_t x = dsp_buf[i];
 
         /* Speaker-protection high-pass */
         int32_t y = (x - s_hpf_x1[ch]) + ((s_hpf_lambda * s_hpf_y1[ch]) >> 15);
@@ -1120,11 +1198,11 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
             s_lim_gain += ((tg - s_lim_gain) * LIM_REL_Q15) >> 15;
         }
         y = (y * s_lim_gain) >> 15;
-        stereo_frames[i] = (int16_t)y;
+        dsp_buf[i] = (int16_t)y;
     }
     s_vol_gain_sm = g;
 
-    size_t bytes = frames * 4;
+    size_t bytes = dsp_frames * 4;
     /* Serialize with stop/park requests from other tasks: the lock is held
      * only around the driver calls, and a concurrent holder takes at most one
      * bounded I2S_WRITE_TIMEOUT_MS write, so AUDIO_IO_LOCK_TIMEOUT_MS (which
@@ -1192,7 +1270,7 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
      * watchdog, so a genuine wedge still surfaces. */
     const uint32_t wr_timeout_ms = I2S_WRITE_TIMEOUT_MS;
     size_t w = 0;
-    esp_err_t e = i2s_channel_write(s_tx, stereo_frames, bytes, &w,
+    esp_err_t e = i2s_channel_write(s_tx, dsp_buf, bytes, &w,
                                     wr_timeout_ms);
     s_last_write_us = esp_timer_get_time();
     xSemaphoreGive(s_io_lock);
