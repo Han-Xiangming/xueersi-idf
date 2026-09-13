@@ -558,7 +558,28 @@ void hw_audio_park(void)
         return;
     }
     if (xSemaphoreTake(s_io_lock,
-                       pdMS_TO_TICKS(AUDIO_IO_LOCK_TIMEOUT_MS)) == pdTRUE) {
+                       pdMS_TO_TICKS(AUDIO_IO_LOCK_TIMEOUT_MS)) != pdTRUE) {
+        return;
+    }
+    if (s_i2s_enabled) {
+        /* Flush the residual tail BEFORE disabling. hw_audio_set_player_active
+         * (false) deliberately leaves the channel running so auto_clear keeps
+         * zeroing each descriptor as it is transmitted; but this function used to
+         * call i2s_channel_disable() immediately, freezing whatever old audio was
+         * still queued in the ring. On the next play the channel is re-enabled and
+         * that frozen tail plays first -> the "余音" of the previous track.
+         *
+         * Fix: keep the channel enabled for one full ring's worth of time so the
+         * DMA drains the queue and auto_clear turns every descriptor to silence.
+         * Only then disable, so a later re-enable starts from a clean (silent)
+         * ring. The wait is bounded by the ring size at the fixed I2S rate. */
+        int64_t drain_us = (int64_t)I2S_DMA_DESC_NUM * 1024 * 1000000 / s_rate;
+        xSemaphoreGive(s_io_lock);   /* don't hold the lock during the wait */
+        vTaskDelay(pdMS_TO_TICKS((TickType_t)(drain_us / 1000 + 60)));
+        if (xSemaphoreTake(s_io_lock,
+                           pdMS_TO_TICKS(AUDIO_IO_LOCK_TIMEOUT_MS)) != pdTRUE) {
+            return;
+        }
         if (s_i2s_enabled) {
             if (i2s_channel_disable(s_tx) != ESP_OK) {
                 ESP_LOGW(TAG, "I2S park failed");
@@ -568,8 +589,8 @@ void hw_audio_park(void)
             ESP_LOGD(TAG, "I2S parked (session #%u ended)",
                      (unsigned)s_enable_count);
         }
-        xSemaphoreGive(s_io_lock);
     }
+    xSemaphoreGive(s_io_lock);
 }
 
 bool hw_audio_is_ready(void)
