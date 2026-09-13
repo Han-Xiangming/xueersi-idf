@@ -19,19 +19,9 @@
 
 ## 1. 快速开始
 
-### 1.1 固件下载与刷入
+本工程不提供预编译固件，需自行从源码构建。
 
-已经编译好的 merged bin 放在本项目的 [Releases](https://github.com/ZyoungInc/xueersi-idf/releases/latest) 页面。普通用户可以直接下载 release 里的 `xiaomiao-merged.bin` 并从 `0x0` 地址刷入，不需要自己搭建 ESP-IDF 编译环境。
-
-示例命令：
-
-```bash
-esptool.py --chip esp32 -b 460800 write_flash 0x0 xiaomiao-merged.bin
-```
-
-刷入前请确认目标硬件是 ESP32-WROVER-B 版本的小喵掌机，并确认串口连接正常。
-
-### 1.2 从源码构建
+### 1.1 从源码构建
 
 需要 ESP-IDF v6.1（正式版，已验证）。
 
@@ -59,7 +49,7 @@ dev clean      :: 清理
 - 蓝牙经典 BR/EDR（Bluedroid 主机），启用 A2DP 与 AVRCP；不启用 BLE
 - FATFS 启用长文件名（堆分配）+ UTF-8 文件名编码，以支持中文文件名
 
-### 1.3 PC 端工具脚本
+### 1.2 PC 端工具脚本
 
 - `rsgain-scan.bat` —— 调用 rsgain 扫描 SD 卡中的 mp3，写入 ReplayGain 2.0 标签。
 - `clear-cover.bat` / `clear-cover.ps1` —— 批量清除 mp3 内嵌封面（视频流）并保留全部音频标签：用 ffmpeg 转封装剥离封面流后回写。ReplayGain 等 TXXX 标签在转封装中原样保留，不影响固件按标签做响度归一。
