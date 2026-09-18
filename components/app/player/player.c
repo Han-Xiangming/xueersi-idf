@@ -989,9 +989,13 @@ static void decode_loop(void)
              * 列表被扫描任务换源/重排时可能失败，导致 s_index=-1，进而 list-loop/
              * 单曲/随机 在 I2S 下全部失效。无显式 index（直接 player_play(path)）
              * 时退回路径回查以保持兼容。 */
-            if (s_new_index >= 0) {
+            if (s_new_index >= 0 && s_new_index < s_playlist->count) {
                 s_index = s_new_index;
             } else {
+                /* 显式 index 失效（列表被换源/重排/缩短，或本次请求没有显式
+                 * index）：退回路径回查，保证 s_index 恒为"当前列表"内的有效
+                 * 下标。越界的 index 会让后续连播/切歌算到错误的曲目，UI 也
+                 * 无法把高亮跟到真正在播的那一首。 */
                 s_index = -1;
                 for (int k = 0; k < s_playlist->count; k++) {
                     if (strcmp(s_playlist->items[k].path, s_path) == 0) {

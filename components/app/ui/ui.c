@@ -2044,6 +2044,23 @@ void ui_refresh(void)
         if (s_mp3_sel >= s_mp3_count) {
             s_mp3_sel = s_mp3_count > 0 ? s_mp3_count - 1 : 0;
         }
+        /* While a (sub)folder load is in flight, s_playlist still holds the
+         * previous folder's contents. Suppress drawing it so we don't flash
+         * the old list for a frame before the scan publishes the new one. */
+        const bool loading = s_mp3_loading && player_scan_busy();
+        player_state_t st = player_state();
+        /* 光标跟随正在播放的曲目：自动连播（自然结束 / 出错跳曲）由播放器自行
+         * 推进 index，UI 必须同步移动高亮，否则列表仍选中上一首，正在播放的那
+         * 首反而没有选中。名字校验是必要的兜底 —— 若正在播放的曲目并不属于当前
+         * 显示的列表（例如播放途中打开了别的子目录，index 已指向另一首），就不
+         * 能用失效的下标去抢光标。 */
+        if (!loading && st != PLAYER_IDLE) {
+            const int cur = player_current_index();
+            if (cur >= 0 && cur < s_mp3_count && cur != s_mp3_sel &&
+                strcmp(player_scan_name(cur), player_current_name()) == 0) {
+                s_mp3_sel = cur;
+            }
+        }
         int top = s_mp3_sel - 1;
         if (top < 0) {
             top = 0;
@@ -2053,10 +2070,6 @@ void ui_refresh(void)
         }
         const bool sel_changed = (s_mp3_sel != s_paint_mp3_sel)
                                  || (top != s_paint_mp3_top);
-        /* While a (sub)folder load is in flight, s_playlist still holds the
-         * previous folder's contents. Suppress drawing it so we don't flash
-         * the old list for a frame before the scan publishes the new one. */
-        const bool loading = s_mp3_loading && player_scan_busy();
         for (int i = 0; i < MP3_LIST_ROWS; i++) {
             int idx = top + i;
             const int sel = (idx == s_mp3_sel);
@@ -2070,7 +2083,7 @@ void ui_refresh(void)
                     /* Selected row scrolls its name if wider than the line — but
                      * only when idle. While playing we freeze a static (clipped)
                      * name to avoid needless redraws and save resources. */
-                    if (player_state() == PLAYER_PLAYING) {
+                    if (st == PLAYER_PLAYING) {
                         s_mp3_mq.scrolling = false;
                         copy_utf8_clipped(s_pl_name_buf, sizeof(s_pl_name_buf),
                                           strip_ext(player_scan_name(idx)));
@@ -2114,7 +2127,6 @@ void ui_refresh(void)
         if (s_mp3_loading && !player_scan_busy()) {
             s_mp3_loading = false;
         }
-        player_state_t st = player_state();
         /* Top-right status: playback symbol + repeat mode, e.g. ">>单曲" /
          * "||列表" / "--随机", so the current loop mode is always visible. */
         char stbuf[16];
