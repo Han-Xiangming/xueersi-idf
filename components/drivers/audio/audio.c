@@ -1066,6 +1066,29 @@ static size_t resamp_process_pairs(const int16_t *in, size_t pairs_in,
     return (size_t)produced;
 }
 
+/* --- Final 16-bit conversion -------------------------------------------
+ * Everything downstream of the per-track / master gain stages runs with 32-bit
+ * headroom (see the block comment above the DSP loop), so the value reaching
+ * the DAC (or the Bluetooth ring) may legitimately be several times full
+ * scale. Casting that straight to int16_t WRAPS (65536 -> 0, 32768 -> -32768)
+ * — the loudest possible artifact, a polarity flip on every clipped sample —
+ * so clamp instead. This ONE explicit clamp replaces the per-stage clamps that
+ * used to sit in the middle of the chain. */
+static int16_t audio_clip16(int32_t v)
+{
+    if (v > 32767) {
+        return 32767;
+    }
+    if (v < -32768) {
+        return -32768;
+    }
+    return (int16_t)v;
+}
+
+/* Bound a stage result to a value that still fits the 32-bit pipeline. Used
+ * only where a later multiply could otherwise exceed INT32_MAX. */
+#define DSP_MAX  1048576   /* 2^20: ~30 dB above full scale */
+
 /* Stream decoded 16-bit stereo PCM (L,R interleaved). `frames` = number of
  * L/R pairs. Returns the write result so the player can tell a wedged
  * pipeline (AUDIO_WRITE_STALLED) from a clean pause/stop
@@ -1132,27 +1155,31 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
          * which the player counts and turns into a visible pipeline error —
          * the decode task is never left blocked inside this call forever. */
         for (size_t i = 0; i < n; i++) {
-            /* Per-track ReplayGain first, then the user master gain (both
-             * clamped to 16-bit: the BT path has no limiter to catch
-             * over-boosted peaks). */
+            /* Per-track ReplayGain first, then the user master gain. NO
+             * intermediate 16-bit clamp between them: see the headroom note
+             * above the speaker loop. Both multiplies widen to 64-bit so a
+             * boosted sample cannot overflow int32. */
             s_track_gain_sm += ((s_track_gain - s_track_gain_sm) * VOL_SMOOTH_A_Q15) >> 15;
             int32_t t = (int32_t)(((int64_t)stereo_frames[i] * s_track_gain_sm) >> 15);
-            if (t > 32767) {
-                t = 32767;
+            if (t > DSP_MAX) {
+                t = DSP_MAX;
             }
-            else if (t < -32768) {
-                t = -32768;
+            else if (t < -DSP_MAX) {
+                t = -DSP_MAX;
             }
             s_master_gain_sm += ((s_master_gain - s_master_gain_sm) * VOL_SMOOTH_A_Q15) >> 15;
             t = (int32_t)(((int64_t)t * s_master_gain_sm) >> 15);
-            if (t > 32767) {
-                t = 32767;
+            if (t > DSP_MAX) {
+                t = DSP_MAX;
             }
-            else if (t < -32768) {
-                t = -32768;
+            else if (t < -DSP_MAX) {
+                t = -DSP_MAX;
             }
             g += ((g_target - g) * VOL_SMOOTH_A_Q15) >> 15;
-            stereo_frames[i] = (int16_t)((t * g) >> 15);
+            /* One 64-bit multiply (t is already beyond 16-bit here) and ONE
+             * clamp into the int16 sample the A2DP encoder expects. */
+            int32_t o = (int32_t)(((int64_t)t * g) >> 15);
+            stereo_frames[i] = audio_clip16(o);
         }
         s_vol_gain_sm = g;
         bool bt_ok = bt_audio_write_pcm(stereo_frames, frames);
@@ -1161,7 +1188,20 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
 
     /* Speaker route: high-pass -> loudness bass shelf -> per-track gain
      * -> user master gain -> master volume -> soft limiter, all per sample
-     * (L = even index, R = odd index). */
+     * (L = even index, R = odd index).
+     *
+     * HEADROOM: only the two SHAPING stages (protection high-pass and bass
+     * shelf) are allowed to clamp to 16-bit — they run at input level, so a
+     * clamp there costs nothing. From the per-track ReplayGain onwards the
+     * signal stays in 32-bit WITHOUT an intermediate clamp, which is what lets
+     * a boost actually be a boost: the old code clamped to ±32767 right after
+     * the track gain AND after the master gain, so any positive master gain
+     * simply squared off every sample above ~25 % FS before the volume knob
+     * ever attenuated it — turning 总增益 up during playback produced hard
+     * clipping instead of more level (the gain even appeared to do nothing on
+     * hot tracks). Now the soft limiter at the end of the chain is what bounds
+     * the peaks, exactly as documented, and the last simple step converts once
+     * into 16-bit with an explicit clamp (never a wrapping cast). */
     for (size_t i = 0; i < n; i++) {
         int ch = (int)(i & 1);
         int32_t x = dsp_buf[i];
@@ -1192,42 +1232,47 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
 
         /* Per-track ReplayGain (pre-master-gain, so it scales the whole
          * signal; the limiter below still bounds the peaks). 64-bit
-         * multiply: the gain can exceed 1.0 (up to +12 dB). */
+         * multiply: the gain can exceed 1.0 (up to +12 dB). NO 16-bit clamp
+         * afterwards — the boost needs somewhere to go. */
         s_track_gain_sm += ((s_track_gain - s_track_gain_sm) * VOL_SMOOTH_A_Q15) >> 15;
         y = (int32_t)(((int64_t)y * s_track_gain_sm) >> 15);
-        if (y > 32767) {
-            y = 32767;
+        if (y > DSP_MAX) {
+            y = DSP_MAX;
         }
-        else if (y < -32768) {
-            y = -32768;
+        else if (y < -DSP_MAX) {
+            y = -DSP_MAX;
         }
 
         /* User master gain (preamp offset, pre-volume; the soft limiter
          * below still bounds the peaks). Same 64-bit multiply: ±12 dB can
-         * scale by up to ~4x. */
+         * scale by up to ~4x, and with the headroom kept here a positive
+         * value really does add level instead of clipping. */
         s_master_gain_sm += ((s_master_gain - s_master_gain_sm) * VOL_SMOOTH_A_Q15) >> 15;
         y = (int32_t)(((int64_t)y * s_master_gain_sm) >> 15);
-        if (y > 32767) {
-            y = 32767;
+        if (y > DSP_MAX) {
+            y = DSP_MAX;
         }
-        else if (y < -32768) {
-            y = -32768;
+        else if (y < -DSP_MAX) {
+            y = -DSP_MAX;
         }
 
         g += ((g_target - g) * VOL_SMOOTH_A_Q15) >> 15;
-        y = (y * g) >> 15;               /* apply logarithmic volume */
+        y = (int32_t)(((int64_t)y * g) >> 15);   /* logarithmic volume */
 
-        /* Soft limiter: tame peaks above the threshold */
+        /* Soft limiter: tame peaks above the threshold. Every product below
+         * widens to 64-bit: y is no longer 16-bit-bounded, so the envelope
+         * and its gain law can overflow int32 otherwise. */
         int32_t a = (y < 0) ? -y : y;
         if (a > s_lim_env) {
             s_lim_env = a;               /* instant peak attack */
         }
         else {
-            s_lim_env = (s_lim_env * LIM_REL_Q15) >> 15;   /* slow release */
+            s_lim_env = (int32_t)(((int64_t)s_lim_env * LIM_REL_Q15) >> 15); /* slow release */
         }
         int32_t tg = 32768;              /* flat 0 dB below threshold */
         if (s_lim_env > LOUD_LIMIT_THRESH) {
-            tg = 32768 - (((s_lim_env - LOUD_LIMIT_THRESH) * LOUD_LIMIT_SLOPE_Q15) >> 15);
+            tg = 32768 - (int32_t)(((int64_t)(s_lim_env - LOUD_LIMIT_THRESH)
+                                    * LOUD_LIMIT_SLOPE_Q15) >> 15);
             if (tg < LOUD_LIMIT_MIN_Q15) {
                 tg = LOUD_LIMIT_MIN_Q15;
             }
@@ -1238,8 +1283,12 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
         else {
             s_lim_gain += ((tg - s_lim_gain) * LIM_REL_Q15) >> 15;
         }
-        y = (y * s_lim_gain) >> 15;
-        dsp_buf[i] = (int16_t)y;
+        y = (int32_t)(((int64_t)y * s_lim_gain) >> 15);
+        /* Single conversion into the 16-bit sample the DAC consumes. The limiter
+         * has already pulled the peaks down; this clamp is only the last-resort
+         * guard for a user who pushed the preamp far enough to still exceed
+         * full scale (and it must never be a wrapping cast). */
+        dsp_buf[i] = audio_clip16(y);
     }
     s_vol_gain_sm = g;
 
