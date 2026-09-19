@@ -1,14 +1,14 @@
 /*
- * Hardware layer: I2S audio output driving a MAX98357 stereo Class-D DAC.
+ * Hardware layer: I2S audio output driving a MAX98357 stereo Class-D DAC,
+ * via an ADF i2s_stream WRITER element (codec-less).
  *
  * Streams decoded MP3 PCM over I2S (BCLK/LRC/DIN); the MAX98357 derives its
  * own master clock from BCLK, so no MCLK is wired.
  *
- * Direct-write architecture: the MP3 player task applies the DSP chain and
- * writes PCM straight to the I2S DMA (no ring buffer / feed task). The DMA
- * paces the decoder by back-pressure; the channel is enabled by the first
- * write of a speaker session and parked (BCLK stopped, amp powered down)
- * while idle or on the Bluetooth route.
+ * The I2S clock is FIXED for the whole session; decoded PCM is resampled to it
+ * before the DSP. The element is created RUNNING at init and only pause/resumed
+ * (route switch to Bluetooth, end-of-playback park) — never disable/enabled, so
+ * the ESP32 out-link stop/start wedge cannot recur.
  */
 #pragma once
 
@@ -29,14 +29,14 @@ typedef enum {
     AUDIO_ROUTE_BT,        /* Bluetooth A2DP sink (headphones / BT speaker) */
 } audio_route_t;
 
-/* Initialize the I2S peripheral and the MAX98357 DAC. Leaves the route at its
- * default (SPEAKER) and the channel parked. */
+/* Initialize the i2s_stream I2S output and the MAX98357 DAC (codec-less).
+ * Creates the WRITER element at the fixed I2S rate and leaves it RUNNING. */
 void hw_audio_init(void);
 
 /* Explicitly select the active output route. The writer streams to exactly
- * this destination. Switching away from the speaker parks the I2S channel
- * (the amp powers down) so it goes truly silent; switching back resumes it.
- * This is the ONLY way the route changes. */
+ * this destination. Switching away from the speaker PAUSES the i2s_stream
+ * writer (BCLK stops, amp powers down); switching back RESUMES it. This is the
+ * ONLY way the route changes. */
 void hw_audio_set_route(audio_route_t route);
 
 /* Current active output route. */
@@ -83,18 +83,18 @@ float hw_audio_get_master_gain_db(void);
  * already matches the fixed I2S rate. */
 void hw_audio_set_sample_rate(uint32_t sample_rate_hz);
 
-/* Mark/unmark the MP3 player as the owner of the I2S bus. Claiming only
- * arms the pipeline (the channel is enabled by the first PCM write).
- * Releasing does NOT park the channel: it keeps clocking auto_clear silence so
- * pause/resume and track switches need no out-link stop/start (see the note
- * in audio.c). Safe to call from any task, including while a write is in
- * flight. */
+/* Mark/unmark the MP3 player as the owner of the I2S bus. Claiming resets the
+ * DSP and RESUMES the i2s_stream writer (it may have been paused by a route
+ * switch or by hw_audio_park() at the previous track's end). Releasing does
+ * NOT pause the element: it keeps clocking digital silence so pause/resume and
+ * track switches need no out-link stop/start (see audio.c). Safe to call from
+ * any task, including while a write is in flight. */
 void hw_audio_set_player_active(bool active);
 
-/* Really park the I2S channel (BCLK stops, amp powers down, out-EOF interrupt
- * disabled). Call ONLY when playback is finished for good — i.e. when the
- * decode loop exits — never on pause or between tracks. Safe to call from any
- * task; a no-op when the channel is already parked. */
+/* Pause the i2s_stream writer (BCLK stops, MAX98357 powers down). Call ONLY
+ * when playback is finished for good — i.e. when the decode loop exits —
+ * never on pause or between tracks. The element is resumed by the next
+ * hw_audio_set_player_active(true). */
 void hw_audio_park(void);
 
 /* Drop what the previous pass left queued in the output pipeline and reset the
@@ -135,13 +135,3 @@ bool hw_audio_is_ready(void);
  * audio internals. */
 bool hw_audio_is_playing(void);
 
-/* Troubleshooting: tear down and re-create the I2S channel from scratch
- * (DMA descriptors, std-mode init, pins), recompute the DSP coefficients
- * for the current sample rate and reset the filter history, leaving the
- * channel parked. Recovers a wedged pipeline (stuck DMA / write stalls)
- * without a reboot — and can also bring the channel up after a boot-time
- * init failure. Call only while the player is stopped: the caller must
- * release the bus first (hw_audio_set_player_active(false) / player_stop),
- * otherwise ESP_ERR_INVALID_STATE is returned. Serialized by the IO mutex
- * like every channel operation. */
-esp_err_t hw_audio_rebuild_i2s(void);

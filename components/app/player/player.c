@@ -1534,19 +1534,12 @@ void player_play(const char *path)
     /* 原则3：audio 未 ready（I2S/互斥锁未初始化）时不接受播放请求。上报
      * 错误而不是静默忽略，UI 才能告诉用户为什么按播放没反应。 */
     if (!hw_audio_is_ready()) {
-        /* Self-heal before giving up: an earlier channel rebuild can have torn
-         * the I2S bus down without managing to recreate it, which would
-         * otherwise silence the device for the REST OF THE BOOT (every later
-         * play hits this same check). One rebuild attempt turns that permanent
-         * failure into a single hiccup. */
-        ESP_LOGW(TAG, "audio not ready -> attempting I2S rebuild");
-        if (hw_audio_rebuild_i2s() != ESP_OK || !hw_audio_is_ready()) {
-            ESP_LOGE(TAG, "[ERROR] play requested but audio not ready, ignored");
-            player_report_error(PLAYER_ERR_AUDIO);
-            s_new_index = -1;   /* 丢弃本次显式 index，避免泄漏到后续直接 player_play(path) */
-            return;
-        }
-        ESP_LOGI(TAG, "I2S rebuilt, continuing play request");
+        /* 音频不可用(初始化失败):直接上报错误,不再尝试重建通道——
+           i2s_stream 元素在 init 时一次性创建,无手写 I2S 通道可重建。 */
+        ESP_LOGE(TAG, "[ERROR] play requested but audio not ready, ignored");
+        player_report_error(PLAYER_ERR_AUDIO);
+        s_new_index = -1;   /* 丢弃本次显式 index，避免泄漏到后续直接 player_play(path) */
+        return;
     }
     /* A fresh play from idle is a new attempt by the user: reset the
      * consecutive-failure streak so a recovered player does not immediately
