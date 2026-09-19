@@ -38,9 +38,10 @@
  * spinning the CPU forever on a file that will never produce audio. */
 #define TRACK_MAX_DECODE_ERRS    512
 /* Consecutive AUDIO_WRITE_STALLED results that abort a track. A single stall
- * is now just a transient (the writer self-heals a wedged DMA by rebuilding
- * the channel), so require more of them before giving up — a momentary
- * decode/SD hiccup must not abort a good track. */
+ * is now just a transient: the i2s_stream writer feeds DMA from a ringbuf, so
+ * a momentary decode/SD hiccup merely backs the ringbuf up and clears on its
+ * own, no channel rebuild needed. Require more of them before giving up so a
+ * brief hiccup must not abort a good track. */
 #define TRACK_MAX_PIPELINE_STALLS 10
 /* Consecutive tracks that failed to play before the player gives up and
  * stops (avoids cycling through a whole card of corrupt files forever). */
