@@ -884,7 +884,7 @@ static bool decode_frame(bool *rate_set)
         hw_audio_set_sample_rate((uint32_t)info.samprate);
         *rate_set = true;
         s_dbg_rate = (uint32_t)info.samprate;
-        ESP_LOGD(TAG, "first frame: %u Hz, %d ch, %d kbps, %d samples/frame",
+        ESP_LOGI(TAG, "first frame: %u Hz, %d ch, %d kbps, %d samples/frame",
                  (unsigned)info.samprate, info.nChans, info.bitrate,
                  info.outputSamps);
     }
@@ -896,15 +896,29 @@ static bool decode_frame(bool *rate_set)
     }
 
     audio_write_result_t wr;
-    if (info.nChans == 2) {
+    if (info.nChans >= 2) {
+        /* Stereo / multichannel: outputSamps is the total sample count, so the
+         * number of stereo frames to write is outputSamps / 2. This is the path
+         * every stereo/joint-stereo file takes. */
         wr = hw_audio_write_pcm(s_pcm, (size_t)(info.outputSamps / 2));
     }
-    else {
-        for (int i = 0; i < info.outputSamps; i++) {
+    else if (info.nChans == 1) {
+        /* Genuine mono output from the decoder: upmix to stereo by duplicating
+         * each sample into L and R. Bound the loop to the stereo buffer so a
+         * mislabeled frame can never overflow s_stereo (MP3_PCM_MAX / 2 frames). */
+        const int frames = (info.outputSamps < MP3_PCM_MAX / 2)
+                               ? info.outputSamps : (MP3_PCM_MAX / 2);
+        for (int i = 0; i < frames; i++) {
             s_stereo[2 * i] = s_pcm[i];
             s_stereo[2 * i + 1] = s_pcm[i];
         }
-        wr = hw_audio_write_pcm(s_stereo, (size_t)info.outputSamps);
+        wr = hw_audio_write_pcm(s_stereo, (size_t)frames);
+    }
+    else {
+        /* nChans == 0 (a malformed first frame some decoders report): there is
+         * nothing to play, but it is not a hard error — just skip the frame so
+         * the no-progress guard above can still catch a truly stuck track. */
+        wr = AUDIO_WRITE_OK;
     }
     if (wr == AUDIO_WRITE_STALLED) {
         /* The I2S DMA is not consuming (bounded write timed out). The writer

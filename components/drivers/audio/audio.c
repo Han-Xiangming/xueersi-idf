@@ -1287,13 +1287,20 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
         s_rebuild_done = false;   /* fresh channel session: allow a rebuild */
         ESP_LOGI(TAG, "I2S enabled (session #%u)", (unsigned)++s_enable_count);
 
-        /* Warm up: push one small silent chunk so the DMA is fully primed
-         * before real audio frames arrive. Prevents first-frame drop after
-         * enable/rebuild. */
+        /* Warm up: prime the DMA with one FULL descriptor of silence so the
+         * out-link is genuinely RUNNING and continuously fed before the first
+         * real audio frame arrives. A half-descriptor prime (256 stereo frames)
+         * was insufficient on a cold (never-enabled) channel: once it finished
+         * transmitting the ring ran dry, the ESP32 I2S out-link does NOT
+         * auto-restart on underrun, and the next real frame's write blocked
+         * until the 1200 ms write timeout -> the track stalled after exactly
+         * one frame on cold start (this song played fine only when switched to
+         * from an already-running channel). hw_audio_rebuild_i2s() uses this
+         * same full-descriptor prime and is stable, so mirror it here. */
         {
-            static int16_t silence[512] = {0};  /* 256 stereo frames ~5.8 ms */
+            static int16_t silence[1024 * 2] = {0};   /* 1024 stereo frames = 1 desc */
             size_t bw;
-            i2s_channel_write(s_tx, silence, sizeof(silence), &bw, pdMS_TO_TICKS(50));
+            i2s_channel_write(s_tx, silence, sizeof(silence), &bw, pdMS_TO_TICKS(100));
         }
     }
     /* Write timeout, in MILLISECONDS: i2s_channel_write() converts it
