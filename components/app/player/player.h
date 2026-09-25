@@ -25,15 +25,21 @@
  * (every directory) for .mp3 files, so there is no single fixed music folder. */
 #define PLAYER_ROOT "/sdcard"
 
-/* On-card playlist cache: a flat text file so we avoid pulling in a JSON
- * parser. One record per line, two TAB-separated fields:
- *     <title> <TAB> <path> <LF>
- * `title` is the display basename (redundant: it is always the basename of
- * `path`; kept so older cache files written before the entry was slimmed
- * down still load); `path` is the absolute path. The source is implicitly
- * PL_SRC_FOLDER (the only one implemented today). A line that cannot be
- * parsed invalidates the whole cache, so a corrupt file never freezes the
- * UI into a broken state — we just fall back to a real scan. */
+/* On-card playlist cache: an M3U8-style text file (so we avoid pulling in a
+ * JSON parser) that doubles as a PC-importable playlist. Layout:
+ *     #EXTM3U
+ *     ##SIG <hex32> <depth>     (source signature; see player.c)
+ *     #EXTINF:-1,<title>
+ *     /sdcard/Album/a.mp3
+ *     ...
+ * `#EXTM3U` is the standard M3U8 header; `#EXTINF` carries the display title
+ * (the name is still derived from the path's basename at read time, so the
+ * title column is informational only). `##SIG` is our own source signature —
+ * a non-standard comment line standard M3U players (VLC, etc.) ignore. `path`
+ * is the absolute path; the source is implicitly PL_SRC_FOLDER (the only one
+ * implemented today). A file that cannot be parsed (bad header, sig mismatch,
+ * corrupt line) invalidates the whole cache, so a broken file never freezes
+ * the UI into a broken state — we just fall back to a real scan. */
 #define PLAYER_CACHE_FILE "/sdcard/.xueersi_playlist.cache"
 
 /* Max length of a fully-qualified track path anywhere on the SD card.
@@ -135,9 +141,10 @@ static inline void player_scan_start(void)
  * instantaneous start. If the cache is missing or unreadable we fall back to
  * a background scan and (re)write the cache on completion. Call this from
  * player_init() in place of player_scan_start() so a re-entered player never
- * blocks on the FATFS walk. Repeated calls are cheap: the cache is
- * validated by file fingerprint (size+mtime) and skipped entirely when the
- * published snapshot is already the unchanged whole-card list. */
+ * blocks on the FATFS walk. Repeated calls are cheap: the cache is validated
+ * by a SOURCE SIGNATURE (a bounded FNV hash over the card's directory/
+ * file mtimes — see player.c) and skipped entirely when the published
+ * snapshot is already the unchanged whole-card list. */
 void player_scan_with_cache(void);
 
 /* Force a fresh scan and rewrite the cache (e.g. the user asked to rebuild

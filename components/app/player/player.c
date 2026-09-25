@@ -223,31 +223,111 @@ static bool s_scan_pending;
 static TaskHandle_t s_scan_task;
 static TaskHandle_t s_watch_task;   /* decode-stall watchdog (see player_watch_task) */
 
-/* The whole-card cache is validated like an HTTP ETag / Last-Modified
- * before any re-read: we remember the cache file's size + mtime at load and
- * write time, then stat() again before touching it — so repeated player
- * entries and <ALL> selections skip the SD I/O entirely when nothing
- * changed. The fingerprint turns stale after: the file changed, the SD was
- * removed (stat fails), or an explicit rescan dropped the cache. */
+/* The whole-card cache is validated by a SOURCE SIGNATURE, not by the cache
+ * file's own attributes. The signature is an FNV-1a 32-bit hash folded from
+ * the (name + mtime) of every entry — files AND directories — within
+ * CACHE_SIG_DEPTH levels below PLAYER_ROOT (see playlist_source_sig()). It is
+ * computed both when we write the cache (after a real scan) and again cheaply
+ * at boot / on each whole-card request; a mismatch means the SD card's music
+ * changed (added / removed / renamed / rewritten files) and the cache must be
+ * rebuilt. This fixes the old size+mtime fingerprint, which only noticed
+ * changes to the CACHE FILE itself and silently went stale when songs were
+ * added to the card while the device was off.
+ *
+ * Cost: a bounded shallow walk (root + up to CACHE_SIG_DEPTH levels of
+ * entries, stat() on each), i.e. a few hundred stat() calls at most instead of
+ * the full recursive FATFS walk a real scan does — so validation is near
+ * instant and the cache is still served instantly when the card is unchanged.
+ * player_rescan() / SD remount remain the explicit invalidation paths. */
 static bool s_pub_is_whole_card;   /* published snapshot == whole-card list */
-static bool s_cache_fp_valid;      /* s_cache_fp holds a valid fingerprint */
-static struct stat s_cache_fp;
 
-static void playlist_cache_refresh_fp(void)
+/* How many directory levels below PLAYER_ROOT the source signature samples.
+ * 2 => root + its subdirs + their subdirs' entries are all hashed (file
+ * mtimes included), so a song added anywhere within two levels is detected.
+ * Changes deeper than this are not caught by the cheap signature and rely on
+ * an explicit player_rescan(); raise this only if your card nests deeper. */
+#define CACHE_SIG_DEPTH 2
+
+/* Bounded-depth walk: fold (name + mtime) of every entry into an FNV-1a hash.
+ * Recurses into subdirectories only while depth < CACHE_SIG_DEPTH, bounding the
+ * work. Returns 0 only if PLAYER_ROOT is unreadable (caller then rescans). */
+static uint32_t playlist_source_sig_dir(const char *dir, int depth)
 {
-    s_cache_fp_valid = (stat(PLAYER_CACHE_FILE, &s_cache_fp) == 0);
+    uint32_t h = 2166136261u;   /* FNV-1a 32-bit offset basis */
+    DIR *d = opendir(dir);
+    if (d == NULL) {
+        return 0;
+    }
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') {   /* skip ".", "..", hidden */
+            continue;
+        }
+        char child[PLAYER_PATH_LEN];
+        snprintf(child, sizeof(child), "%s/%s", dir, e->d_name);
+        struct stat st;
+        if (stat(child, &st) != 0) {
+            continue;
+        }
+        /* Fold the entry name, then its mtime, into the hash. */
+        for (const char *p = e->d_name; *p != '\0'; p++) {
+            h ^= (uint8_t)*p;
+            h *= 16777619u;
+        }
+        h ^= (uint8_t)':';
+        uint32_t m = (uint32_t)st.st_mtime;
+        for (int i = 0; i < 4; i++) {
+            h ^= (uint8_t)(m >> (i * 8));
+            h *= 16777619u;
+        }
+        if (S_ISDIR(st.st_mode) && depth < CACHE_SIG_DEPTH) {
+            h ^= playlist_source_sig_dir(child, depth + 1);
+        }
+    }
+    closedir(d);
+    return h;
 }
 
-/* True when the cache file still looks byte-identical to what we last loaded
- * or wrote (same size and mtime). False if it is gone (SD removed / rescan
- * unlinked it) or no reference fingerprint has been captured yet. */
-static bool playlist_cache_unchanged(void)
+/* Source signature of the whole card: what the cache is supposed to mirror. */
+static uint32_t playlist_source_sig(void)
 {
-    struct stat st;
-    if (!s_cache_fp_valid || stat(PLAYER_CACHE_FILE, &st) != 0) {
+    return playlist_source_sig_dir(PLAYER_ROOT, 0);
+}
+
+/* The signature stored in the cache file (the `##SIG <hex> <depth>` line), or
+ * 0 if the cache is missing / not our M3U8 format / unreadable. */
+static uint32_t playlist_cache_stored_sig(void)
+{
+    FILE *f = fopen(PLAYER_CACHE_FILE, "r");
+    if (f == NULL) {
+        return 0;
+    }
+    char line[128];
+    uint32_t sig = 0;
+    if (fgets(line, sizeof(line), f) != NULL &&
+        strncmp(line, "#EXTM3U", 8) == 0) {
+        if (fgets(line, sizeof(line), f) != NULL) {
+            unsigned long v = 0;
+            if (sscanf(line, "##SIG %lx", &v) == 1) {
+                sig = (uint32_t)v;
+            }
+        }
+    }
+    fclose(f);
+    return sig;
+}
+
+/* True when a readable, well-formed cache exists AND its stored source
+ * signature still matches the live card — i.e. the cached list is current and
+ * safe to serve without a real scan. */
+static bool playlist_cache_valid(void)
+{
+    uint32_t stored = playlist_cache_stored_sig();
+    if (stored == 0) {
         return false;
     }
-    return st.st_size == s_cache_fp.st_size && st.st_mtime == s_cache_fp.st_mtime;
+    uint32_t live = playlist_source_sig();
+    return live != 0 && live == stored;
 }
 
 /* Forward declaration: a completed real scan persists its result to the
@@ -408,10 +488,12 @@ void player_load(playlist_src_t src, const char *root)
     }
     /* Whole-card requests are served from the on-card cache (or the
      * in-memory snapshot) instead of a full FATFS walk: the cache IS the
-     * whole-card list, and staleness is handled by the explicit rescan.
-     * Only a sub-folder request needs a real scan. */
+     * whole-card list, and staleness is detected by the source-signature
+     * check (playlist_cache_valid()) — so a card changed while powered off is
+     * transparently re-scanned. An explicit rescan / SD remount still force
+     * it. Only a sub-folder request needs a real scan. */
     if (strcmp(root, PLAYER_ROOT) == 0 && !s_scan_busy && !s_scan_pending) {
-        if (s_pub_is_whole_card && playlist_cache_unchanged()) {
+        if (s_pub_is_whole_card && playlist_cache_valid()) {
             return;   /* already showing the fresh whole-card list */
         }
         playlist_t *work = (s_playlist == &s_pl_a) ? &s_pl_b : &s_pl_a;
@@ -1450,22 +1532,28 @@ void player_init(void)
 }
 
 /* --- On-card playlist cache -------------------------------------------
- * A flat text file (PLAYER_CACHE_FILE) of TAB-separated records:
- *     <src> <TAB> <title> <TAB> <path> <LF>
- * This avoids pulling in a JSON parser for a list that can be a few hundred
- * entries. Loading the cache is O(n) line reads and is effectively
- * instantaneous versus the FATFS walk that a real scan requires. */
-
-/* Append one entry to the cache file (already open in append mode). The
- * title column is the path's basename, kept for backward compatibility. */
-static void playlist_cache_write_entry(FILE *f, const playlist_entry_t *e)
-{
-    const char *b = strrchr(e->path, '/');
-    fprintf(f, "%s\t%s\n", (b != NULL) ? b + 1 : e->path, e->path);
-}
+ * An M3U8-style playlist file (PLAYER_CACHE_FILE):
+ *     #EXTM3U
+ *     ##SIG <hex32> <depth>
+ *     #EXTINF:-1,<title>
+ *     /sdcard/Album/a.mp3
+ *     #EXTINF:-1,<title>
+ *     /sdcard/Album/b.mp3
+ *     ...
+ * `#EXTM3U` is the standard M3U8 header; `#EXTINF` carries the display title
+ * (we still derive the name from the path's basename at read time, so the
+ * title column is informational only). `##SIG` is our own source signature —
+ * a non-standard comment line that standard M3U players (VLC, etc.) ignore, so
+ * the cache doubles as a PC-importable playlist. The list is already sorted at
+ * write time, so loading is O(n) line reads and effectively instantaneous
+ * versus the FATFS walk a real scan requires. A `##SIG` mismatch (or a missing
+ * / non-M3U8 cache) makes playlist_cache_valid() false, so a card that changed
+ * while powered off is transparently re-scanned on the next load. */
 
 /* Serialize the just-published snapshot to the cache file. Called from the
- * scan task after a real scan completes, so a re-entry reads instantly. */
+ * scan task after a real scan completes, so a re-entry reads instantly. The
+ * source signature is recomputed here (cheap, bounded walk) and embedded so the
+ * next validation needs no extra state. */
 static void playlist_cache_write(const playlist_t *pl)
 {
     FILE *f = fopen(PLAYER_CACHE_FILE, "w");
@@ -1473,71 +1561,66 @@ static void playlist_cache_write(const playlist_t *pl)
         ESP_LOGW(TAG, "cache write failed (open %s)", PLAYER_CACHE_FILE);
         return;
     }
+    uint32_t sig = playlist_source_sig();
+    fprintf(f, "#EXTM3U\n");
+    fprintf(f, "##SIG %08x %d\n", (unsigned int)sig, CACHE_SIG_DEPTH);
     for (int i = 0; i < pl->count; i++) {
-        playlist_cache_write_entry(f, &pl->items[i]);
+        const playlist_entry_t *e = &pl->items[i];
+        const char *b = strrchr(e->path, '/');
+        const char *title = (b != NULL) ? b + 1 : e->path;
+        fprintf(f, "#EXTINF:-1,%s\n", title);
+        fprintf(f, "%s\n", e->path);
     }
     fclose(f);
-    ESP_LOGI(TAG, "wrote %d entries to cache %s", pl->count, PLAYER_CACHE_FILE);
-    /* The RAM snapshot now matches the file: refresh the fingerprint so the
-     * next entry/source selection can skip re-reading it. */
-    playlist_cache_refresh_fp();
-}
-
-/* Parse one cache line into `e`. Returns true on success. `line` is mutated
- * (NUL-terminated at field boundaries). Any malformed line fails the load so
- * a corrupt cache degrades to a real scan instead of a broken list. */
-static bool playlist_cache_parse_line(char *line, playlist_entry_t *e)
-{
-    /* Strip trailing CR/LF. */
-    size_t len = strlen(line);
-    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
-        line[--len] = '\0';
-    }
-    if (len == 0) {
-        return false;
-    }
-    char *p_title = line;
-    char *p_path = strchr(p_title, '\t');
-    if (p_path == NULL) {
-        return false;
-    }
-    *p_path++ = '\0';
-
-    size_t title_len = strlen(p_title);
-    if (title_len == 0 || title_len >= MP3_NAME_LEN) {
-        return false;
-    }
-    size_t path_len = strlen(p_path);
-    if (path_len == 0 || path_len >= PLAYER_PATH_LEN) {
-        return false;
-    }
-    /* Only the path is stored: the display name is derived from it. The
-     * title column is still validated above so a corrupt cache line fails. */
-    memcpy(e->path, p_path, path_len + 1);
-    return true;
+    ESP_LOGI(TAG, "wrote %d entries (sig %08x) to cache %s",
+             pl->count, (unsigned int)sig, PLAYER_CACHE_FILE);
 }
 
 /* Load the playlist from the cache file into `work` and publish it. Returns
- * the entry count, or 0 (and publishes an empty list) if the cache is
- * missing/corrupt. A 0-return *may* mean a legitimately empty card, so the
- * caller still triggers a real scan to confirm and (re)write the cache. */
+ * the entry count, or 0 (and publishes nothing) if the cache is missing,
+ * non-M3U8, or its source signature no longer matches the live card — in which
+ * case the caller does a real scan and (re)writes the cache. */
 static int playlist_load_from_cache(playlist_t *work)
 {
+    if (!playlist_cache_valid()) {
+        return 0;   /* stale/absent: caller will scan + write */
+    }
     FILE *f = fopen(PLAYER_CACHE_FILE, "r");
     if (f == NULL) {
-        return 0;   /* no cache: caller will scan + write */
+        return 0;
+    }
+    char line[PLAYER_PATH_LEN + 64];
+    /* Skip the header lines (#EXTM3U, then ##SIG). */
+    if (fgets(line, sizeof(line), f) == NULL ||
+        strncmp(line, "#EXTM3U", 8) != 0) {
+        fclose(f);
+        return 0;   /* not our format */
+    }
+    if (fgets(line, sizeof(line), f) == NULL) {   /* skip the ##SIG line */
+        fclose(f);
+        return 0;
     }
     int n = 0;
-    char line[PLAYER_PATH_LEN + MP3_NAME_LEN + 32];
     bool corrupt = false;
     while (fgets(line, sizeof(line), f) != NULL) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (len == 0) {
+            continue;
+        }
+        if (line[0] == '#') {   /* #EXTINF / any comment: not a path */
+            continue;
+        }
         if (n >= PLAYER_SCAN_MAX) {
             break;   /* cache larger than we keep: trust count, skip rest */
         }
-        if (!playlist_cache_parse_line(line, &work->items[n])) {
+        if (len >= PLAYER_PATH_LEN) {
             corrupt = true;
             break;
         }
+        memcpy(work->items[n].path, line, len + 1);
         n++;
     }
     fclose(f);
@@ -1546,12 +1629,11 @@ static int playlist_load_from_cache(playlist_t *work)
         unlink(PLAYER_CACHE_FILE);
         return 0;
     }
-    /* Cache order is already the sorted order captured at write time; no
-     * re-sort needed. Publish as the whole-card folder source. */
+    /* Cache order is the sorted order captured at write time; no re-sort.
+     * Publish as the whole-card folder source. */
     snprintf(s_src_name, sizeof(s_src_name), "整卡");
     playlist_publish(work, n, PL_SRC_FOLDER);
     s_pub_is_whole_card = true;
-    playlist_cache_refresh_fp();   /* the snapshot now matches the file */
     ESP_LOGI(TAG, "loaded %d entries from cache %s", n, PLAYER_CACHE_FILE);
     return n;
 }
@@ -1574,10 +1656,10 @@ void player_scan_with_cache(void)
         return;
     }
     /* In-memory snapshot reuse: the published list is already the fresh
-     * whole-card list (cache unchanged since it was loaded or written), so
-     * a player re-entry needs no SD I/O and no re-publish — no version
-     * bump, no UI repaint churn. */
-    if (s_pub_is_whole_card && playlist_cache_unchanged()) {
+     * whole-card list (cache valid — source signature matches — since it was
+     * loaded or written), so a player re-entry needs no SD I/O and no
+     * re-publish — no version bump, no UI repaint churn. */
+    if (s_pub_is_whole_card && playlist_cache_valid()) {
         return;
     }
     playlist_t *work = (s_playlist == &s_pl_a) ? &s_pl_b : &s_pl_a;
