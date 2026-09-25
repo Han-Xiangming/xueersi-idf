@@ -41,10 +41,12 @@ void hw_battery_sample(void);
  *     per-100%-volume slope in mV via hw_battery_set_load_comp_mv(). The
  *     actual offset applied is slope_mv * volume_pct / 100.
  *
- *  2) Freeze while playing: the periodic sampler skips updating the cached
- *     voltage/percent while audio is actively clocking to the DAC, so the
- *     gauge holds its last (rested) value instead of drifting down under load.
- *     Forced samples (settings page) still refresh. Toggle with
+ *  2) Freeze while playing: the periodic sampler ALWAYS reads the ADC and
+ *     refreshes the cached voltage/percent (so the data never goes stale),
+ *     but the *displayed* percentage is held while audio is actively clocking
+ *     to the DAC, so the gauge does not drift under load. The raw value is
+ *     fresh, so it converges immediately when playback stops. Forced samples
+ *     (settings page) always refresh the display. Toggle with
  *     hw_battery_set_freeze_while_playing(). */
 void hw_battery_set_load_comp_mv(uint16_t comp_mv_per_100pct);
 uint16_t hw_battery_get_load_comp_mv(void);
