@@ -21,8 +21,11 @@
  * or the dedicated display-width clipped copy instead. */
 #define MP3_NAME_LEN 256
 
-/* SD card mount point. The playlist is built by scanning the WHOLE card
- * (every directory) for .mp3 files, so there is no single fixed music folder. */
+/* SD card mount point AND the player layer's default scan root. The player is
+ * source-agnostic: it scans whatever root directory it is handed (folder
+ * source), so there is no single hard-coded music folder at the player layer.
+ * player_scan_with_cache() uses this whole-card root by default; the UI's
+ * source picker narrows choices to /sdcard/Music (see MUSIC_ROOT in ui.c). */
 #define PLAYER_ROOT "/sdcard"
 
 /* On-card playlist cache: an M3U8-style text file (so we avoid pulling in a

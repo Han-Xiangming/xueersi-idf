@@ -342,11 +342,14 @@ static int s_mp3_sel;
 static bool s_mp3_loading;
 
 /* Playlist "source" picker: before showing the track list, the user picks a
- * source — <ALL> (whole card) or one top-level folder on the SD card. The
- * chosen source determines which directory player_load() scans. The track
- * ORDER within a source is fixed (sorted name) and cannot be changed at
- * runtime — there is deliberately no reorder UI; only a fresh load may change
- * it (by rescanning the filesystem). */
+ * source — <ALL> (whole /sdcard/Music tree) or one sub-folder directly under
+ * /sdcard/Music. The chosen source determines which directory player_load()
+ * scans. The player layer is source-agnostic (it scans any root; the default
+ * boot scan is the whole card via PLAYER_ROOT), but this picker only exposes
+ * the /sdcard/Music subtree for user convenience. The track ORDER within a
+ * source is fixed (sorted name) and cannot be changed at runtime — there is
+ * deliberately no reorder UI; only a fresh load may change it (by rescanning
+ * the filesystem). */
 typedef enum {
     PV_SOURCE = 0,   /* picking a source: <ALL> + folders */
     PV_LIST,         /* browsing/playing the loaded playlist */
@@ -990,8 +993,11 @@ static void ui_build_settings(lv_obj_t *page)
                          UI_GRAY, &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
 }
 
-/* Music root: playlist sources are the FOLDERS directly under /sdcard/Music.
- * Each becomes one selectable source; <ALL> scans the whole Music tree. */
+/* UI source-picker root: the user picks a music source from the FOLDERS
+ * directly under /sdcard/Music. Each sub-folder is one selectable source;
+ * <ALL> (entry 0) scans the whole /sdcard/Music tree. This is a UI-level
+ * convenience rooted here; the player layer itself scans any root it is given
+ * (see PLAYER_ROOT in player.h — its default boot scan is the whole card). */
 #define MUSIC_ROOT PLAYER_ROOT "/Music"
 
 /* Discover playlist sources: <ALL> (every .mp3 under /sdcard/Music, recursive)
