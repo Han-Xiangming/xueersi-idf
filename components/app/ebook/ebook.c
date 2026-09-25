@@ -21,6 +21,8 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_heap_caps.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 static const char *TAG = "ebook";
 
@@ -111,6 +113,22 @@ typedef struct {
     uint16_t crc;                       /* CRC16-CCITT over the first 70 B   */
 } eb_slot_t;
 #define EBOOK_PROG_SLOT_SZ  sizeof(eb_slot_t)
+
+/* On-chip NVS mirror of the most-recently-read book. A redundancy layer so a
+ * removed / corrupted SD card, or a failed card write, does not lose the
+ * current position. Mirrors exactly one book (the open one); the card stays the
+ * authoritative per-book store, so this never breaks "progress follows the
+ * book". NVS wear-levels its flash, so writing on every save is cheap. */
+#define EBOOK_NVS_NS     "ebook_nvs"
+#define EBOOK_NVS_MIRROR "mirror"
+typedef struct {
+    uint64_t fp;                         /* content fingerprint (0 = empty)   */
+    uint32_t path_h;                     /* path hash, name-based fallback id */
+    uint32_t off;                        /* page-start byte offset            */
+    uint8_t  pct;                        /* off * 100 / size                  */
+    char     name[EBOOK_PROG_NAME_LEN];  /* display name, UTF-8               */
+    char     ctx[EBOOK_CTX_LEN];         /* raw bytes at `off` (anchor)       */
+} eb_nvs_mirror_t;                        /* 8+4+4+1+32+16 = 65 B */
 
 /* v1 entry (path-hash MRU table), read only for migration into v2. The layout
  * must stay byte-identical to the one the old firmware wrote. */
@@ -320,6 +338,7 @@ static TaskHandle_t s_save_task;
 static eb_slot_t s_prog[EBOOK_PROG_MAX] EXT_RAM_BSS_ATTR;
 static uint32_t s_seq;                   /* next slot sequence number */
 static bool s_prog_loaded;               /* false until a load attempt ran */
+static nvs_handle_t s_nvs_h = 0;         /* lazy NVS handle for the mirror   */
 
 /* v1 table, loaded on demand for one-time migration into v2. */
 static eb_v1_t s_v1[EBOOK_PROG_MAX] EXT_RAM_BSS_ATTR;
@@ -1163,6 +1182,79 @@ static int slot_find(uint64_t fp)
     return -1;
 }
 
+/* Fallback lookup by path hash, used when the content fingerprint changed
+ * (e.g. a re-encode / regeneration that shifted the head or tail sample) but
+ * the filename is unchanged. Matches at most one book; a path-hash collision
+ * can only cause a wrong restore attempt, which restore_position() still
+ * validates against the live file. */
+static int slot_find_path(uint32_t path_h)
+{
+    for (int i = 0; i < EBOOK_PROG_MAX; i++) {
+        if (s_prog[i].fp != 0 && s_prog[i].path_h == path_h) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* --- on-chip NVS mirror of the most-recently-read book --- */
+
+/* Open the NVS handle on first use; returns false if NVS is unavailable. */
+static bool nvs_mirror_ensure(void)
+{
+    if (s_nvs_h != 0) {
+        return true;
+    }
+    return nvs_open(EBOOK_NVS_NS, NVS_READWRITE, &s_nvs_h) == ESP_OK;
+}
+
+/* Persist the current snapshot to NVS. Called on every successful card save, so
+ * the mirror always tracks the latest position — and, crucially, it is also
+ * written when the card write fails, acting as the "pending补写" copy that
+ * survives an SD removal or corruption until the card is available again. */
+static void nvs_mirror_save(const eb_snap_t *snap)
+{
+    if (snap->fp == 0 || !nvs_mirror_ensure()) {
+        return;
+    }
+    eb_nvs_mirror_t m;
+    memset(&m, 0, sizeof(m));
+    m.fp = snap->fp;
+    m.path_h = fnv1a32(snap->path);
+    m.off = snap->off;
+    m.pct = snap->pct;
+    snprintf(m.name, sizeof(m.name), "%s", snap->name);
+    memcpy(m.ctx, snap->ctx, EBOOK_CTX_LEN);
+    if (nvs_set_blob(s_nvs_h, EBOOK_NVS_MIRROR, &m, sizeof(m)) == ESP_OK) {
+        nvs_commit(s_nvs_h);
+    }
+}
+
+/* Load the NVS mirror into a slot-shaped struct for restore_position().
+ * Returns true when a valid (fp != 0) record exists. */
+static bool nvs_mirror_load(eb_slot_t *out)
+{
+    if (!nvs_mirror_ensure()) {
+        return false;
+    }
+    eb_nvs_mirror_t m;
+    size_t len = sizeof(m);
+    if (nvs_get_blob(s_nvs_h, EBOOK_NVS_MIRROR, &m, &len) != ESP_OK) {
+        return false;
+    }
+    if (m.fp == 0) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    out->fp = m.fp;
+    out->path_h = m.path_h;
+    out->off = m.off;
+    out->pct = m.pct;
+    snprintf(out->name, sizeof(out->name), "%s", m.name);
+    memcpy(out->ctx, m.ctx, EBOOK_CTX_LEN);
+    return true;
+}
+
 /* A free slot, else the one with the oldest sequence number (least recently
  * read). */
 static int slot_alloc(void)
@@ -1375,6 +1467,10 @@ static bool progress_save(void)
     if (valid) {
         ok = progress_write(snap.fp, snap.path, snap.off, snap.pct, snap.name,
                             snap.ctx);
+        nvs_mirror_save(&snap);   /* mirror latest position regardless of the
+                                   * card result: on SD success it is the
+                                   * redundancy, on SD failure it is the
+                                   * pending补写 copy. */
         ESP_LOGD(TAG, "save off=%u pct=%u%% fp=%08X%08X ok=%d",
                  (unsigned)snap.off, (unsigned)snap.pct,
                  (unsigned)(uint32_t)(snap.fp >> 32),
@@ -1748,7 +1844,13 @@ bool ebook_open(int idx)
     s_resume_kind = EBOOK_RESUME_NONE;
     if (src.size > 0 && book_fp != 0) {
         progress_load();
-        const int si = slot_find(book_fp);
+        const uint32_t src_path_h = fnv1a32(src.path);
+        int si = slot_find(book_fp);
+        if (si < 0) {
+            si = slot_find_path(src_path_h);   /* fingerprint changed but the
+                                                * filename is the same: the
+                                                * position is still remembered. */
+        }
         if (si >= 0) {
             s_resume_kind = restore_position(&s_prog[si], src.size, &start);
         }
@@ -1771,6 +1873,21 @@ bool ebook_open(int idx)
                 const int si2 = slot_find(book_fp);
                 if (si2 >= 0) {
                     s_resume_kind = restore_position(&s_prog[si2], src.size, &start);
+                }
+            }
+        }
+        /* Last-resort fallback: the card is missing / the slot was lost, but a
+         * previous save mirrored this book (by fingerprint or by name) to NVS.
+         * restore_position() still validates it, so a changed file degrades
+         * instead of jumping to a wrong page. */
+        if (s_resume_kind == EBOOK_RESUME_NONE) {
+            eb_slot_t nv;
+            if (nvs_mirror_load(&nv) &&
+                (nv.fp == book_fp || nv.path_h == src_path_h)) {
+                s_resume_kind = restore_position(&nv, src.size, &start);
+                if (s_resume_kind != EBOOK_RESUME_NONE) {
+                    ESP_LOGI(TAG, "progress: resumed from NVS mirror '%s' kind=%d",
+                             nv.name, (int)s_resume_kind);
                 }
             }
         }
@@ -1944,7 +2061,11 @@ void ebook_progress_clear_all(void)
     s_v1_loaded = true;
     s_v1_count = 0;
     xSemaphoreGiveRecursive(s_prog_mux);
-    ESP_LOGI(TAG, "progress: cleared all (v2 + v1)");
+    if (nvs_mirror_ensure()) {
+        nvs_erase_key(s_nvs_h, EBOOK_NVS_MIRROR);
+        nvs_commit(s_nvs_h);
+    }
+    ESP_LOGI(TAG, "progress: cleared all (v2 + v1 + NVS mirror)");
 }
 
 bool ebook_jump_percent(int pct)
