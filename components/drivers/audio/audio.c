@@ -5,15 +5,15 @@
  * Wiring (from board_config.h):
  *   BCLK -> GPIO32, LRC(WS) -> GPIO15, DIN -> GPIO21, no MCLK.
  *
- * The I2S bus is configured as 16-bit STEREO (fixed 44100 Hz) and driven by an
- * ADF i2s_stream WRITER element; raw PCM is streamed for MP3 playback.
+ * The I2S bus is configured as 16-bit STEREO (fixed 44100 Hz) and driven by a
+ * self-contained i2s_std writer task; raw PCM is streamed for MP3 playback.
  *
- * Architecture: DIRECT decode-to-I2S path with a SMALL ring buffer owned by the
- * i2s_stream element. The MP3 player task (the only writer) applies the DSP
- * chain and calls audio_element_write(); the i2s_stream writer task (its own
- * task) pops the ring and feeds the I2S DMA. The DMA is the jitter buffer and
- * paces the decoder by back-pressure, so decode and the hardware clock can
- * never run away from each other.
+ * Architecture: DIRECT decode-to-I2S path with a SMALL ring buffer (freertos
+ * ringbuf) between the DSP and the DMA writer task. The MP3 player task (the
+ * only writer) applies the DSP chain and pushes PCM into the ring via
+ * hw_audio_write_pcm(); the writer task pops the ring and feeds the i2s_std
+ * DMA. The DMA is the jitter buffer and paces the decoder by back-pressure, so
+ * decode and the hardware clock can never run away from each other.
  *
  * The I2S clock is FIXED at init and is NEVER reconfigured for a sample-rate
  * change (decoded PCM is resampled to it in hw_audio_write_pcm instead). The
@@ -34,15 +34,15 @@
 #include <math.h>
 #include <string.h>
 
-#include "driver/i2s_std.h"   /* i2s_gpio_config_t / I2S_NUM_0 / I2S_ROLE_MASTER (供 i2s_stream gpio 配置) */
-#include "audio_element.h"
-#include "i2s_stream.h"
+#include "driver/i2s_std.h"   /* i2s_chan_handle_t / i2s_channel_init_std_mode / i2s_gpio_config_t */
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
 #include "esp_attr.h"          /* EXT_RAM_BSS_ATTR for the resampler scratch */
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"    /* TaskHandle_t / xTaskCreate / ulTaskNotifyTake / xTaskNotifyGive */
+#include "freertos/ringbuf.h" /* xRingbuffer*: local PCM ring between the DSP and the DMA writer task */
+#include "freertos/semphr.h"
 
 static const char *TAG = "hw_audio";
 
@@ -54,9 +54,9 @@ static const char *TAG = "hw_audio";
  * zero chunk per descriptor is enough to silence the whole ring. */
 #define I2S_DMA_DESC_NUM    12
 
-/* i2s_stream writer task owns the actual DMA write, so there is no manual
- * write timeout / IO mutex here: audio_element_write() blocks on the element's
- * ring buffer and the writer task feeds the DMA independently. */
+/* A dedicated DMA writer task owns the actual I2S write, so there is no manual
+ * write timeout / IO mutex here: hw_audio_write_pcm() blocks on the ring buffer
+ * (xRingbufferSend) and the writer task feeds the i2s_std DMA independently. */
 
 /* Speaker-protection high-pass cutoff (Hz).
  *
@@ -70,15 +70,26 @@ static const char *TAG = "hw_audio";
  * still passing the rated band. */
 #define SPEAKER_HPF_FC_HZ   800
 
-static audio_element_handle_t s_i2s_el = NULL;   /* i2s_stream WRITER 元素 */
+/* Local I2S output: we replace the ADF i2s_stream element with a
+ * self-contained writer. A freertos ringbuf buffers DSP-produced PCM; a
+ * dedicated task pulls from it and feeds the ESP-IDF i2s_std DMA channel, so
+ * there is no ADF dependency and no manual IO mutex — xRingbufferSend() blocks
+ * on the ring and the writer task paces the DMA independently. */
+static i2s_chan_handle_t s_i2s_chan = NULL;  /* i2s_std TX channel (the DMA)   */
+static RingbufHandle_t   s_pcm_rb    = NULL;  /* DSP -> DMA PCM ring buffer     */
+static TaskHandle_t      s_i2s_task  = NULL;  /* DMA writer task handle         */
+static bool              s_i2s_disabled;      /* channel currently disabled     */
+static bool              s_parked;            /* hw_audio_park(): stop BCLK     */
+static bool              s_flush_req;         /* pipeline_flush pending         */
 static volatile bool s_ready;
 static uint32_t s_rate = AUDIO_DEFAULT_RATE;
 
 /* The I2S bus runs at ONE FIXED rate (s_rate) for the whole session: decoded
  * PCM is resampled to it in hw_audio_write_pcm, so a rate change NEVER
- * reconfigures the I2S clock. The i2s_stream element is created once at init
- * and left RUNNING; pause/resume (not disable/enable) gates it. This removes
- * the out-link stop/start cycle that wedged the ESP32 DMA ("plays at first,
+ * reconfigures the I2S clock. The i2s_std channel is enabled once at init and
+ * left RUNNING; the writer task pause/resume (not a channel disable/enable)
+ * gates it. This removes the out-link stop/start cycle that wedged the ESP32
+ * DMA ("plays at first,
  * then nothing, only over I2S"). See hw_audio_set_sample_rate(). */
 
 /* SpeexDSP fixed-point resampler state (decoder rate -> fixed I2S rate).
@@ -120,7 +131,7 @@ static volatile bool s_player_active;    /* MP3 player owns the I2S bus */
  * destination and never probes the Bluetooth link itself. */
 static audio_route_t s_route = AUDIO_ROUTE_SPEAKER;
 
-/* Consecutive failed i2s_stream writes (bounds the WARN/ERROR rate). */
+/* Consecutive failed PCM ring writes (bounds the WARN/ERROR rate). */
 static uint32_t s_wr_errs;
 
 /* Underflow diagnostics: the gap between consecutive speaker-path writes
@@ -283,16 +294,12 @@ static void audio_apply_route(audio_route_t route)
     s_route = route;
     if (audio_route_is_bt()) {
         resamp_free();   /* speaker resampler not needed while BT owns output */
-        /* 路由到 BT:暂停 i2s_stream writer → BCLK 停,MAX98357 休眠(省电)。
-           扬声器路径不再写它,但元素保留,切回时 resume 即可。 */
-        if (s_i2s_el != NULL) {
-            audio_element_pause(s_i2s_el);
-        }
-    } else {
-        /* 切回扬声器:恢复 writer(若被 pause)。 */
-        if (s_i2s_el != NULL) {
-            audio_element_resume(s_i2s_el);
-        }
+        /* 路由到 BT: writer 在下一轮自动 pause(BCLK 停,MAX98357 休眠)。
+           扬声器路径不再写它,切回时 resume 即可。 */
+    }
+    /* else: 切回扬声器, writer 在下一轮自动 resume。唤醒 writer 让变动即时生效。 */
+    if (s_i2s_task != NULL) {
+        xTaskNotifyGive(s_i2s_task);
     }
     s_volume = audio_route_is_bt() ? s_vol_bt : s_vol_speaker;
     audio_update_vol_gain();
@@ -475,9 +482,11 @@ void hw_audio_set_player_active(bool active)
         s_vol_gain_sm = s_vol_gain;   /* start at full gain: no fade-in */
         audio_set_hpf_coeff(s_rate);  /* default-rate coeff until 1st frame */
         audio_set_loudness_coeff(s_rate);
-        /* 恢复 writer(若被 park/路由切换暂停过)。元素在 init 时已 RUNNING,首次播放为无害 no-op。 */
-        if (s_i2s_el != NULL) {
-            audio_element_resume(s_i2s_el);
+        /* 恢复 writer(若被 park/路由切换暂停过)。通道在 init 时已 enabled,
+           首次播放为无害 no-op。 */
+        s_parked = false;
+        if (s_i2s_task != NULL) {
+            xTaskNotifyGive(s_i2s_task);
         }
         ESP_LOGI(TAG, "[PLAYER] audio pipeline ready");
     }
@@ -500,10 +509,10 @@ void hw_audio_set_player_active(bool active)
     }
 }
 
-/* Really stop playback: pause the i2s_stream writer task. This stops BCLK and
+/* Really stop playback: pause the DMA writer task. This stops BCLK and
  * powers the MAX98357 down — but does NOT disable/rebuild the I2S channel, so
  * there is no out-link stop/start cycle that could wedge the ESP32 DMA. The
- * element is resumed by the next hw_audio_set_player_active(true) (or by a
+ * writer is resumed by the next hw_audio_set_player_active(true) (or by a
  * route switch back to the speaker).
  *
  * Call this ONLY when audio is genuinely finished — when the decode loop exits
@@ -513,8 +522,9 @@ void hw_audio_park(void)
 {
     /* 暂停 writer:BCLK 停,MAX98357 休眠。Ring 中残留由 writer 在 pause 前自然
        排空;下次播放 resume 即干净。不再 disable/重建 I2S。 */
-    if (s_i2s_el != NULL) {
-        audio_element_pause(s_i2s_el);
+    s_parked = true;
+    if (s_i2s_task != NULL) {
+        xTaskNotifyGive(s_i2s_task);
     }
     s_last_write_us = 0;
     ESP_LOGD(TAG, "I2S parked (writer paused)");
@@ -522,47 +532,111 @@ void hw_audio_park(void)
 
 bool hw_audio_is_ready(void)
 {
-    return s_ready && (s_i2s_el != NULL);
+    return s_ready && (s_i2s_chan != NULL);
 }
 
-/* Create the I2S output as a standalone ADF i2s_stream WRITER element.
- * Codec-less: no audio_board_init / set_codec (the MAX98357 is a pure-I2S
- * Class-D DAC). The element is created at ONE FIXED rate (s_rate) and left
- * RUNNING; pause/resume gates it — there is no runtime enable/disable/reconfig
- * that could wedge the ESP32 out-link. The board pins are carried over from the
- * old std-mode config. NOTE: the gpio_cfg / field names below follow a recent
- * esp-adf-libs layout; adapt to your ADF version if it differs. */
+/* Create the I2S output with ESP-IDF's i2s_std — no ADF. Codec-less: the
+ * MAX98357 is a pure-I2S Class-D DAC. The channel runs at ONE FIXED rate
+ * (s_rate) and is left ENABLED; the writer task gates it (pause/resume via
+ * s_parked / route) — never a runtime reconfig that could wedge the ESP32
+ * out-link. The board pins are the old std-mode config. */
+static void i2s_writer_task(void *arg)
+{
+    /* Silence chunk used to keep BCLK running during decode gaps / between
+     * tracks (auto_clear makes the DMA emit digital silence, no wedge). */
+    static int16_t silence[256 * 2];   /* static BSS, already zeroed */
+    size_t written = 0;
+    for (;;) {
+        if (s_flush_req) {
+            /* Drop what is queued, then reset the DMA queue so the next pass
+             * starts clean (auto_clear alone does NOT reset the queue). */
+            uint8_t *it; size_t len;
+            while ((it = (uint8_t *)xRingbufferReceive(s_pcm_rb, &len, 0)) != NULL) {
+                vRingbufferReturnItem(s_pcm_rb, it);
+            }
+            if (s_i2s_chan != NULL) {
+                i2s_channel_disable(s_i2s_chan);
+                i2s_channel_enable(s_i2s_chan);
+            }
+            s_flush_req = false;
+        }
+        bool paused = (s_route == AUDIO_ROUTE_BT) || s_parked;
+        if (paused) {
+            if (!s_i2s_disabled && s_i2s_chan != NULL) {
+                i2s_channel_disable(s_i2s_chan);   /* BCLK stops, amp sleeps */
+                s_i2s_disabled = true;
+            }
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  /* wait for resume / flush */
+            continue;
+        }
+        if (s_i2s_disabled && s_i2s_chan != NULL) {
+            i2s_channel_enable(s_i2s_chan);
+            s_i2s_disabled = false;
+        }
+        /* Pull PCM from the ring; on underrun, emit silence to keep BCLK alive. */
+        uint8_t *item = (uint8_t *)xRingbufferReceive(s_pcm_rb, &written,
+                                                       pdMS_TO_TICKS(20));
+        if (item != NULL) {
+            i2s_channel_write(s_i2s_chan, item, written, &written, portMAX_DELAY);
+            vRingbufferReturnItem(s_pcm_rb, item);
+        } else {
+            i2s_channel_write(s_i2s_chan, silence, sizeof(silence), &written,
+                              portMAX_DELAY);
+        }
+    }
+}
+
 static esp_err_t audio_create_channel(void)
 {
-    i2s_stream_cfg_t cfg = I2S_STREAM_CFG_DEFAULT();
-    cfg.type = AUDIO_STREAM_WRITER;
-    cfg.i2s_config.sample_rate = (int)s_rate;       /* 固定 I2S 时钟,绝不随轨道变 */
-    cfg.i2s_config.bits         = 16;
-    cfg.i2s_config.channels     = 2;
-    cfg.i2s_config.i2s_port     = I2S_NUM_0;
-    cfg.i2s_config.chan_cfg.role        = I2S_ROLE_MASTER;
-    cfg.i2s_config.chan_cfg.dma_desc_num  = I2S_DMA_DESC_NUM;
-    cfg.i2s_config.chan_cfg.dma_frame_num = 1024;
-    cfg.out_rb_size = 8 * 1024;                     /* ringbuf,吸收 decode 抖动 */
-    /* 引脚:沿用原 std 配置(mclk 未用,MAX98357 从 BCLK 派生主时钟)。 */
-    cfg.i2s_config.gpio_cfg = (i2s_gpio_config_t){
-        .mclk = I2S_GPIO_UNUSED,
-        .bclk = PIN_NUM_I2S_BCLK,
-        .ws   = PIN_NUM_I2S_LRC,
-        .dout = PIN_NUM_I2S_DIN,
-        .din  = I2S_GPIO_UNUSED,
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num  = I2S_DMA_DESC_NUM;
+    chan_cfg.dma_frame_num = 1024;
+    esp_err_t rc = i2s_new_channel(&chan_cfg, &s_i2s_chan, NULL);
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "[AUDIO] i2s_new_channel failed: %s", esp_err_to_name(rc));
+        return rc;
+    }
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(s_rate),
+        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(16, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = PIN_NUM_I2S_BCLK,
+            .ws   = PIN_NUM_I2S_LRC,
+            .dout = PIN_NUM_I2S_DIN,
+            .din  = I2S_GPIO_UNUSED,
+        },
     };
-    s_i2s_el = i2s_stream_init(&cfg);
-    if (s_i2s_el == NULL) {
-        ESP_LOGE(TAG, "[AUDIO] i2s_stream init failed");
+    rc = i2s_channel_init_std_mode(s_i2s_chan, &std_cfg);
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "[AUDIO] i2s_channel_init_std_mode failed: %s",
+                 esp_err_to_name(rc));
+        i2s_del_channel(s_i2s_chan);
+        s_i2s_chan = NULL;
+        return rc;
+    }
+    rc = i2s_channel_enable(s_i2s_chan);   /* BCLK starts; writer task feeds DMA */
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "[AUDIO] i2s_channel_enable failed: %s", esp_err_to_name(rc));
+        i2s_del_channel(s_i2s_chan);
+        s_i2s_chan = NULL;
+        return rc;
+    }
+    s_pcm_rb = xRingbufferCreate(8 * 1024, RINGBUF_TYPE_BYTEBUF);
+    if (s_pcm_rb == NULL) {
+        ESP_LOGE(TAG, "[AUDIO] PCM ringbuf alloc failed");
+        i2s_del_channel(s_i2s_chan);
+        s_i2s_chan = NULL;
         return ESP_FAIL;
     }
-    esp_err_t e = audio_element_run(s_i2s_el);   /* 启动 writer 任务(此时 enable I2S) */
-    if (e != ESP_OK) {
-        ESP_LOGE(TAG, "[AUDIO] i2s_stream run failed: %s", esp_err_to_name(e));
-        audio_element_deinit(s_i2s_el);
-        s_i2s_el = NULL;
-        return e;
+    BaseType_t tr = xTaskCreate(i2s_writer_task, "i2s_wr", 4096, NULL, 6, &s_i2s_task);
+    if (tr != pdPASS) {
+        ESP_LOGE(TAG, "[AUDIO] i2s writer task create failed");
+        vRingbufferDelete(s_pcm_rb);
+        s_pcm_rb = NULL;
+        i2s_del_channel(s_i2s_chan);
+        s_i2s_chan = NULL;
+        return ESP_FAIL;
     }
     return ESP_OK;
 }
@@ -585,7 +659,7 @@ void hw_audio_init(void)
 
     s_ready = true;
 
-    ESP_LOGI(TAG, "[AUDIO] I2S ready (i2s_stream WRITER, %u Hz fixed)",
+    ESP_LOGI(TAG, "[AUDIO] I2S ready (i2s_std WRITER, %u Hz fixed)",
              (unsigned)s_rate);
 
     /* Route starts at the speaker; nothing else may flip it (see hw_audio_set_route).
@@ -630,7 +704,7 @@ uint8_t hw_audio_get_volume(void)
 
 bool hw_audio_is_playing(void)
 {
-    return s_player_active && (s_i2s_el != NULL);
+    return s_player_active && (s_i2s_chan != NULL) && !s_parked && s_route == AUDIO_ROUTE_SPEAKER;
 }
 
 void hw_audio_set_speaker_volume(uint8_t volume_pct)
@@ -807,8 +881,14 @@ void hw_audio_pipeline_flush(void)
         bt_audio_flush_pcm_ring();
         return;
     }
-    /* Speaker route: the channel keeps running; auto_clear drains it to
-     * silence. Deliberately no i2s_channel_disable()/enable() here. */
+    /* Speaker route: ask the writer task to drop the queued PCM and reset the
+     * DMA queue (auto_clear alone does NOT reset the queue, which is what let
+     * it desync and wedge on repeat). The task owns the channel, so this is
+     * the only safe place to toggle disable/enable. */
+    s_flush_req = true;
+    if (s_i2s_task != NULL) {
+        xTaskNotifyGive(s_i2s_task);
+    }
 }
 
 /* Resample `pairs_in` stereo L/R pairs (decoder native rate) to the fixed I2S
@@ -868,11 +948,13 @@ static size_t resamp_process_pairs(const int16_t *in, size_t pairs_in,
  * (headphones reproduce full band, and the sink's own
  * limiting handles hot peaks).
  *
- * Speaker output goes DIRECTLY to the I2S DMA (no ring buffer): the bounded
- * write blocks under DMA back-pressure, which paces the decoder at exactly
- * the hardware clock rate, and the DMA (12 x 1024 frames, auto_clear) absorbs
- * decode jitter. A wedged DMA surfaces as AUDIO_WRITE_STALLED; a stop/pause
- * mid-write surfaces as AUDIO_WRITE_ABANDONED. */
+ * Speaker output goes through the PCM ring buffer: hw_audio_write_pcm() pushes
+ * DSP-produced PCM into it via a bounded xRingbufferSend, which paces the
+ * decoder under back-pressure, and the dedicated DMA writer task pops from it
+ * and feeds the i2s_std channel. The ring + DMA (12 x 1024 frames, auto_clear)
+ * absorb decode jitter. A wedged DMA (ring never drained) surfaces as
+ * AUDIO_WRITE_STALLED; a stop/pause mid-write surfaces as
+ * AUDIO_WRITE_ABANDONED. */
 audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
 {
     if (!s_ready || !s_player_active || frames == 0) {
@@ -899,8 +981,8 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
     size_t n = dsp_frames * 2;
 
     if (bt_out) {
-        /* 路由到 BT 时,扬声器 i2s_stream 元素已在 set_route 中 pause(BCLK 停),
-           这里只做 BT 发送与增益。 */
+        /* 路由到 BT 时,扬声器 i2s_std 频道已由 writer task 在 set_route 中
+           pause(BCLK 停),这里只做 BT 发送与增益。 */
         /* Bluetooth route: volume only, full band. The blocking send inside
          * bt_audio_write_pcm() paces the decoder. The send is now BOUNDED
          * (~2 s): a stalled BT sink surfaces as AUDIO_WRITE_STALLED here,
@@ -1024,7 +1106,7 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
      * (the decode time) must stay well under the DMA drain time, otherwise the
      * DMA runs dry between frames. s_last_write_us = end of previous write
      * (0 = idle since); a gap > 30 ms is logged at WARN at most once/sec. */
-    if (s_i2s_el != NULL) {
+    if (s_i2s_chan != NULL) {
         int64_t now_us = esp_timer_get_time();
         if (s_last_write_us != 0) {
             int64_t gap_ms = (now_us - s_last_write_us) / 1000;
@@ -1040,25 +1122,31 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
         }
     }
 
-    /* 元素已在 init 时 enable+run;这里只把已重采样+DSP 后的 PCM 写入它的
-       ringbuf,由 i2s_stream 自己的 writer 任务喂 DMA。无 enable/预热/reconfig/
-       互斥锁。backpressure 由 ringbuf 自然处理。 */
-    if (s_i2s_el == NULL) {
+    /* 频道已在 init 时 enable;这里只把已重采样+DSP 后的 PCM 写入 ringbuf,
+       由独立的 DMA writer 任务喂 I2S。无 enable/预热/reconfig/互斥锁。
+       backpressure 由 ringbuf 自然处理。 */
+    if (s_i2s_chan == NULL || s_pcm_rb == NULL) {
         return AUDIO_WRITE_STALLED;
     }
-    int wrote = audio_element_write(s_i2s_el, (char *)dsp_buf, (int)bytes);
+    /* Push the DSP-produced PCM into the ring; xRingbufferSend blocks (back-
+     * pressure) until there is room, mirroring the old audio_element_write(). */
+    if (xRingbufferSend(s_pcm_rb, dsp_buf, bytes, pdMS_TO_TICKS(100)) != pdTRUE) {
+        s_last_write_us = esp_timer_get_time();
+        /* 暂停/停止落在写中途:不算错误。 */
+        if (!s_player_active) {
+            return AUDIO_WRITE_ABANDONED;
+        }
+        if (++s_wr_errs >= 4) {
+            ESP_LOGE(TAG, "[ERROR] PCM ringbuf full / write stalled (%u bytes)",
+                     (unsigned)bytes);
+            s_wr_errs = 0;
+        }
+        return AUDIO_WRITE_STALLED;
+    }
     s_last_write_us = esp_timer_get_time();
     /* 暂停/停止落在写中途:不算错误。 */
     if (!s_player_active) {
         return AUDIO_WRITE_ABANDONED;
-    }
-    if (wrote < (int)bytes) {
-        if (++s_wr_errs >= 4) {
-            ESP_LOGE(TAG, "[ERROR] i2s_stream write failed (%d/%d bytes)",
-                     wrote, (int)bytes);
-            s_wr_errs = 0;
-        }
-        return AUDIO_WRITE_STALLED;
     }
     s_wr_errs = 0;
     return AUDIO_WRITE_OK;

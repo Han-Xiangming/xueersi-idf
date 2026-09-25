@@ -1,14 +1,15 @@
 /*
  * Hardware layer: I2S audio output driving a MAX98357 stereo Class-D DAC,
- * via an ADF i2s_stream WRITER element (codec-less).
+ * via an ESP-IDF i2s_std channel + a self-contained DMA writer task (codec-less).
  *
  * Streams decoded MP3 PCM over I2S (BCLK/LRC/DIN); the MAX98357 derives its
  * own master clock from BCLK, so no MCLK is wired.
  *
  * The I2S clock is FIXED for the whole session; decoded PCM is resampled to it
- * before the DSP. The element is created RUNNING at init and only pause/resumed
- * (route switch to Bluetooth, end-of-playback park) — never disable/enabled, so
- * the ESP32 out-link stop/start wedge cannot recur.
+ * before the DSP. The i2s_std channel is enabled ONCE at init and the DMA writer
+ * task only pause/resumes it (route switch to Bluetooth, end-of-playback park) —
+ * never a runtime disable/re-enable of the out-link, so the ESP32 DMA wedge
+ * cannot recur. A small ring buffer sits between the DSP and the writer task.
  */
 #pragma once
 
@@ -29,14 +30,15 @@ typedef enum {
     AUDIO_ROUTE_BT,        /* Bluetooth A2DP sink (headphones / BT speaker) */
 } audio_route_t;
 
-/* Initialize the i2s_stream I2S output and the MAX98357 DAC (codec-less).
- * Creates the WRITER element at the fixed I2S rate and leaves it RUNNING. */
+/* Initialize the i2s_std I2S output and the MAX98357 DAC (codec-less).
+ * Enables the TX channel at the fixed I2S rate and starts the DMA writer task,
+ * which is left RUNNING. */
 void hw_audio_init(void);
 
 /* Explicitly select the active output route. The writer streams to exactly
- * this destination. Switching away from the speaker PAUSES the i2s_stream
- * writer (BCLK stops, amp powers down); switching back RESUMES it. This is the
- * ONLY way the route changes. */
+ * this destination. Switching away from the speaker PAUSES the DMA writer task
+ * (channel disabled, BCLK stops, amp powers down); switching back RESUMES it.
+ * This is the ONLY way the route changes. */
 void hw_audio_set_route(audio_route_t route);
 
 /* Current active output route. */
@@ -84,27 +86,28 @@ float hw_audio_get_master_gain_db(void);
 void hw_audio_set_sample_rate(uint32_t sample_rate_hz);
 
 /* Mark/unmark the MP3 player as the owner of the I2S bus. Claiming resets the
- * DSP and RESUMES the i2s_stream writer (it may have been paused by a route
+ * DSP and RESUMES the DMA writer task (it may have been paused by a route
  * switch or by hw_audio_park() at the previous track's end). Releasing does
- * NOT pause the element: it keeps clocking digital silence so pause/resume and
- * track switches need no out-link stop/start (see audio.c). Safe to call from
- * any task, including while a write is in flight. */
+ * NOT pause the channel: it keeps clocking auto_clear digital silence so
+ * pause/resume and track switches need no out-link stop/start (see audio.c).
+ * Safe to call from any task, including while a write is in flight. */
 void hw_audio_set_player_active(bool active);
 
-/* Pause the i2s_stream writer (BCLK stops, MAX98357 powers down). Call ONLY
- * when playback is finished for good — i.e. when the decode loop exits —
- * never on pause or between tracks. The element is resumed by the next
- * hw_audio_set_player_active(true). */
+/* Pause the DMA writer task (channel disabled, BCLK stops, MAX98357 powers
+ * down). Call ONLY when playback is finished for good — i.e. when the decode
+ * loop exits — never on pause or between tracks. The writer is resumed by the
+ * next hw_audio_set_player_active(true). */
 void hw_audio_park(void);
 
 /* Drop what the previous pass left queued in the output pipeline and reset the
  * underrun bookkeeping, so the next PCM write starts a clean pass. Used at
  * repeat-one seams before the inter-pass pause.
  *  - Bluetooth: really flushes the stale PCM ring tail.
- *  - Speaker (I2S): parks the channel, refills the whole DMA ring with silence
- *    and re-enables it, so the descriptor queue is reset and the next write
- *    starts from an empty DMA (auto_clear alone does NOT reset the queue, which
- *    is why a bare no-op here let the queue desync and wedge on repeat).
+ *  - Speaker (I2S): asks the DMA writer task to drain the PCM ring and
+ *    disable/re-enable the i2s_std channel, so the descriptor queue is reset
+ *    and the next write starts from an empty DMA (auto_clear alone does NOT
+ *    reset the queue, which is why a bare no-op here let the queue desync and
+ *    wedge on repeat).
  * Call from the task that owns PCM writes. */
 void hw_audio_pipeline_flush(void);
 
@@ -112,8 +115,8 @@ void hw_audio_pipeline_flush(void);
  * "the pipeline is wedged" (DMA not consuming) vs "playback was
  * deactivated mid-write" (pause/stop — not an error). */
 typedef enum {
-    AUDIO_WRITE_OK = 0,       /* streamed to the I2S DMA (or BT) */
-    AUDIO_WRITE_STALLED,      /* I2S write failed / timed out (wedged) */
+    AUDIO_WRITE_OK = 0,       /* streamed into the PCM ring (or BT) */
+    AUDIO_WRITE_STALLED,      /* ring full / DMA not consuming (wedged) */
     AUDIO_WRITE_ABANDONED,    /* player deactivated mid-write: not an error */
 } audio_write_result_t;
 
@@ -121,12 +124,13 @@ typedef enum {
  * L/R pairs. Used by the MP3 player to output decoded audio. Samples are
  * filtered in place (per-track ReplayGain + user master gain + speaker-
  * protection high-pass + loudness shelf + volume + limiter, see the driver
- * docs) before a bounded direct write to the I2S DMA, which paces the caller
- * by back-pressure. */
+ * docs) then pushed into the PCM ring buffer via a bounded xRingbufferSend,
+ * which paces the caller by back-pressure; the DMA writer task feeds the I2S
+ * channel independently. */
 audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames);
 
-/* True only after the I2S channel and the IO mutex are up. Callers must
- * NOT start playback before this returns true. */
+/* True only after the I2S channel and the DMA writer task are up. Callers
+ * must NOT start playback before this returns true. */
 bool hw_audio_is_ready(void);
 
 /* True while the MP3 player owns the I2S bus AND the channel is actually
@@ -134,4 +138,3 @@ bool hw_audio_is_ready(void);
  * drivers (e.g. the battery gauge) to probe load state without touching
  * audio internals. */
 bool hw_audio_is_playing(void);
-

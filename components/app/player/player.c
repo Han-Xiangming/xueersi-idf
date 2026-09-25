@@ -38,7 +38,7 @@
  * spinning the CPU forever on a file that will never produce audio. */
 #define TRACK_MAX_DECODE_ERRS    512
 /* Consecutive AUDIO_WRITE_STALLED results that abort a track. A single stall
- * is now just a transient: the i2s_stream writer feeds DMA from a ringbuf, so
+ * is now just a transient: the i2s_std writer task feeds DMA from a ringbuf, so
  * a momentary decode/SD hiccup merely backs the ringbuf up and clears on its
  * own, no channel rebuild needed. Require more of them before giving up so a
  * brief hiccup must not abort a good track. */
@@ -1536,7 +1536,7 @@ void player_play(const char *path)
      * 错误而不是静默忽略，UI 才能告诉用户为什么按播放没反应。 */
     if (!hw_audio_is_ready()) {
         /* 音频不可用(初始化失败):直接上报错误,不再尝试重建通道——
-           i2s_stream 元素在 init 时一次性创建,无手写 I2S 通道可重建。 */
+           i2s_std 通道在 init 时一次性启用,无手写 I2S 通道可重建。 */
         ESP_LOGE(TAG, "[ERROR] play requested but audio not ready, ignored");
         player_report_error(PLAYER_ERR_AUDIO);
         s_new_index = -1;   /* 丢弃本次显式 index，避免泄漏到后续直接 player_play(path) */
