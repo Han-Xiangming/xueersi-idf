@@ -601,19 +601,19 @@ static void i2s_writer_task(void *arg)
             taskENTER_CRITICAL(&s_ring_lock);
             s_ring_bytes = 0;   /* queue dropped: nothing pending */
             taskEXIT_CRITICAL(&s_ring_lock);
-            if (s_i2s_chan != NULL) {
-                i2s_channel_disable(s_i2s_chan);
-                i2s_channel_enable(s_i2s_chan);
-            }
-            if (s_flush_fill) {
-                /* Hard track switch (stop->next, manual next/prev): the DMA
-                 * descriptors AHEAD of the current pointer still hold the
-                 * previous track's PCM. disable/enable alone does NOT clear
-                 * them, so write a full ring of silence to overwrite every
-                 * descriptor before the new track's data is let in. This is
-                 * what removes the "上一首残音" deterministically (see the
-                 * comment by I2S_DMA_DESC_NUM: one silence chunk per
-                 * descriptor silences the whole ring). */
+            /* Hard track switch (stop->next, manual next/prev): overwrite the
+             * whole DMA descriptor ring with silence BEFORE re-enabling the
+             * channel, while the DMA is still running. The descriptors AHEAD of
+             * the current pointer still hold the previous track's PCM; if we
+             * disable/enable first, the re-enabled channel may re-feed those
+             * stale descriptors to the DMA and they get played (the "上一首残音")
+             * before our silence can overwrite them. Writing the silence while
+             * the channel is still ENABLED overwrites every descriptor buffer
+             * up front, so a later enable/re-feed can only emit silence.
+             * Skipped when the channel is already parked (disabled): the park
+             * path below already clears the ring with silence before disabling,
+             * so there is nothing stale to overwrite here. */
+            if (s_flush_fill && s_i2s_chan != NULL && !s_i2s_disabled) {
                 size_t filled = 0;
                 const size_t ring_bytes =
                     (size_t)I2S_DMA_DESC_NUM * 1024U * 4U; /* desc * frames * bytes/frame */
@@ -624,6 +624,10 @@ static void i2s_writer_task(void *arg)
                     filled += w;
                 }
             }
+            if (s_i2s_chan != NULL) {
+                i2s_channel_disable(s_i2s_chan);
+                i2s_channel_enable(s_i2s_chan);
+            }
             s_flush_req = false;
             s_flush_fill = false;
             if (s_flush_done != NULL) {
@@ -632,12 +636,11 @@ static void i2s_writer_task(void *arg)
         }
         bool paused = (s_route == AUDIO_ROUTE_BT) || s_parked;
         if (paused) {
-            /* Play out whatever is still queued so the just-ended track's tail
-             * is NOT cut off. The old i2s_stream element drained its buffer on
-             * pause; the new async writer used to disable the channel at once,
-             * dropping up to ~280 ms of tail and making "the song ended"
-             * undetectable. After the ring is empty, let the DMA flush its
-             * in-flight tail before killing BCLK. */
+            /* Stop/park MUTES at once: drop the queued previous-track PCM
+             * instead of playing its tail out, then the silence fill below
+             * overwrites the DMA descriptors. A stop therefore leaves no
+             * audible tail and nothing for the next track to leak ("上一首残音").
+             * Ring bytes are still decremented so s_ring_bytes stays truthful. */
             uint8_t *pit; size_t plen;
             while ((pit = (uint8_t *)xRingbufferReceive(s_pcm_rb, &plen, 0)) != NULL) {
                 taskENTER_CRITICAL(&s_ring_lock);
@@ -647,15 +650,27 @@ static void i2s_writer_task(void *arg)
                     s_ring_bytes = 0;
                 }
                 taskEXIT_CRITICAL(&s_ring_lock);
-                /* Play the tail out on the speaker; if Bluetooth owns the route
-                 * the stale PCM belongs to the speaker path and must just be
-                 * dropped, never emitted on the I2S bus. */
-                if (!audio_route_is_bt() && s_i2s_chan != NULL) {
-                    i2s_channel_write(s_i2s_chan, pit, plen, &plen, portMAX_DELAY);
-                }
-                vRingbufferReturnItem(s_pcm_rb, pit);
+                vRingbufferReturnItem(s_pcm_rb, pit);   /* dropped, not played */
             }
             vTaskDelay(pdMS_TO_TICKS(I2S_DMA_DRAIN_MS));
+            /* Overwrite the DMA descriptor ring with silence while the channel
+             * is still ENABLED, so the just-ended track's PCM left in
+             * descriptors AHEAD of the DMA pointer is erased before we disable
+             * (park). Otherwise that stale PCM is frozen in the descriptors and
+             * re-fed when the channel is re-enabled on the next track, leaking
+             * the "上一首残音" across a stop->next. This is the park-side mirror
+             * of the silence-fill in the flush block above. */
+            if (s_i2s_chan != NULL && !s_i2s_disabled) {
+                size_t filled = 0;
+                const size_t ring_bytes =
+                    (size_t)I2S_DMA_DESC_NUM * 1024U * 4U; /* desc * frames * bytes/frame */
+                while (filled < ring_bytes) {
+                    size_t w = 0;
+                    i2s_channel_write(s_i2s_chan, silence,
+                                      sizeof(silence), &w, portMAX_DELAY);
+                    filled += w;
+                }
+            }
             if (!s_i2s_disabled && s_i2s_chan != NULL) {
                 i2s_channel_disable(s_i2s_chan);   /* BCLK stops, amp sleeps */
                 s_i2s_disabled = true;
@@ -678,8 +693,18 @@ static void i2s_writer_task(void *arg)
                 s_ring_bytes = 0;   /* defensive: never underflow */
             }
             taskEXIT_CRITICAL(&s_ring_lock);
-            i2s_channel_write(s_i2s_chan, item, written, &written, portMAX_DELAY);
-            vRingbufferReturnItem(s_pcm_rb, item);
+            if (!s_player_active) {
+                /* Stop/park requested: the queued PCM is already gain-processed,
+                 * so lowering the volume gain would NOT mute it. Drop it and emit
+                 * silence instead, so a stop is silent at once instead of playing
+                 * the previous track's tail out — the "停止先 mute" guarantee. */
+                vRingbufferReturnItem(s_pcm_rb, item);
+                i2s_channel_write(s_i2s_chan, silence, sizeof(silence), &written,
+                                  portMAX_DELAY);
+            } else {
+                i2s_channel_write(s_i2s_chan, item, written, &written, portMAX_DELAY);
+                vRingbufferReturnItem(s_pcm_rb, item);
+            }
         } else {
             i2s_channel_write(s_i2s_chan, silence, sizeof(silence), &written,
                               portMAX_DELAY);
@@ -1065,7 +1090,10 @@ void hw_audio_pipeline_switch(void)
     s_flush_req = true;
     xTaskNotifyGive(s_i2s_task);   /* wake the writer if it is parked */
     if (s_flush_done != NULL) {
-        xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(100));
+        /* A full-ring silence fill takes ~272 ms of real playback time, so the
+         * wait must clear that (plus the disable/enable) or the caller can start
+         * the next track before the previous one's descriptors are overwritten. */
+        xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(400));
     }
 }
 
