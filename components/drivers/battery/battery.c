@@ -76,7 +76,7 @@ static bool     s_inited  = false;
 static uint16_t s_load_comp_mv = 50;
 /* Hold the last rested reading while audio is actively playing, so the gauge
  * does not creep down under load. Forced samples still refresh. */
-static bool     s_freeze_while_playing = false;
+static bool     s_freeze_while_playing = true;
 
 /* Map a pack voltage to 0..100 % via a piecewise open-circuit (rested) Li-ion
  * table. A single-cell Li-ion curve is strongly non-linear: it sits on a long
