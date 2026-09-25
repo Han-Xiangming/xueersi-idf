@@ -154,6 +154,9 @@ static audio_route_t s_route = AUDIO_ROUTE_SPEAKER;
 
 /* Consecutive failed PCM ring writes (bounds the WARN/ERROR rate). */
 static uint32_t s_wr_errs;
+/* Consecutive timed-out i2s_channel_write()s (bounds the ERROR rate). Surfaces
+ * a wedged DMA as a logged stall instead of a silent portMAX_DELAY freeze. */
+static uint32_t s_wr_stalls;
 
 /* Bytes currently sitting in the PCM ring: pushed by hw_audio_write_pcm(),
  * pulled by the writer task. This is how much decoded audio is still queued
@@ -579,6 +582,31 @@ bool hw_audio_is_ready(void)
     return s_ready && (s_i2s_chan != NULL);
 }
 
+/* Bounded I2S DMA write. Returns true on success, false on timeout.
+ *
+ * The DMA writer task is NOT task-WDT monitored, so an infinite-block
+ * i2s_channel_write() (a wedged out-link) froze playback with NO log and NO
+ * reboot — the "press play, totally stuck" symptom. A bounded write instead
+ * surfaces a wedged DMA as a logged stall (and retries next loop, which self-
+ * heals a transient credit hiccup). A descriptor frees every ~23 ms at 44.1 kHz,
+ * so a 50 ms timeout covers normal back-pressure and only trips on a real wedge.
+ * On failure the caller keeps ownership of `data` (it must return/drop it). */
+static bool i2s_write_bounded(const void *data, size_t len)
+{
+    size_t w = 0;
+    esp_err_t rc = i2s_channel_write(s_i2s_chan, data, len, &w, pdMS_TO_TICKS(50));
+    if (rc == ESP_OK) {
+        s_wr_stalls = 0;
+        return true;
+    }
+    if (++s_wr_stalls >= 8) {
+        ESP_LOGE(TAG, "[ERROR] i2s_channel_write stalled (rc=%d): DMA wedged?",
+                 (int)rc);
+        s_wr_stalls = 0;
+    }
+    return false;
+}
+
 /* Create the I2S output with ESP-IDF's i2s_std — no ADF. Codec-less: the
  * MAX98357 is a pure-I2S Class-D DAC. The channel runs at ONE FIXED rate
  * (s_rate) and is left ENABLED; the writer task gates it (pause/resume via
@@ -592,8 +620,9 @@ static void i2s_writer_task(void *arg)
     size_t written = 0;
     for (;;) {
         if (s_flush_req) {
-            /* Drop what is queued, then reset the DMA queue so the next pass
-             * starts clean (auto_clear alone does NOT reset the queue). */
+            /* Drop the queued PCM so the next track starts clean. The channel is
+             * deliberately NOT disabled/re-enabled here (see the note below): the
+             * DMA queue self-clears via auto_clear + the silence fill. */
             uint8_t *it; size_t len;
             while ((it = (uint8_t *)xRingbufferReceive(s_pcm_rb, &len, 0)) != NULL) {
                 vRingbufferReturnItem(s_pcm_rb, it);
@@ -618,16 +647,24 @@ static void i2s_writer_task(void *arg)
                 const size_t ring_bytes =
                     (size_t)I2S_DMA_DESC_NUM * 1024U * 4U; /* desc * frames * bytes/frame */
                 while (filled < ring_bytes) {
-                    size_t w = 0;
-                    i2s_channel_write(s_i2s_chan, silence,
-                                      sizeof(silence), &w, portMAX_DELAY);
-                    filled += w;
+                    if (!i2s_write_bounded(silence, sizeof(silence))) {
+                        break;   /* DMA wedged: skip the silence pre-fill */
+                    }
+                    filled += sizeof(silence);
                 }
             }
-            if (s_i2s_chan != NULL) {
-                i2s_channel_disable(s_i2s_chan);
-                i2s_channel_enable(s_i2s_chan);
-            }
+            /* Keep the channel ENABLED across the flush. A disable()+enable()
+             * here resets the TX descriptor credit queue but enable() does NOT
+             * refill it, so the next i2s_channel_write() blocks forever waiting
+             * for a credit that never arrives — the ESP32 DMA wedge that freezes
+             * playback silently after a track switch (log goes quiet, only a
+             * reboot recovers). The full-ring silence fill above (hard switch)
+             * already overwrites every descriptor with silence WHILE the channel
+             * is ENABLED, and auto_clear zeroes each descriptor as it is
+             * transmitted, so the previous track's residual PCM ("上一首残音")
+             * is gone without ever touching the channel. See the architecture
+             * comment near the top of this file: the channel is enabled once at
+             * init and left RUNNING; the flush must not stop/start it. */
             s_flush_req = false;
             s_flush_fill = false;
             if (s_flush_done != NULL) {
@@ -665,10 +702,10 @@ static void i2s_writer_task(void *arg)
                 const size_t ring_bytes =
                     (size_t)I2S_DMA_DESC_NUM * 1024U * 4U; /* desc * frames * bytes/frame */
                 while (filled < ring_bytes) {
-                    size_t w = 0;
-                    i2s_channel_write(s_i2s_chan, silence,
-                                      sizeof(silence), &w, portMAX_DELAY);
-                    filled += w;
+                    if (!i2s_write_bounded(silence, sizeof(silence))) {
+                        break;   /* DMA wedged: skip the silence pre-fill */
+                    }
+                    filled += sizeof(silence);
                 }
             }
             if (!s_i2s_disabled && s_i2s_chan != NULL) {
@@ -699,15 +736,15 @@ static void i2s_writer_task(void *arg)
                  * silence instead, so a stop is silent at once instead of playing
                  * the previous track's tail out — the "停止先 mute" guarantee. */
                 vRingbufferReturnItem(s_pcm_rb, item);
-                i2s_channel_write(s_i2s_chan, silence, sizeof(silence), &written,
-                                  portMAX_DELAY);
+                i2s_write_bounded(silence, sizeof(silence));
             } else {
-                i2s_channel_write(s_i2s_chan, item, written, &written, portMAX_DELAY);
+                /* On a DMA stall the item is returned to the ring and retried
+                 * next loop (self-heal); a wedged link is logged, never frozen. */
+                i2s_write_bounded(item, written);
                 vRingbufferReturnItem(s_pcm_rb, item);
             }
         } else {
-            i2s_channel_write(s_i2s_chan, silence, sizeof(silence), &written,
-                              portMAX_DELAY);
+            i2s_write_bounded(silence, sizeof(silence));
         }
     }
 }
@@ -1334,20 +1371,43 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
     if (s_i2s_chan == NULL || s_pcm_rb == NULL) {
         return AUDIO_WRITE_STALLED;
     }
-    /* Push the DSP-produced PCM into the ring; xRingbufferSend blocks (back-
-     * pressure) until there is room, mirroring the old audio_element_write(). */
-    if (xRingbufferSend(s_pcm_rb, dsp_buf, bytes, pdMS_TO_TICKS(100)) != pdTRUE) {
-        s_last_write_us = esp_timer_get_time();
-        /* 暂停/停止落在写中途:不算错误。 */
-        if (!s_player_active) {
-            return AUDIO_WRITE_ABANDONED;
+    /* Push the DSP-produced PCM into the ring in sub-ring chunks. A single
+     * decoded (and resampled) frame can be LARGER than the whole PCM ring: e.g.
+     * a 48 kHz track resampled to the fixed 44.1 kHz I2S rate is ~8.5 KB, but the
+     * ring is only 8 KB. A byte-buffer ringbuf fails the send outright when the
+     * item exceeds its capacity, so a whole-frame xRingbufferSend() would NEVER
+     * succeed and the decoder would spin forever returning AUDIO_WRITE_STALLED
+     * (log prints the first frame, then silence — "press play and it hangs",
+     * exactly the reported cold-boot-first-play freeze). Chunking each frame into
+     * items smaller than the ring lets the DMA writer task drain between chunks,
+     * so any frame size streams. */
+    size_t off = 0;
+    audio_write_result_t res = AUDIO_WRITE_OK;
+    while (off < bytes) {
+        size_t chunk = bytes - off;
+        if (chunk > 1024) {
+            chunk = 1024;   /* well under the 8 KB ring; small DMA writes */
         }
-        if (++s_wr_errs >= 4) {
-            ESP_LOGE(TAG, "[ERROR] PCM ringbuf full / write stalled (%u bytes)",
-                     (unsigned)bytes);
-            s_wr_errs = 0;
+        if (xRingbufferSend(s_pcm_rb, (uint8_t *)dsp_buf + off, chunk,
+                            pdMS_TO_TICKS(100)) != pdTRUE) {
+            s_last_write_us = esp_timer_get_time();
+            /* 暂停/停止落在写中途:不算错误。 */
+            if (!s_player_active) {
+                return AUDIO_WRITE_ABANDONED;
+            }
+            if (++s_wr_errs >= 4) {
+                ESP_LOGE(TAG, "[ERROR] PCM ringbuf full / write stalled (%u bytes)",
+                         (unsigned)chunk);
+                s_wr_errs = 0;
+            }
+            res = AUDIO_WRITE_STALLED;   /* back-pressure: ring full, retry next frame */
+            break;
         }
-        return AUDIO_WRITE_STALLED;
+        off += chunk;
+        /* Serialised so the writer task's decrement can never lose this add. */
+        taskENTER_CRITICAL(&s_ring_lock);
+        s_ring_bytes += chunk;   /* account for queued audio (end-of-track detection) */
+        taskEXIT_CRITICAL(&s_ring_lock);
     }
     s_last_write_us = esp_timer_get_time();
     /* 暂停/停止落在写中途:不算错误。 */
@@ -1355,11 +1415,5 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
         return AUDIO_WRITE_ABANDONED;
     }
     s_wr_errs = 0;
-    {
-        /* Serialised so the writer task's decrement can never lose this add. */
-        taskENTER_CRITICAL(&s_ring_lock);
-        s_ring_bytes += bytes;   /* account for queued audio (end-of-track detection) */
-        taskEXIT_CRITICAL(&s_ring_lock);
-    }
-    return AUDIO_WRITE_OK;
+    return res;
 }
