@@ -2482,7 +2482,10 @@ static void ui_action(void)
         }
         else {
             set_action("播放中");
-            player_play(player_scan_path(s_mp3_sel));
+            /* 直接用 UI 已知的下标起播，跳过 player_play() 内的路径回查：保证
+             * s_index 从第一首起就恒为有效显式下标，避免极端情况下（列表被扫描
+             * 任务换源/重排）路径回查失败导致 s_index=-1，进而连播/切歌算错。 */
+            player_play_index(s_mp3_sel);
         }
         break;
     case UI_PAGE_BT:

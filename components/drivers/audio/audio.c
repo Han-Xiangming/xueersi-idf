@@ -43,6 +43,9 @@
 #include "freertos/task.h"    /* TaskHandle_t / xTaskCreate / ulTaskNotifyTake / xTaskNotifyGive */
 #include "freertos/ringbuf.h" /* xRingbuffer*: local PCM ring between the DSP and the DMA writer task */
 #include "freertos/semphr.h"
+#if defined(CONFIG_ESP_TASK_WDT_EN)
+#include "esp_task_wdt.h"   /* esp_task_wdt_reset: keep the task WDT fed while we block */
+#endif
 
 static const char *TAG = "hw_audio";
 
@@ -53,6 +56,15 @@ static const char *TAG = "hw_audio";
  * stereo) = 48 KB of buffering (~280 ms at 44.1 kHz). One descriptor-sized
  * zero chunk per descriptor is enough to silence the whole ring. */
 #define I2S_DMA_DESC_NUM    12
+
+/* Time for the DMA to flush its in-flight descriptors (~48 KB at 44.1 kHz
+ * stereo ≈ 280 ms) after the PCM ring has drained. The writer waits this out
+ * before parking and hw_audio_drain_blocking() adds it on top, so a parked or
+ * track-ended boundary does not chop the last ~280 ms of audio. The refactor
+ * to a ring buffer + async writer had no such wait, so "the song ended" was
+ * both inaudible (tail dropped on park) and undetectable (decoder EOF led real
+ * playback by ~300 ms with no completion signal). */
+#define I2S_DMA_DRAIN_MS    350
 
 /* A dedicated DMA writer task owns the actual I2S write, so there is no manual
  * write timeout / IO mutex here: hw_audio_write_pcm() blocks on the ring buffer
@@ -81,6 +93,15 @@ static TaskHandle_t      s_i2s_task  = NULL;  /* DMA writer task handle         
 static bool              s_i2s_disabled;      /* channel currently disabled     */
 static bool              s_parked;            /* hw_audio_park(): stop BCLK     */
 static bool              s_flush_req;         /* pipeline_flush pending         */
+static bool              s_flush_fill;        /* hard switch: also overwrite the
+                                               * DMA descriptor ring with silence
+                                               * to kill previous-track PCM left
+                                               * in descriptors ahead of the DMA. */
+static SemaphoreHandle_t s_flush_done = NULL; /* posted by the writer when a
+                                               * synchronous pipeline flush has
+                                               * actually dropped the ring + reset
+                                               * the DMA queue, so the caller can
+                                               * start the next track clean. */
 static volatile bool s_ready;
 static uint32_t s_rate = AUDIO_DEFAULT_RATE;
 
@@ -133,6 +154,29 @@ static audio_route_t s_route = AUDIO_ROUTE_SPEAKER;
 
 /* Consecutive failed PCM ring writes (bounds the WARN/ERROR rate). */
 static uint32_t s_wr_errs;
+
+/* Bytes currently sitting in the PCM ring: pushed by hw_audio_write_pcm(),
+ * pulled by the writer task. This is how much decoded audio is still queued
+ * but NOT yet handed to the DMA. Together with the DMA's own in-flight
+ * descriptors (bounded ~280 ms, see I2S_DMA_DRAIN_MS) it tells the player
+ * exactly when a track's last sample has actually been emitted — i.e. when
+ * the song has really ended, instead of merely when the decoder hit EOF.
+ * Without it the post-refactor player cannot determine track end.
+ *
+ * IMPORTANT: `volatile`. It is written by hw_audio_write_pcm() (decode task)
+ * and by the writer task, and read across tasks by hw_audio_drain_blocking()/
+ * hw_audio_pending(). Without volatile the compiler caches it in a register
+ * inside the drain wait-loop and the loop spins forever (the writer empties
+ * the ring, the cached value stays > 0) — which starves esp_task_wdt_reset()
+ * and reboots via the 5 s task-WDT. Updates are also serialised by the
+ * spinlock so the read-modify-write never loses an increment from the other
+ * task. */
+static volatile size_t s_ring_bytes;
+
+/* Serialises the s_ring_bytes accounting across the decode task (increment)
+ * and the writer task (decrement) so the non-atomic read-modify-write can
+ * never lose an update. */
+static portMUX_TYPE s_ring_lock = portMUX_INITIALIZER_UNLOCKED;
 
 /* Underflow diagnostics: the gap between consecutive speaker-path writes
  * (the decode time) must stay well under the DMA drain time, otherwise the
@@ -554,14 +598,64 @@ static void i2s_writer_task(void *arg)
             while ((it = (uint8_t *)xRingbufferReceive(s_pcm_rb, &len, 0)) != NULL) {
                 vRingbufferReturnItem(s_pcm_rb, it);
             }
+            taskENTER_CRITICAL(&s_ring_lock);
+            s_ring_bytes = 0;   /* queue dropped: nothing pending */
+            taskEXIT_CRITICAL(&s_ring_lock);
             if (s_i2s_chan != NULL) {
                 i2s_channel_disable(s_i2s_chan);
                 i2s_channel_enable(s_i2s_chan);
             }
+            if (s_flush_fill) {
+                /* Hard track switch (stop->next, manual next/prev): the DMA
+                 * descriptors AHEAD of the current pointer still hold the
+                 * previous track's PCM. disable/enable alone does NOT clear
+                 * them, so write a full ring of silence to overwrite every
+                 * descriptor before the new track's data is let in. This is
+                 * what removes the "上一首残音" deterministically (see the
+                 * comment by I2S_DMA_DESC_NUM: one silence chunk per
+                 * descriptor silences the whole ring). */
+                size_t filled = 0;
+                const size_t ring_bytes =
+                    (size_t)I2S_DMA_DESC_NUM * 1024U * 4U; /* desc * frames * bytes/frame */
+                while (filled < ring_bytes) {
+                    size_t w = 0;
+                    i2s_channel_write(s_i2s_chan, silence,
+                                      sizeof(silence), &w, portMAX_DELAY);
+                    filled += w;
+                }
+            }
             s_flush_req = false;
+            s_flush_fill = false;
+            if (s_flush_done != NULL) {
+                xSemaphoreGive(s_flush_done);   /* unblock the waiting caller */
+            }
         }
         bool paused = (s_route == AUDIO_ROUTE_BT) || s_parked;
         if (paused) {
+            /* Play out whatever is still queued so the just-ended track's tail
+             * is NOT cut off. The old i2s_stream element drained its buffer on
+             * pause; the new async writer used to disable the channel at once,
+             * dropping up to ~280 ms of tail and making "the song ended"
+             * undetectable. After the ring is empty, let the DMA flush its
+             * in-flight tail before killing BCLK. */
+            uint8_t *pit; size_t plen;
+            while ((pit = (uint8_t *)xRingbufferReceive(s_pcm_rb, &plen, 0)) != NULL) {
+                taskENTER_CRITICAL(&s_ring_lock);
+                if (plen <= s_ring_bytes) {
+                    s_ring_bytes -= plen;
+                } else {
+                    s_ring_bytes = 0;
+                }
+                taskEXIT_CRITICAL(&s_ring_lock);
+                /* Play the tail out on the speaker; if Bluetooth owns the route
+                 * the stale PCM belongs to the speaker path and must just be
+                 * dropped, never emitted on the I2S bus. */
+                if (!audio_route_is_bt() && s_i2s_chan != NULL) {
+                    i2s_channel_write(s_i2s_chan, pit, plen, &plen, portMAX_DELAY);
+                }
+                vRingbufferReturnItem(s_pcm_rb, pit);
+            }
+            vTaskDelay(pdMS_TO_TICKS(I2S_DMA_DRAIN_MS));
             if (!s_i2s_disabled && s_i2s_chan != NULL) {
                 i2s_channel_disable(s_i2s_chan);   /* BCLK stops, amp sleeps */
                 s_i2s_disabled = true;
@@ -577,6 +671,13 @@ static void i2s_writer_task(void *arg)
         uint8_t *item = (uint8_t *)xRingbufferReceive(s_pcm_rb, &written,
                                                        pdMS_TO_TICKS(20));
         if (item != NULL) {
+            taskENTER_CRITICAL(&s_ring_lock);
+            if (written <= s_ring_bytes) {
+                s_ring_bytes -= written;
+            } else {
+                s_ring_bytes = 0;   /* defensive: never underflow */
+            }
+            taskEXIT_CRITICAL(&s_ring_lock);
             i2s_channel_write(s_i2s_chan, item, written, &written, portMAX_DELAY);
             vRingbufferReturnItem(s_pcm_rb, item);
         } else {
@@ -647,6 +748,11 @@ void hw_audio_init(void)
         return;
     }
 
+    s_flush_done = xSemaphoreCreateBinary();
+    if (s_flush_done == NULL) {
+        ESP_LOGE(TAG, "[AUDIO] flush semaphore alloc failed");
+    }
+
     audio_set_hpf_coeff(s_rate);      /* default-rate HPF coefficient */
     audio_set_loudness_coeff(s_rate); /* default-rate loudness shelf coeff */
     audio_build_vol_table();          /* precompute the 0.1 dB gain table */
@@ -705,6 +811,43 @@ uint8_t hw_audio_get_volume(void)
 bool hw_audio_is_playing(void)
 {
     return s_player_active && (s_i2s_chan != NULL) && !s_parked && s_route == AUDIO_ROUTE_SPEAKER;
+}
+
+/* Bytes still queued in the PCM ring (decoded but not yet pulled by the writer
+ * task). The player polls this after a track hits EOF to learn when the last
+ * sample has left the ring; the DMA adds a bounded ~280 ms tail on top, which
+ * hw_audio_drain_blocking() also waits out. Returns 0 once everything decoded
+ * has at least been handed to the DMA. */
+size_t hw_audio_pending(void)
+{
+    return s_ring_bytes;
+}
+
+/* Block until every queued sample has actually been played: the PCM ring
+ * drained AND the DMA's in-flight tail flushed. Call at a track boundary or
+ * before park so the previous track's audio is fully emitted before the next
+ * starts (or before the device goes silent). This is what makes "the song has
+ * ended" determinable again after the ring-buffer refactor decoupled the
+ * decoder's EOF from real playback. Safe to call from the decode task, which
+ * is allowed to block at a seam.
+ *
+ * s_ring_bytes is volatile, so this loop re-reads it every pass and terminates
+ * once the writer task has emptied the ring. It is also hard-bounded: a wedged
+ * DMA / stalled writer can never spin this task past the 5 s task-WDT window,
+ * and we keep feeding the WDT while we wait. */
+void hw_audio_drain_blocking(void)
+{
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
+    while (s_ring_bytes > 0 && xTaskGetTickCount() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+#if defined(CONFIG_ESP_TASK_WDT_EN)
+        esp_task_wdt_reset();   /* this task must keep the WDT fed while blocked */
+#endif
+    }
+    vTaskDelay(pdMS_TO_TICKS(I2S_DMA_DRAIN_MS));
+#if defined(CONFIG_ESP_TASK_WDT_EN)
+    esp_task_wdt_reset();
+#endif
 }
 
 void hw_audio_set_speaker_volume(uint8_t volume_pct)
@@ -884,10 +1027,45 @@ void hw_audio_pipeline_flush(void)
     /* Speaker route: ask the writer task to drop the queued PCM and reset the
      * DMA queue (auto_clear alone does NOT reset the queue, which is what let
      * it desync and wedge on repeat). The task owns the channel, so this is
-     * the only safe place to toggle disable/enable. */
+     * the only safe place to toggle disable/enable.
+     *
+     * Synchronous: block until the writer has actually dropped the ring and
+     * reset the DMA queue. A mere flag + notify is not enough — the caller
+     * (decode loop) then immediately opens a NEW track and writes its first
+     * PCM; without waiting, that first chunk could land in the ring and be
+     * discarded by the still-pending flush, cutting the new song's head. The
+     * wait is bounded (100 ms) so a wedged writer can never deadlock the
+     * caller. */
+    if (s_i2s_task == NULL) {
+        return;   /* no writer to flush (init failed / not yet up) */
+    }
     s_flush_req = true;
-    if (s_i2s_task != NULL) {
-        xTaskNotifyGive(s_i2s_task);
+    xTaskNotifyGive(s_i2s_task);   /* wake the writer if it is parked */
+    if (s_flush_done != NULL) {
+        xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(100));
+    }
+}
+
+/* Hard track switch: like hw_audio_pipeline_flush() but the writer also
+ * overwrites the DMA descriptor ring with silence so any previous track's
+ * PCM still queued in descriptors ahead of the DMA pointer is discarded. Use
+ * this on a real switch (stop->next, manual next/prev) where residual audio
+ * must not bleed into the next song. Synchronous. */
+void hw_audio_pipeline_switch(void)
+{
+    s_last_write_us = 0;
+    if (s_route == AUDIO_ROUTE_BT) {
+        bt_audio_flush_pcm_ring();
+        return;
+    }
+    if (s_i2s_task == NULL) {
+        return;   /* no writer to flush (init failed / not yet up) */
+    }
+    s_flush_fill = true;
+    s_flush_req = true;
+    xTaskNotifyGive(s_i2s_task);   /* wake the writer if it is parked */
+    if (s_flush_done != NULL) {
+        xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(100));
     }
 }
 
@@ -1149,5 +1327,11 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
         return AUDIO_WRITE_ABANDONED;
     }
     s_wr_errs = 0;
+    {
+        /* Serialised so the writer task's decrement can never lose this add. */
+        taskENTER_CRITICAL(&s_ring_lock);
+        s_ring_bytes += bytes;   /* account for queued audio (end-of-track detection) */
+        taskEXIT_CRITICAL(&s_ring_lock);
+    }
     return AUDIO_WRITE_OK;
 }

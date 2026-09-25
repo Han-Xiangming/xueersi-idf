@@ -111,6 +111,14 @@ void hw_audio_park(void);
  * Call from the task that owns PCM writes. */
 void hw_audio_pipeline_flush(void);
 
+/* Hard track switch: like hw_audio_pipeline_flush() but the writer ALSO
+ * overwrites the entire DMA descriptor ring with silence, so any previous
+ * track's PCM still sitting in descriptors ahead of the DMA pointer is
+ * discarded (disable/enable alone does not clear them). Use this on a real
+ * track switch (stop->next, manual next/prev) where residual audio must not
+ * bleed into the next song. Synchronous: blocks until the writer is done. */
+void hw_audio_pipeline_switch(void);
+
 /* Result of a PCM write, so the caller can distinguish "streamed" from
  * "the pipeline is wedged" (DMA not consuming) vs "playback was
  * deactivated mid-write" (pause/stop — not an error). */
@@ -138,3 +146,18 @@ bool hw_audio_is_ready(void);
  * drivers (e.g. the battery gauge) to probe load state without touching
  * audio internals. */
 bool hw_audio_is_playing(void);
+
+/* Bytes still queued in the PCM ring (decoded but not yet pulled by the
+ * writer task). The player polls this after a track hits EOF to learn when
+ * every decoded sample has at least been handed to the DMA — i.e. when the
+ * song has really ended, not merely when the decoder reached file-EOF. The
+ * DMA adds a bounded ~280 ms tail on top; hw_audio_drain_blocking() waits
+ * that out too. */
+size_t hw_audio_pending(void);
+
+/* Block until every queued sample has actually been played (ring drained and
+ * the DMA's in-flight tail flushed). Call at a track boundary or before park
+ * so the previous track's audio is fully emitted before the next starts or the
+ * device goes silent. Safe to call from the decode task (allowed to block at a
+ * seam). */
+void hw_audio_drain_blocking(void);

@@ -90,6 +90,14 @@ static char s_name[MP3_NAME_LEN];
 static int s_index = -1;          /* list index of the loaded track (-1 = none) */
 static int s_new_index = -1;       /* explicit list index of the pending play
                                    * request (-1 = derive from path at reload) */
+static volatile bool s_switch_soft;   /* natural-end auto-advance: the ring is
+                                      * already drained, so the reload flush
+                                      * must NOT add a silence gap (soft flush).
+                                      * Set by the UI/scan task, read by the
+                                      * decode loop (cross-task, like s_new_req). */
+static bool s_ever_played;  /* a track has been opened at least once, so a
+                              * later switch has real audio to clear (otherwise
+                              * the first-ever play is a soft flush, no gap). */
 static volatile bool s_stop_req;
 static volatile bool s_pause_req;
 static volatile bool s_new_req;
@@ -101,6 +109,14 @@ static uint32_t s_dbg_rate;            /* samplerate captured from 1st frame */
  * each new track; if it reaches the limit the track is aborted instead of
  * spinning forever on a corrupt/non-MP3 file. */
 static int s_no_sync_refills;
+/* Genuine end-of-file flag. Set only when a read returns 0 with NO underlying
+ * error (i.e. feof, not ferror), so we know the source can never yield more
+ * bytes. This is what lets the trailing-data paths below end the track as a
+ * NATURAL finish instead of misjudging the song's end: a transient SD read
+ * error (ferror) must NOT be treated as "song ended", and padding/garbage
+ * bytes past the real end must not be escalated into a false CORRUPT verdict.
+ * Reset per track. */
+static bool s_at_eof;
 /* Consecutive MP3Decode failures in the current track (reset on success).
  * Guards against the byte-by-byte resync spinning forever on garbage. */
 static int s_track_errs;
@@ -710,12 +726,25 @@ static bool open_track(void)
         return false;
     }
     parse_id3v2();   /* skip the tag past the decoder + pick up ReplayGain */
+    clearerr(s_src.fp);      /* drop any stale error/EOF flag from a prior file */
     s_bytes_left = 0;
     s_consumed = 0;
+    s_at_eof = false;        /* fresh track: not at end yet */
     s_no_sync_refills = 0;   /* fresh track: restart sync-word watchdog */
     s_track_errs = 0;        /* fresh track: restart decode-error watchdog */
     s_pcm_stalls = 0;        /* fresh track: restart pipeline-stall watchdog */
     s_no_prog = 0;           /* fresh track: restart no-progress watchdog */
+    s_ever_played = true;    /* a real track is now open: every later switch
+                              * (stop->next, manual next/prev, error advance)
+                              * has real audio to clear, so the reload block
+                              * must use the HARD flush (hw_audio_pipeline_switch)
+                              * that overwrites the whole DMA descriptor ring
+                              * with silence. This is what kills the "上一首残音"
+                              * on a stop-then-next. Set here (not only in
+                              * repeat_one_rewind) because open_track() is the
+                              * path hit on EVERY normal play — including the
+                              * first — so a plain play never leaves s_ever_played
+                              * false and silently falls back to the soft flush. */
     return true;
 }
 
@@ -758,11 +787,13 @@ static bool rewind_track(void)
     }
     s_bytes_left = 0;
     s_consumed = 0;
+    s_at_eof = false;        /* fresh pass: not at end yet */
     s_no_sync_refills = 0;   /* fresh pass: restart sync-word watchdog */
     s_track_errs = 0;        /* fresh pass: restart decode-error watchdog */
     s_pcm_stalls = 0;        /* fresh pass: restart pipeline-stall watchdog */
     s_no_prog = 0;           /* fresh pass: restart no-progress watchdog */
     s_dbg_frames = 0;
+    clearerr(s_src.fp);      /* drop any stale error/EOF flag before replay */
     parse_id3v2();           /* re-skip the tag + pick up ReplayGain again */
     hw_audio_set_player_active(true); /* re-arm the pipeline */
     return true;
@@ -803,8 +834,24 @@ static bool decode_frame(bool *rate_set)
                            MP3_READ_CHUNK - s_bytes_left);
         s_bytes_left += got;
         t_read_done = esp_timer_get_time();
-        if (got == 0 && s_bytes_left < 2) {
-            return false;   /* end of file */
+        if (got == 0) {
+            /* A zero read from a blocking FILE* is ambiguous: it means EITHER
+             * the file is genuinely exhausted (feof) OR a low-level read error
+             * occurred (ferror, e.g. an SDSPI CRC glitch). The old code treated
+             * both as "song ended", which cut good tracks short on a transient
+             * SD error and left no real notion of "audio is over". Tell them
+             * apart: an error is a hard failure; genuine EOF lets us stop
+             * hunting for more frames and end the track cleanly below. */
+            if (ferror(s_src.fp)) {
+                ESP_LOGE(TAG, "read error on '%s', aborting track", s_name);
+                s_track_errored = true;
+                player_report_error(PLAYER_ERR_PIPELINE);
+                return false;
+            }
+            s_at_eof = true;   /* no more bytes will ever come from this file */
+        }
+        if (s_at_eof && s_bytes_left < 2) {
+            return false;   /* natural end of file */
         }
     }
 
@@ -815,6 +862,13 @@ static bool decode_frame(bool *rate_set)
                  s_bytes_left);
         s_consumed = 0;
         s_bytes_left = 0;
+        if (s_at_eof) {
+            /* Past the real end of the file, so any bytes left are trailing
+             * (padding / ID3v1 / garbage), never more audio. End the track as
+             * a natural finish instead of spinning the no-sync watchdog toward
+             * a false "corrupt" verdict. */
+            return false;
+        }
         if (++s_no_sync_refills >= 64) {
             ESP_LOGE(TAG, "no MP3 sync word after 64 refills, aborting track");
             s_track_errored = true;
@@ -841,6 +895,14 @@ static bool decode_frame(bool *rate_set)
          * task-WDT quiet — this is the graceful, fast path). */
         ESP_LOGD(TAG, "MP3Decode status=%d at consumed=%d, resyncing",
                  status, s_consumed);
+        if (s_at_eof) {
+            /* Decode failed but the file is already exhausted: the failing
+             * bytes are trailing junk past the real audio, not a corrupt
+             * track. End naturally rather than flagging CORRUPT — otherwise a
+             * perfectly good song with a padded/garbage tail would be
+             * misjudged as broken. */
+            return false;
+        }
         if (++s_track_errs >= TRACK_MAX_DECODE_ERRS) {
             ESP_LOGE(TAG, "track '%s' too many decode errors (%d), aborting",
                      s_name, s_track_errs);
@@ -870,6 +932,10 @@ static bool decode_frame(bool *rate_set)
      * healthy track always advances the file or emits audio, so a short streak
      * of pure no-progress frames is unmistakably corrupt. */
     if (info.outputSamps == 0 && consumed_this == 0) {
+        if (s_at_eof) {
+            /* Trailing no-op frames past EOF: the logical end of audio. */
+            return false;
+        }
         if (++s_no_prog >= 16) {
             ESP_LOGE(TAG, "decode made no progress for %d frames, aborting '%s'",
                      s_no_prog, s_name);
@@ -995,6 +1061,31 @@ static void decode_loop(void)
 #endif
         if (s_new_req) {
             s_new_req = false;
+            /* Clear any PCM still sitting in the ring (and reset the DMA queue)
+             * from the PREVIOUS track BEFORE loading the new one. Without this,
+             * a stop pressed and then a next-track started before the decode
+             * loop finished tearing down — or any manual next/prev — would let
+             * the writer drain the old track's tail into the new track: the
+             * "上一首残音" bug.
+             *
+             * Hard vs soft: a hard switch (hw_audio_pipeline_switch) ALSO
+             * overwrites the whole DMA descriptor ring with silence, killing
+             * previous-track PCM left in descriptors AHEAD of the DMA pointer —
+             * that is what the soft flush alone could not remove, and it is what
+             * the "still has residual" reports were about. Use it on any real
+             * switch that has audio to clear (s_ever_played), but NOT on the
+             * first-ever play (nothing to clear -> no pointless ~280 ms gap) and
+             * NOT on natural-end (the ring is already drained by
+             * hw_audio_drain_blocking(), so a hard fill would add a spurious gap
+             * and wreck the perceptible seam). */
+            if (s_switch_soft) {
+                hw_audio_pipeline_flush();
+            } else if (s_ever_played) {
+                hw_audio_pipeline_switch();
+            } else {
+                hw_audio_pipeline_flush();
+            }
+            s_switch_soft = false;
             strncpy(s_path, s_new_path, sizeof(s_path) - 1);
             s_path[sizeof(s_path) - 1] = '\0';
             strncpy(s_name, s_new_name, sizeof(s_name) - 1);
@@ -1125,7 +1216,7 @@ static void decode_loop(void)
                              s_index, s_name);
                     hw_audio_pipeline_flush();
                     vTaskDelay(pdMS_TO_TICKS(REPEAT_ONE_GAP_MS));
-                    player_play_index(s_index);   /* 显式 index 重播当前曲目 */
+                    player_play_index_ex(s_index, true);   /* 显式 index 重播当前曲目 */
                     continue;   /* 重载块按 s_new_index 重开当前曲目 */
                 }
                 /* 兜底：当前曲目不在列表（无显式 index）时原地 rewind */
@@ -1182,7 +1273,15 @@ static void decode_loop(void)
          * inside the track block above.) decide_next_index() returns -1 to
          * stop when the list is empty or the mode is list-loop but the current
          * track is not in the list (s_index < 0) — no auto-advance into the
-         * void. */
+         * void.
+         *
+         * Drain first: the ring buffer + async writer decoupled the decoder's
+         * EOF from real playback, so without this the "song ended" moment is
+         * undetectable (decoder is ~300 ms ahead) and the next track would
+         * start on top of the previous tail. Waiting for the audio to actually
+         * finish makes the boundary perceptible AND lets the UI mark the track
+         * as ended coherently. */
+        hw_audio_drain_blocking();
         const int cnt = s_playlist->count;
         const int next = decide_next_index(s_repeat, s_index, cnt);
         if (next < 0) {
@@ -1190,7 +1289,7 @@ static void decode_loop(void)
         }
         ESP_LOGI(TAG, "[MODE] natural end: repeat=%d from %d -> %d (cnt=%d)",
                  (int)s_repeat, s_index, next, cnt);
-        player_play_index(next);   /* 显式 index：重载块直接采用，模式一致 */
+        player_play_index_ex(next, true);   /* 自然结束：ring 已排空，软切换保边界 */
         continue;   /* loop top picks up s_new_req and starts the next song */
     }
     /* Decode loop is leaving for good (stop / watchdog / too many failures):
@@ -1608,12 +1707,20 @@ void player_play(const char *path)
 
 void player_play_index(int i)
 {
+    player_play_index_ex(i, false);
+}
+
+void player_play_index_ex(int i, bool soft)
+{
     if (i < 0 || i >= player_scan_count()) {
         return;
     }
     /* 显式给出列表下标：重载块优先采用该 index 而非路径回查，保证自动连播/
-     * 错误前进始终基于确定的 index（见 decode_loop 重载块）。 */
+     * 错误前进始终基于确定的 index（见 decode_loop 重载块）。soft=true marks
+     * the reload as a natural-end / repeat-one seam so it uses the soft flush
+     * (no extra silence gap); false is a real switch that hard-flushes. */
     s_new_index = i;
+    s_switch_soft = soft;
     /* Play by absolute path from the (immutable) playlist snapshot. The index
      * itself is read-only here — callers may only SELECT an entry, never
      * reorder the list. */
@@ -1647,8 +1754,13 @@ static int player_step(int dir)
 /* Single source of truth for "which track plays next at a natural end / on a
  * manual next". Handles every repeat mode so the decode-loop natural-end block
  * and player_next() cannot drift apart:
- *   - ALL : next entry, wrapping at the end; -1 (stop) if the list is empty or
- *           the ended track is not in the list (s_index < 0).
+ *   - ALL : next entry, wrapping at the end; -1 (stop) only if the list is
+ *           genuinely empty (cnt <= 0). If the ended track's index was never
+ *           resolved (s_index < 0 — e.g. playback started from a path that no
+ *           longer matches any scanned entry) we restart from the top (index 0)
+ *           instead of silently stopping after one track: that "list does not
+ *           advance / stuck at the boundary" regression is why the original
+ *           -1-return-on-(s_index<0) path was removed.
  *   - RANDOM: a random entry, never the just-ended one when the list holds more
  *           than one; the single-element list degenerates to track 0.
  *   - ONE is NOT handled here: single-track loop replays the file IN PLACE
@@ -1672,7 +1784,15 @@ static int decide_next_index(player_repeat_t mode, int ended_index, int cnt)
     }
     /* PLAYER_REPEAT_ALL (and any unknown mode): sequential, wrapping. */
     if (ended_index < 0) {
-        return -1;
+        /* The ended track was not in the list (its index was never resolved,
+         * e.g. playback was started from a path that does not match any
+         * scanned entry, so s_index stayed -1). A genuine empty list is
+         * already handled above (cnt <= 0). Here we must NOT return -1 and
+         * silently stop after one track — that is the "list does not advance
+         * / stuck at the boundary" regression. Restart from the top of the
+         * list instead; the next natural end will have a real index and
+         * advance normally. */
+        return (cnt > 0) ? 0 : -1;
     }
     return (ended_index + 1) % cnt;
 }

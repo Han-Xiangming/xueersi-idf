@@ -186,6 +186,13 @@ void player_play(const char *path);
  * ignored. */
 void player_play_index(int i);
 
+/* Like player_play_index(), with an explicit seam hint. soft=true marks the
+ * switch as a natural-end / single-track-loop seam so the reload uses a soft
+ * flush (no forced silence gap); soft=false is a real switch (manual
+ * next/prev, stop->next, error advance) and hard-flushes the DMA ring to drop
+ * any previous track's residual PCM. */
+void player_play_index_ex(int i, bool soft);
+
 /* Index of the track currently loaded (0-based), or -1 when nothing has been
  * loaded yet / the list is empty. */
 int player_current_index(void);
