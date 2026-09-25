@@ -28,7 +28,7 @@ FATFS 目录遍历在 SDSPI 上耗时数十 ms，故列表由**独立扫描任�
 | `player_scan_start()` | 请求后台扫描 `/sdcard/Music` 的 `.mp3`（忽略大小写）；扫描进行中的请求合并为一次后续扫描 |
 | `player_scan_busy()` | 扫描中或已排队 |
 | `player_scan_version()` | 每次完成扫描递增；UI 轮询以检测新列表 |
-| `player_scan_count()` | 最近一次扫描的曲目数（最多 64 首，`PLAYER_SCAN_MAX`） |
+| `player_scan_count()` | 最近一次扫描的曲目数（最多 256 首，`PLAYER_SCAN_MAX`） |
 | `player_scan_name(i)` | 第 i 首曲目名（越界返回 ""） |
 
 - 扫描结果按 `strcasecmp` 排序（qsort），跨扫描稳定；双缓冲快照发布：先填工作区 → 复制到活动数组 → bump 版本。

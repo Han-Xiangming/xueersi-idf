@@ -439,7 +439,7 @@ static void player_load_folder(const char *root)
     }
     playlist_publish(work, n, PL_SRC_FOLDER);
     /* Remember what we just published: the whole-card list only when the
-     * scan root was the card root (drives the cache fingerprint reuse). */
+     * scan root was the card root (drives the whole-card cache reuse). */
     s_pub_is_whole_card = (strcmp(root, PLAYER_ROOT) == 0);
     /* The on-card cache represents the WHOLE-CARD list only. A sub-folder
      * browse must NOT overwrite it, or the next player entry (which always

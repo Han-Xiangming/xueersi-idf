@@ -180,7 +180,7 @@ MAX98357 由 BCLK 内部派生主时钟，因此 **不需要 MCLK**。
 ### 5.1 播放器（MP3）
 
 - 解码库：`esp-libhelix-mp3`（libhelix C API），运行在独立 FreeRTOS 任务中，不阻塞 UI。
-- 音源：整卡递归扫描（最多 64 首），支持「整卡 / 指定文件夹」源选择；首次扫描结果写入 `/sdcard/.xueersi_playlist.cache` 缓存，下次进入播放器秒开，无需重新遍历 FATFS。
+- 音源：整卡递归扫描（最多 256 首，`PLAYER_SCAN_MAX`），支持「整卡 / 指定文件夹」源选择；首次扫描结果写入 `/sdcard/.xueersi_playlist.cache` 缓存（M3U8 文本格式，可被 VLC 等直接导入），下次进入播放器秒开，无需重新遍历 FATFS。缓存以**源签名**（整卡下两层目录/文件的名字 + mtime 的 FNV 哈希）做失效判定：关机后往卡里加 / 删 / 改歌，下次进入会自动重扫并更新缓存，无需手动「重扫列表」。
 - 支持播放 / 暂停切换 / 停止；播放时上下键调节音量，A 播放/继续，B 停止。
 - 循环模式：列表循环（默认）/ 单曲循环，播放页按 Select 键切换，右上角状态栏显示当前模式。
 - ReplayGain 2.0：自动读取歌曲 ID3 标签中的 `REPLAYGAIN_TRACK_GAIN`（loudgain / rsgain 写入），在进入主音量前以约 5 ms 平滑曲线应用分轨响度增益，未打标歌曲按 0 dB 处理。
