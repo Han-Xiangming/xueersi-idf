@@ -83,7 +83,7 @@ static bt_conn_state_cb_t s_conn_state_cb;
  * particular sink still congests. Lowered to 45 (~295 kbps): some sinks
  * still hit L2CAP congestion at 53 (the "l2cab is_cong_cback_context"
  * flood), so we trade a little quality for a robust link. */
-#define BT_SBC_MAX_BITPOOL     45
+#define BT_SBC_MAX_BITPOOL     40
 
 /* Preferred SBC capability advertised to sinks: same shape as the stack
  * default config, but with max_bitpool capped (see BT_SBC_MAX_BITPOOL).
