@@ -137,6 +137,7 @@ static void lvgl_task(void *arg)
 {
     lv_group_t *group = (lv_group_t *)arg;
     uint32_t last_update_ms = 0;
+    bool was_standby = false;           /* edge detect for standby entry */
 
     ESP_LOGI(TAG, "Start Xiaomiao hardware dashboard");
     ui_create(group);
@@ -158,6 +159,17 @@ static void lvgl_task(void *arg)
 
         /* Drive the auto screen-off (standby) idle timer each loop. */
         hw_lcd_standby_tick();
+
+        /* On entering standby the screen blanks: the user has stopped
+         * interacting and may power the device off or close it, so flush the
+         * reader position right away instead of relying on the 1.5 s debounce
+         * window to survive a power drop. No-ops when no book is open, so it
+         * is safe to call every standby edge. */
+        const bool standby_now = hw_lcd_is_standby_active();
+        if (standby_now && !was_standby) {
+            ebook_progress_flush();
+        }
+        was_standby = standby_now;
 
         usleep(delay_ms * 1000);
     }

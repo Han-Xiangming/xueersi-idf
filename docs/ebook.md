@@ -142,6 +142,8 @@ const char *ebook_page_text(void);         /* 本页文本（行间 '\n'），�
 
 ### 4.4 阅读进度持久化（续读）
 
+> 实现位置：持久化层（文件格式、槽数组、CRC、NVS mirror、v1 迁移、指纹/hash）已抽到独立的 `components/ebook_progress` 组件，对外提供统一 API（`ebook_progress.h`）。`ebook.c` 只保留调度（防抖、后台保存任务、四级续读回退）并调用该模块。`components/app/ebook/CMakeLists.txt` 已 `REQUIRES ebook_progress`。
+
 参照主流阅读器的做法，并按纯 TXT 的约束做了降级：
 
 | 来源 | 做法 | 本项目 |
@@ -203,7 +205,8 @@ slot = { fp(8) path_h(4) off(4) seq(4) ctx[16] name[32] pct(1) flags(1) crc(2) }
 | 翻页后 | 防抖 **1.5s**（`EBOOK_SAVE_DELAY_MS`） |
 | 累计翻 10 页 | 强制落盘（`EBOOK_SAVE_FORCE_PAGES`，连续翻页会一直重置防抖） |
 | 退出阅读页 / 换书 / `ebook_close()` | 同步保存；失败时 UI 提示「进度保存失败」 |
-| 卡拔出 / 写失败 | 置 `ebook_save_failed()`（sticky）并打日志；SD 无卸载回调，无法做到零丢失 |
+| 进入待机（息屏） | 同步保存一次；用户停手后可能断电 / 合盖，不等 1.5s 防抖窗口 |
+| 卡拔出 / 写失败 | 置 `ebook_save_failed()`（sticky）并打日志；写失败后每 **2s** 自动重试，直到下一次翻页或退出；SD 无卸载回调，无法做到零丢失 |
 
 #### 4.4.6 v1 进度迁移
 
