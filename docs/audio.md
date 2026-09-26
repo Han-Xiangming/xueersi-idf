@@ -14,7 +14,7 @@ MP3 解码（helix） ──> hw_audio_write_pcm() → 按路由分发
 - 输出 DAC：MAX98357 单声道 Class-D，I2S 标准模式（16-bit 立体声，只写 DOUT 声道），引脚 BCLK=32 / LRC=15 / DIN=21，无 MCLK。
 - 蓝牙输出：A2DP Source，SBC 编码由 Bluedroid 完成（见 `docs/bluetooth.md`）。
 - **路由互斥**：蓝牙连接时只走蓝牙，I2S 不喂数据（喇叭静音），解码任务由 BT 环形缓冲的阻塞发送单一时钟驱动，避免双时钟漂移丢音。
-- **环形缓冲 + 独立 DMA writer 任务（无 ADF 中间层）**：MP3 解码任务在 DSP 后把 PCM 推入一个 8KB 的 FreeRTOS 字节环形缓冲（`xRingbufferSend()`，满则阻塞——天然背压）；一个专用 writer 任务（`i2s_wr`，优先级 9、绑定 core 1，高于解码任务 8 与 LVGL 7）独立地从 ring 取出 PCM 喂 `i2s_channel_write()`；钉在 core 1 是为了避开 core 0 上的 WiFi/蓝牙控制器高优先级任务抢占导致 DMA 欠载卡顿。I2S DMA（12×1024 帧，`auto_clear`）即抖动缓冲，writer 任务按硬件时钟定速取走 ring 中的数据——解码快则 ring 背压堵住解码，解码慢则 writer 发数字静音填空，解码与 DMA 不会互相跑飞。
+- **环形缓冲 + 独立 DMA writer 任务（无 ADF 中间层）**：MP3 解码任务在 DSP 后把 PCM 推入一个 8KB 的 FreeRTOS 字节环形缓冲（`xRingbufferSend()`，满则阻塞——天然背压）；一个专用 writer 任务（`i2s_wr`，优先级 6）独立地从 ring 取出 PCM 喂 `i2s_channel_write()`。I2S DMA（12×1024 帧，`auto_clear`）即抖动缓冲，writer 任务按硬件时钟定速取走 ring 中的数据——解码快则 ring 背压堵住解码，解码慢则 writer 发数字静音填空，解码与 DMA 不会互相跑飞。
 - **通道驻车（由 writer 任务控制，有意为之的代价）**：`i2s_std` 频道在 `hw_audio_init()` 时 `i2s_channel_enable()` 一次后**常驻运行**；只有两种情形会由 **DMA writer 任务**在下一轮循环里 `i2s_channel_disable()` 关掉通道（停 BCLK/LRC、MAX98357 掉电）：(1) **切到蓝牙路由**（喇叭静音、省电）；(2) **整段停止** `hw_audio_park()`（B 键退解码循环 / 看门狗停摆）。speaker 路由下、播放未真正结束（暂停 / 曲间 / 仅 `player_active=false`）时频道**保持启用**，writer 任务以 `auto_clear` 数字静音填充环形缓冲——代价是 BCLK 持续、MAX98357 不进掉电（几 mA），换取绝不触发会卡死 ESP32 DMA 的 out-link stop/start。**停止先排净余音**：`hw_audio_set_player_active(false)` 不立即关通道，而是让解码任务下一帧写返回 `AUDIO_WRITE_ABANDONED` 即时静音；整圈 DMA 环形缓冲（12×1024 帧）靠 `auto_clear` 把已传输描述符清零、在「下次播放之前」自然排净成静音，`hw_audio_park()` 再 `i2s_channel_disable()` 冻结的是静音而非上一首尾音（见 §4）。所有 I2S 通道操作都收敛到这一个 writer 任务内部，天然串行，无需互斥锁；跨任务停止安全（IDF 驱动在 `i2s_channel_disable` 中置 READY 并等待在途写循环退出）。
 
 ## 2. 音量模型
