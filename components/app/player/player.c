@@ -225,14 +225,16 @@ static TaskHandle_t s_watch_task;   /* decode-stall watchdog (see player_watch_t
 
 /* The whole-card cache is validated by a SOURCE SIGNATURE, not by the cache
  * file's own attributes. The signature is an FNV-1a 32-bit hash folded from
- * the (name + mtime) of every entry — files AND directories — within
- * CACHE_SIG_DEPTH levels below PLAYER_ROOT (see playlist_source_sig()). It is
- * computed both when we write the cache (after a real scan) and again cheaply
- * at boot / on each whole-card request; a mismatch means the SD card's music
- * changed (added / removed / renamed / rewritten files) and the cache must be
- * rebuilt. This fixes the old size+mtime fingerprint, which only noticed
- * changes to the CACHE FILE itself and silently went stale when songs were
- * added to the card while the device was off.
+ * the (name + size) of every file entry — directory names are folded too, but
+ * not directory sizes — within CACHE_SIG_DEPTH levels below PLAYER_ROOT (see
+ * playlist_source_sig()). It is computed both when we write the cache (after a
+ * real scan) and again cheaply at boot / on each whole-card request; a mismatch
+ * means the SD card's music changed (added / removed / renamed / resized files)
+ * and the cache must be rebuilt. We hash size instead of mtime on purpose: FAT
+ * mtimes are often unstable across reboots / remounts, so an mtime-based hash
+ * would flag an unchanged card as stale and force a full SD re-scan on (almost)
+ * every player open. File size is stable and still catches add / remove /
+ * rename and any content change that alters the byte length.
  *
  * Cost: a bounded shallow walk (root + up to CACHE_SIG_DEPTH levels of
  * entries, stat() on each), i.e. a few hundred stat() calls at most instead of
@@ -269,16 +271,23 @@ static uint32_t playlist_source_sig_dir(const char *dir, int depth)
         if (stat(child, &st) != 0) {
             continue;
         }
-        /* Fold the entry name, then its mtime, into the hash. */
+        /* Fold the entry name into the hash. */
         for (const char *p = e->d_name; *p != '\0'; p++) {
             h ^= (uint8_t)*p;
             h *= 16777619u;
         }
-        h ^= (uint8_t)':';
-        uint32_t m = (uint32_t)st.st_mtime;
-        for (int i = 0; i < 4; i++) {
-            h ^= (uint8_t)(m >> (i * 8));
-            h *= 16777619u;
+        /* Fold the entry's size (stable across mounts, unlike FAT mtime) so a
+         * content change is caught; directory sizes are meaningless, so only
+         * fold size for regular files. Replacing mtime with size keeps the
+         * cache valid across reboots / remounts instead of forcing a full SD
+         * re-scan on every player open. */
+        if (!S_ISDIR(st.st_mode)) {
+            h ^= (uint8_t)'#';
+            uint32_t sz = (uint32_t)st.st_size;
+            for (int i = 0; i < 4; i++) {
+                h ^= (uint8_t)(sz >> (i * 8));
+                h *= 16777619u;
+            }
         }
         if (S_ISDIR(st.st_mode) && depth < CACHE_SIG_DEPTH) {
             h ^= playlist_source_sig_dir(child, depth + 1);
@@ -304,9 +313,12 @@ static uint32_t playlist_cache_stored_sig(void)
     }
     char line[128];
     uint32_t sig = 0;
-    if (fgets(line, sizeof(line), f) != NULL &&
-        strncmp(line, "#EXTM3U", 8) == 0) {
-        if (fgets(line, sizeof(line), f) != NULL) {
+    if (fgets(line, sizeof(line), f) != NULL) {
+        /* First line is the #EXTM3U marker; compare as a prefix since it
+         * carries a trailing newline (an 8-char strncmp would never match). */
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strcmp(line, "#EXTM3U") == 0 &&
+            fgets(line, sizeof(line), f) != NULL) {
             unsigned long v = 0;
             if (sscanf(line, "##SIG %lx", &v) == 1) {
                 sig = (uint32_t)v;
@@ -1590,9 +1602,15 @@ static int playlist_load_from_cache(playlist_t *work)
         return 0;
     }
     char line[PLAYER_PATH_LEN + 64];
-    /* Skip the header lines (#EXTM3U, then ##SIG). */
-    if (fgets(line, sizeof(line), f) == NULL ||
-        strncmp(line, "#EXTM3U", 8) != 0) {
+    /* First line is the #EXTM3U marker; compare as a prefix since it carries a
+     * trailing newline (an 8-char strncmp would never match). The ##SIG line
+     * immediately follows and is skipped below. */
+    if (fgets(line, sizeof(line), f) == NULL) {
+        fclose(f);
+        return 0;   /* not our format */
+    }
+    line[strcspn(line, "\r\n")] = '\0';
+    if (strcmp(line, "#EXTM3U") != 0) {
         fclose(f);
         return 0;   /* not our format */
     }
