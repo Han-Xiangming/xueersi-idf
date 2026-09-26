@@ -66,6 +66,22 @@ static const char *TAG = "hw_audio";
  * playback by ~300 ms with no completion signal). */
 #define I2S_DMA_DRAIN_MS    350
 
+/* DMA writer task: it is the ONLY task that actually feeds the I2S DMA, so it
+ * must never be starved of CPU or the DMA descriptors drain and the amp emits
+ * silence (audible stutter / "I2S write gap"). Two rules follow from this:
+ *
+ *  - Pinned to CORE 1 (the app core, alongside the decode task and LVGL),
+ *    NOT core 0. Core 0 hosts the WiFi / Bluetooth controller + stack, whose
+ *    tasks run at priorities far above 6; on core 0 they preempt this writer
+ *    and drain the DMA whenever the radio is active — the root cause of
+ *    intermittent stutter during local (speaker) playback.
+ *  - Priority ABOVE PLAYER_TASK_PRIORITY (8) and LVGL (7). The writer spends
+ *    almost all of its time blocked in i2s_channel_write() waiting for DMA
+ *    credit, so it only briefly preempts decode/UI; in return neither a UI
+ *    render burst nor a decode burst can starve the DMA feeder. */
+#define I2S_WRITER_PRIORITY   9
+#define I2S_WRITER_CORE       1
+
 /* A dedicated DMA writer task owns the actual I2S write, so there is no manual
  * write timeout / IO mutex here: hw_audio_write_pcm() blocks on the ring buffer
  * (xRingbufferSend) and the writer task feeds the i2s_std DMA independently. */
@@ -785,14 +801,20 @@ static esp_err_t audio_create_channel(void)
         s_i2s_chan = NULL;
         return rc;
     }
-    s_pcm_rb = xRingbufferCreate(8 * 1024, RINGBUF_TYPE_BYTEBUF);
+    /* 32 KB PCM ring (~180 ms @ 44.1 kHz stereo): a frame resampled from 48 kHz
+     * is ~4 KB, so the whole ring comfortably absorbs SD-read / decode jitter
+     * before the DMA descriptors; the old 8 KB ring was below one frame and left
+     * almost no jitter headroom (it only worked via forced 1 KB chunking). */
+    s_pcm_rb = xRingbufferCreate(32 * 1024, RINGBUF_TYPE_BYTEBUF);
     if (s_pcm_rb == NULL) {
         ESP_LOGE(TAG, "[AUDIO] PCM ringbuf alloc failed");
         i2s_del_channel(s_i2s_chan);
         s_i2s_chan = NULL;
         return ESP_FAIL;
     }
-    BaseType_t tr = xTaskCreate(i2s_writer_task, "i2s_wr", 4096, NULL, 6, &s_i2s_task);
+    BaseType_t tr = xTaskCreatePinnedToCore(i2s_writer_task, "i2s_wr", 4096,
+                                            NULL, I2S_WRITER_PRIORITY,
+                                            &s_i2s_task, I2S_WRITER_CORE);
     if (tr != pdPASS) {
         ESP_LOGE(TAG, "[AUDIO] i2s writer task create failed");
         vRingbufferDelete(s_pcm_rb);
@@ -1371,22 +1393,19 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
     if (s_i2s_chan == NULL || s_pcm_rb == NULL) {
         return AUDIO_WRITE_STALLED;
     }
-    /* Push the DSP-produced PCM into the ring in sub-ring chunks. A single
-     * decoded (and resampled) frame can be LARGER than the whole PCM ring: e.g.
-     * a 48 kHz track resampled to the fixed 44.1 kHz I2S rate is ~8.5 KB, but the
-     * ring is only 8 KB. A byte-buffer ringbuf fails the send outright when the
-     * item exceeds its capacity, so a whole-frame xRingbufferSend() would NEVER
-     * succeed and the decoder would spin forever returning AUDIO_WRITE_STALLED
-     * (log prints the first frame, then silence — "press play and it hangs",
-     * exactly the reported cold-boot-first-play freeze). Chunking each frame into
-     * items smaller than the ring lets the DMA writer task drain between chunks,
-     * so any frame size streams. */
+    /* Push the DSP-produced PCM into the ring in sub-ring chunks. A byte-buffer
+     * ringbuf fails the send outright when a single item exceeds its capacity, so
+     * a whole-frame xRingbufferSend() would NEVER succeed and the decoder would
+     * spin forever returning AUDIO_WRITE_STALLED (log prints the first frame, then
+     * silence — "press play and it hangs", exactly the reported cold-boot-first-
+     * play freeze). Chunking each frame into items smaller than the ring lets the
+     * DMA writer task drain between chunks, so any frame size streams. */
     size_t off = 0;
     audio_write_result_t res = AUDIO_WRITE_OK;
     while (off < bytes) {
         size_t chunk = bytes - off;
         if (chunk > 1024) {
-            chunk = 1024;   /* well under the 8 KB ring; small DMA writes */
+            chunk = 1024;   /* well under the 32 KB ring; small DMA writes */
         }
         if (xRingbufferSend(s_pcm_rb, (uint8_t *)dsp_buf + off, chunk,
                             pdMS_TO_TICKS(100)) != pdTRUE) {
