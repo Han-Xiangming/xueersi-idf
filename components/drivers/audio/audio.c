@@ -691,13 +691,17 @@ static void i2s_writer_task(void *arg)
             }
             vTaskDelay(pdMS_TO_TICKS(I2S_DMA_DRAIN_MS));
             /* Overwrite the DMA descriptor ring with silence while the channel
-             * is still ENABLED, so the just-ended track's PCM left in
-             * descriptors AHEAD of the DMA pointer is erased before we disable
-             * (park). Otherwise that stale PCM is frozen in the descriptors and
-             * re-fed when the channel is re-enabled on the next track, leaking
-             * the "上一首残音" across a stop->next. This is the park-side mirror
-             * of the silence-fill in the flush block above. */
-            if (s_i2s_chan != NULL && !s_i2s_disabled) {
+             * stays ENABLED. The just-ended track's PCM left in descriptors
+             * AHEAD of the DMA pointer is erased so it cannot leak as
+             * "上一首残音" into the next track on resume. We deliberately NEVER
+             * disable() the channel here: i2s_channel_disable() resets the TX
+             * descriptor credit queue that i2s_channel_enable() does NOT refill,
+             * which wedges the ESP32 I2S out-link (first chunk plays, then
+             * permanent silence — "press play, then nothing"). The channel is
+             * enabled once at init and left RUNNING; park just drops the tail
+             * and waits, and auto_clear clocks silence while we block. (Mirror
+             * of the silence-fill in the flush block above.) */
+            if (s_i2s_chan != NULL) {
                 size_t filled = 0;
                 const size_t ring_bytes =
                     (size_t)I2S_DMA_DESC_NUM * 1024U * 4U; /* desc * frames * bytes/frame */
@@ -708,16 +712,8 @@ static void i2s_writer_task(void *arg)
                     filled += sizeof(silence);
                 }
             }
-            if (!s_i2s_disabled && s_i2s_chan != NULL) {
-                i2s_channel_disable(s_i2s_chan);   /* BCLK stops, amp sleeps */
-                s_i2s_disabled = true;
-            }
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  /* wait for resume / flush */
             continue;
-        }
-        if (s_i2s_disabled && s_i2s_chan != NULL) {
-            i2s_channel_enable(s_i2s_chan);
-            s_i2s_disabled = false;
         }
         /* Pull PCM from the ring; on underrun, emit silence to keep BCLK alive. */
         uint8_t *item = (uint8_t *)xRingbufferReceive(s_pcm_rb, &written,
