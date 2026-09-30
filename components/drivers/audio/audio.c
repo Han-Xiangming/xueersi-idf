@@ -792,7 +792,13 @@ static esp_err_t audio_create_channel(void)
         s_i2s_chan = NULL;
         return ESP_FAIL;
     }
-    BaseType_t tr = xTaskCreate(i2s_writer_task, "i2s_wr", 4096, NULL, 6, &s_i2s_task);
+    /* Pin to Core 1: this is the final real-time link (PCM ring -> I2S DMA).
+     * An unpinned task can be scheduled on Core 0, where the Bluetooth
+     * controller+stack run at higher priority and starve it during heavy BT
+     * traffic, causing I2S underruns (clicks/dropouts). Core 1 hosts the app;
+     * priority 6 keeps it below the decode (8) and LVGL (7) tasks there. */
+    BaseType_t tr = xTaskCreatePinnedToCore(i2s_writer_task, "i2s_wr", 4096,
+                                            NULL, 6, &s_i2s_task, 1);
     if (tr != pdPASS) {
         ESP_LOGE(TAG, "[AUDIO] i2s writer task create failed");
         vRingbufferDelete(s_pcm_rb);
