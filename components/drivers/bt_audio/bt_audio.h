@@ -73,6 +73,11 @@ bool bt_audio_connect_index(int index);
 /* Drop the current A2DP connection (keeps the stack up). */
 void bt_audio_disconnect(void);
 
+/* Auto-retry progress for the in-flight dial-out (0 when idle). The UI uses
+ * these to render "retrying k/max" while BT_PAIR_CONNECTING. */
+uint8_t bt_audio_retry_count(void);
+uint8_t bt_audio_retry_max(void);
+
 /* Name of the connected (or connecting) sink, "" if none. */
 const char *bt_audio_peer_name(void);
 

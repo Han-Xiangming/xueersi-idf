@@ -506,6 +506,7 @@ static int             s_ext_bt_count;
 static bt_pair_state_t s_ext_bt_pair  = BT_PAIR_IDLE;
 static bool            s_ext_bt_conn;
 static bool            s_ext_bt_scan;
+static uint8_t         s_ext_bt_retry;     /* last seen auto-retry count */
 static bool            s_ext_sd_mounted;
 static uint32_t        s_ext_scan_ver;    /* player's MP3 list refresh */
 static player_state_t  s_ext_pl_state = PLAYER_IDLE;
@@ -1092,10 +1093,10 @@ static void ui_build_bt(lv_obj_t *page)
 
     s_ui.bt_status = ui_label(page, "扫描中...", 196, UI_GRAY,
                               &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
-    s_ui.hint = ui_label(page, "上/下选 A连接 B返回", 214, UI_GRAY,
+    s_ui.hint = ui_label(page, "上/下选 A连接 Select扫描 B返回", 214, UI_GRAY,
                          &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
 
-    bt_audio_scan_start();
+    bt_audio_scan_start();   /* scan once on entry; SELECT re-scans */
 }
 
 /* Book display name. Keep the full filename (including the ".txt" suffix) so
@@ -1437,12 +1438,14 @@ static bool ui_external_changed(void)
     bool conn    = bt_audio_is_connected();
     bool scan    = bt_audio_is_scanning();
     if (v != s_ext_bt_ver || cnt != s_ext_bt_count || ps != s_ext_bt_pair
-        || conn != s_ext_bt_conn || scan != s_ext_bt_scan) {
+        || conn != s_ext_bt_conn || scan != s_ext_bt_scan
+        || bt_audio_retry_count() != s_ext_bt_retry) {
         s_ext_bt_ver   = v;
         s_ext_bt_count = cnt;
         s_ext_bt_pair  = ps;
         s_ext_bt_conn  = conn;
         s_ext_bt_scan  = scan;
+        s_ext_bt_retry = bt_audio_retry_count();
         changed = true;
     }
 
@@ -2250,8 +2253,14 @@ void ui_refresh(void)
             ui_set_hint("配对中... B返回");
         }
         else if (bt_audio_pair_state() == BT_PAIR_CONNECTING) {
+            uint8_t rc = bt_audio_retry_count();
+            uint8_t rm = bt_audio_retry_max();
             char st[28];
-            snprintf(st, sizeof(st), "配对中 %s", bt_audio_peer_name());
+            if (rc > 0) {
+                snprintf(st, sizeof(st), "重试中 %u/%u", (unsigned)rc, (unsigned)rm);
+            } else {
+                snprintf(st, sizeof(st), "配对中 %s", bt_audio_peer_name());
+            }
             st[27] = '\0';
             ui_label_set(s_ui.bt_status, st);
             ui_set_hint("连接中... B返回");
@@ -2277,7 +2286,7 @@ void ui_refresh(void)
             else {
                 ui_label_set(s_ui.bt_status, "无设备");
             }
-            ui_set_hint(count ? "上/下选 A连接 B返回" : "A重扫 B返回");
+            ui_set_hint(count ? "上/下选 A连接 B返回" : "Select扫描 B返回");
         }
         break;
     }
@@ -2509,8 +2518,7 @@ static void ui_action(void)
             }
         }
         else {
-            set_action("扫描中");
-            bt_audio_scan_start();
+            set_action("按Select扫描");
         }
         break;
     case UI_PAGE_SETTINGS: {
@@ -2917,6 +2925,11 @@ else if (s_ui.page_id == UI_PAGE_EBOOK_LIST) {
             s_eb_jump = true;
             s_eb_jump_pct = ebook_percent();
             ui_mark_dirty();
+        }
+        else if (s_ui.page_id == UI_PAGE_BT) {
+            /* Select starts a fresh sink scan. */
+            bt_audio_scan_start();
+            set_action("扫描中");
         }
     }
     else if (key == LV_KEY_ENTER) {

@@ -895,12 +895,29 @@ bool bt_audio_connect_index(int index)
     if (!s_initialized || s_disabling || index < 0 || index >= s_dev_count) {
         return false;
     }
-    /* Single-flight: an attempt already in progress means the auto-retry (or a
-     * prior press) owns the link. Report "connecting" instead of spawning a
-     * second overlapping dial-out —overlapping attempts are exactly what makes
-     * the "remote features unknown" failure repeat. */
+    /* Re-entrancy / single-flight guard. An in-flight dial-out (or the
+     * auto-retry timer) already owns the link — don't spawn a second
+     * overlapping attempt, which is exactly what makes the "remote features
+     * unknown" failure repeat. */
     if (s_pair_state == BT_PAIR_CONNECTING) {
-        return true;
+        return true;                        /* dial-out in progress: ignore */
+    }
+    if (s_connected) {
+        if (memcmp(s_devs[index].bda, s_peer_bda, sizeof(esp_bd_addr_t)) == 0) {
+            return true;                    /* already linked to this peer */
+        }
+        /* Switching to a different peer: cancel any pending retry and tear
+         * down the current link first, so we never leave two half-open links
+         * fighting for the radio. */
+        s_conn_auto = false;
+        if (s_conn_timer != NULL) {
+            xTimerStop(s_conn_timer, 0);
+        }
+        esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
+        esp_a2d_source_disconnect(s_peer_bda);
+        s_connected = false;
+        s_ever_connected = false;
+        s_pair_state = BT_PAIR_IDLE;
     }
     if (s_discovering) {
         esp_bt_gap_cancel_discovery();      /* radio can't scan and dial */
@@ -930,6 +947,18 @@ void bt_audio_disconnect(void)
         esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
         esp_a2d_source_disconnect(s_peer_bda);
     }
+}
+
+/* Auto-retry progress for the in-flight dial-out, surfaced to the UI so it can
+ * show "retrying k/max". Both are 0 when idle / Bluetooth disabled. */
+uint8_t bt_audio_retry_count(void)
+{
+    return s_conn_retries;
+}
+
+uint8_t bt_audio_retry_max(void)
+{
+    return BT_CONNECT_MAX_RETRY;
 }
 
 const char *bt_audio_peer_name(void)
@@ -1110,6 +1139,16 @@ bool bt_audio_connect_index(int index)
 
 void bt_audio_disconnect(void)
 {
+}
+
+uint8_t bt_audio_retry_count(void)
+{
+    return 0;
+}
+
+uint8_t bt_audio_retry_max(void)
+{
+    return 0;
 }
 
 const char *bt_audio_peer_name(void)
