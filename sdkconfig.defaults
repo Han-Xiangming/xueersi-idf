@@ -34,6 +34,12 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 #
 
 #
+# WiFi (disabled - not used in this project)
+#
+# CONFIG_ESP_WIFI_ENABLED is not set
+# CONFIG_ESP_WIFI_REMOTE_ENABLED is not set
+
+#
 # Bluetooth
 #
 CONFIG_BT_ENABLED=y
