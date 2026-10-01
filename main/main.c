@@ -18,7 +18,7 @@
 #include "buttons.h"
 #include "audio.h"
 #include "battery.h"
-#include "bt_audio.h"
+#include "bluetooth_audio.h"
 #include "lcd.h"
 #include "sd.h"
 #include "lvgl.h"
@@ -26,6 +26,7 @@
 #include "player.h"
 #include "ebook.h"
 #include "rtc_wdt.h"
+#include "log_sink.h"
 #include "esp_attr.h"
 #include "hal/uart_ll.h"
 
@@ -68,6 +69,11 @@ static int IRAM_ATTR xm_console_vprintf(const char *fmt, va_list ap)
         }
         uart_ll_write_txfifo(hw, (const uint8_t *)&buf[i], 1);
     }
+    /* Mirror to on-device log file (non-blocking copy into the ring buffer;
+     * see log_sink_enqueue). NOTE: this calls a flash-resident FreeRTOS
+     * function from an IRAM vprintf — safe in normal operation, and only at
+     * risk during a flash-cache-disabled write window (rare). */
+    log_sink_enqueue(buf, (size_t)n);
     return n;
 }
 
@@ -179,6 +185,11 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "Xiaomiao LVGL 9.5 dashboard boot");
 
+    /* On-device log mirror: ring-buffer + drain task writes every log line to
+     * /sdcard/logs/app.log so the device is diagnosable without a UART. Must
+     * exist before the vprintf hook so the early boot lines are captured. */
+    log_sink_init();
+
     /* Non-blocking console: a wedged UART must never freeze a task that
      * logs (see xm_console_vprintf). Installed before any subsystem logs. */
     esp_log_set_vprintf(xm_console_vprintf);
@@ -209,9 +220,9 @@ void app_main(void)
     hw_lcd_init();
     hw_audio_init();
     hw_battery_init();
-    bt_audio_init();
-    bt_audio_set_avrc_cmd_cb(xiaomiao_avrc_cmd);
-    bt_audio_set_avrc_volume_cb(xiaomiao_avrc_volume);
+    bluetooth_audio_init();
+    bluetooth_audio_set_avrc_cmd_cb(xiaomiao_avrc_cmd);
+    bluetooth_audio_set_avrc_volume_cb(xiaomiao_avrc_volume);
     hw_sd_try_mount();
     player_init();
     ebook_init();

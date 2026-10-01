@@ -3,7 +3,7 @@ idf_component_register(
     PRIV_REQUIRES audio
                   battery
                   board
-                  bt_audio
+                  bluetooth_audio
                   buttons
                   ebook
                   esp_hal_uart
@@ -14,4 +14,5 @@ idf_component_register(
                   player
                   sd
                   ui
+                  log_sink
 )

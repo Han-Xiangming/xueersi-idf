@@ -98,7 +98,7 @@ y=204      "上/下选 A进入 左/右设 B返回"
 - 音量/总增益/蓝牙/背光/息屏持久化到 NVS（命名空间 `ui_cfg`：`volume` / `vol_bt`（蓝牙音量槽位）/ `gain_db`（dB×10）/ `bt_on` / `backlight` / `standby_s`）；变更置脏位，800ms 无操作后一次写入（`ui_settings_flush`）。
 - 音量行显示**当前生效路由**的音量（蓝牙已连时为蓝牙槽位，否则喇叭槽位）。
 - 选中"蓝牙"按 A 进入蓝牙页（自动把 BT 主开关置开、懒启动蓝牙栈）。
-- 日志等级控制 `player` / `hw_audio` / `bt_audio` 三个 tag 的运行时日志级别。
+- 日志等级控制 `player` / `hw_audio` / `bluetooth_audio` 三个 tag 的运行时日志级别。
 
 ## 8. 蓝牙页布局
 
@@ -110,9 +110,9 @@ y=172   "扫描中... N" / "N 个设备" / "无设备" / "已连接 <名>" / "�
 y=204  上下文提示（连接/断开/重试/扫描）
 ```
 
-- 进入页面即 `bt_audio_scan_start()`；设备列表只在 `bt_audio_device_version()` 递增时重格式化（MAC 回退名不反复拼接）。
+- 进入页面即 `bluetooth_audio_scan_start()`；设备列表只在 `bluetooth_audio_device_version()` 递增时重格式化（MAC 回退名不反复拼接）。
 - 配对状态机：CONNECTING → PAIRING（SSP，显示 6 位配对码）→ OK/FAIL；失败 A 重试。
-- 连接自动重试（2s 退避，最多 4 次）期间仍显示"连接中..."，由 `bt_audio` 内部处理（见 `docs/bluetooth.md`）。
+- 连接自动重试（2s 退避，最多 4 次）期间仍显示"连接中..."，由 `bluetooth_audio` 内部处理（见 `docs/bluetooth.md`）。
 
 ## 9. 阅读页布局
 

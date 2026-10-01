@@ -27,7 +27,7 @@
 #define LOG_LOCAL_LEVEL ESP_LOG_INFO    /* keep detailed audio tracing out unless explicitly set to DEBUG at compile time */
 #include "board_config.h"
 #include "audio.h"
-#include "bt_audio.h"
+#include "bluetooth_audio.h"
 #include "speex/speex_resampler.h"   /* OUTSIDE_SPEEX + FIXED_POINT: self-contained
                                      * fixed-point arbitrary-rate resampler */
 
@@ -102,8 +102,20 @@ static SemaphoreHandle_t s_flush_done = NULL; /* posted by the writer when a
                                                * actually dropped the ring + reset
                                                * the DMA queue, so the caller can
                                                * start the next track clean. */
+/* One-shot seam diagnostics (see hw_audio_set_player_active + i2s_writer_task).
+ * s_diag_arm: when set, the writer dumps its state the moment a seam flush
+ * completes — proves whether s_player_active / s_parked / s_i2s_disabled are
+ * correct at the instant track2 should start. s_diag_first: when set, the
+ * writer logs the FIRST real PCM chunk it hands to the DMA after the seam —
+ * if that prints with a real post_peak but the speaker stays silent, the PCM
+ * reached the out-link and the fault is silicon/DMA-side, not the writer. */
+static bool              s_diag_arm   = false;
+static bool              s_diag_first = false;
 static volatile bool s_ready;
 static uint32_t s_rate = AUDIO_DEFAULT_RATE;
+/* File-scope silence chunk used to flood / re-arm the DMA descriptor ring
+ * across a track seam and at park. Must be reachable from i2s_seam_rearm(). */
+static int16_t s_seam_silence[256 * 2];
 
 /* The I2S bus runs at ONE FIXED rate (s_rate) for the whole session: decoded
  * PCM is resampled to it in hw_audio_write_pcm, so a rate change NEVER
@@ -495,7 +507,7 @@ static void audio_dsp_reset(void)
  *
  * That is exactly the reported failure: "sometimes fine after power-on, later
  * playback dead, log goes quiet, only over I2S". Bluetooth is never affected
- * because it never touches the I2S DMA (bt_audio_write_pcm() goes straight to
+ * because it never touches the I2S DMA (bluetooth_audio_write_pcm() goes straight to
  * the A2DP ring).
  *
  * The fix is structural: enable the channel ONCE (on the first write) and
@@ -533,6 +545,13 @@ void hw_audio_set_player_active(bool active)
            首次播放为无害 no-op。 */
         s_parked = false;
         if (s_i2s_task != NULL) {
+            /* Arm the one-shot seam diagnostics: the writer will dump its
+             * state right after the next flush completes, and log the first
+             * real PCM chunk it hands to the DMA. This is how we tell, for a
+             * silent second track, whether the writer is dropping PCM
+             * (s_player_active stuck false), parked, or actually writing it. */
+            s_diag_arm = true;
+            s_diag_first = true;
             xTaskNotifyGive(s_i2s_task);
         }
         ESP_LOGI(TAG, "[PLAYER] audio pipeline ready");
@@ -607,6 +626,41 @@ static bool i2s_write_bounded(const void *data, size_t len)
     return false;
 }
 
+/* Seam re-arm: the TX out-link STOPS whenever the PCM ring drains (auto_clear
+ * only zeroes sent descriptors, it does NOT loop the DMA). The old "flood
+ * silence" re-arm is unreliable on this i2s_std build — i2s_channel_write() can
+ * return OK yet the DMA never re-picks the out-link, leaving the next track
+ * silent (the documented "second song dead" failure). A disable+enable
+ * cleanly re-initialises the descriptor queue: this is the standard i2s_std
+ * restart path, and the architecture comment's "enable() doesn't refill the
+ * credit queue" caveat applied to the OLD ADF I2S driver, NOT the current
+ * i2s_std one. A silence refill follows so any stale descriptor ahead of the
+ * DMA pointer is overwritten before the next track starts. */
+static void i2s_seam_rearm(void)
+{
+    if (s_i2s_chan == NULL || s_i2s_disabled) {
+        return;
+    }
+    esp_err_t rc = i2s_channel_disable(s_i2s_chan);
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "[AUDIO] seam re-arm: disable rc=%s", esp_err_to_name(rc));
+    }
+    rc = i2s_channel_enable(s_i2s_chan);
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "[AUDIO] seam re-arm: enable rc=%s", esp_err_to_name(rc));
+        return;
+    }
+    size_t filled = 0;
+    const size_t ring_bytes = (size_t)I2S_DMA_DESC_NUM * 1024U * 4U;
+    while (filled < ring_bytes) {
+        if (!i2s_write_bounded(s_seam_silence, sizeof(s_seam_silence))) {
+            break;
+        }
+        filled += sizeof(s_seam_silence);
+    }
+    ESP_LOGW(TAG, "[AUDIO] seam re-arm: channel reset + silence refilled");
+}
+
 /* Create the I2S output with ESP-IDF's i2s_std — no ADF. Codec-less: the
  * MAX98357 is a pure-I2S Class-D DAC. The channel runs at ONE FIXED rate
  * (s_rate) and is left ENABLED; the writer task gates it (pause/resume via
@@ -614,11 +668,33 @@ static bool i2s_write_bounded(const void *data, size_t len)
  * out-link. The board pins are the old std-mode config. */
 static void i2s_writer_task(void *arg)
 {
-    /* Silence chunk used to keep BCLK running during decode gaps / between
-     * tracks (auto_clear makes the DMA emit digital silence, no wedge). */
-    static int16_t silence[256 * 2];   /* static BSS, already zeroed */
+    /* Silence fill lives in s_seam_silence (file scope) and is applied via
+     * i2s_seam_rearm() at the seam/park; see that helper. */
     size_t written = 0;
+    static uint32_t s_w_chunks = 0;     /* real-PCM chunks handed to DMA */
+    static uint32_t s_sil_chunks = 0;   /* silence chunks emitted */
+    static uint32_t s_drop_inactive = 0;/* real PCM dropped because !active */
+    static int32_t  s_post_peak = 0;    /* peak of POST-DSP PCM sent to DMA */
+    static int64_t  s_hb_us = 0;
     for (;;) {
+        int64_t now = esp_timer_get_time();
+        if (now - s_hb_us > 1000000) {
+            /* Debug heartbeat: what the writer is actually doing. If w=0 but the
+             * decode side reports ok=39 (ring filling), the PCM is being dropped
+             * (drop_inact) or we are parked -> seam state bug. If w is high but
+             * post_peak is tiny, the DSP is attenuating the track into silence. */
+            ESP_LOGW(TAG,
+                     "[WRTR] active=%d parked=%d route=%d dis=%d ring=%u "
+                     "w=%u sil=%u drop_inact=%u post_peak=%d (%.1f%%)",
+                     (int)s_player_active, (int)s_parked, (int)s_route,
+                     (int)s_i2s_disabled, (unsigned)s_ring_bytes,
+                     (unsigned)s_w_chunks, (unsigned)s_sil_chunks,
+                     (unsigned)s_drop_inactive, (int)s_post_peak,
+                     s_post_peak * 100.0f / 32768.0f);
+            s_w_chunks = 0; s_sil_chunks = 0; s_drop_inactive = 0;
+            s_post_peak = 0;
+            s_hb_us = now;
+        }
         if (s_flush_req) {
             /* Drop the queued PCM so the next track starts clean. The channel is
              * deliberately NOT disabled/re-enabled here (see the note below): the
@@ -643,32 +719,32 @@ static void i2s_writer_task(void *arg)
              * path below already clears the ring with silence before disabling,
              * so there is nothing stale to overwrite here. */
             if (s_flush_fill && s_i2s_chan != NULL && !s_i2s_disabled) {
-                size_t filled = 0;
-                const size_t ring_bytes =
-                    (size_t)I2S_DMA_DESC_NUM * 1024U * 4U; /* desc * frames * bytes/frame */
-                while (filled < ring_bytes) {
-                    if (!i2s_write_bounded(silence, sizeof(silence))) {
-                        break;   /* DMA wedged: skip the silence pre-fill */
-                    }
-                    filled += sizeof(silence);
-                }
+                /* Hard track switch / natural-advance re-arm: reset the TX
+                 * out-link so the next track's PCM is actually picked up. */
+                i2s_seam_rearm();
             }
-            /* Keep the channel ENABLED across the flush. A disable()+enable()
-             * here resets the TX descriptor credit queue but enable() does NOT
-             * refill it, so the next i2s_channel_write() blocks forever waiting
-             * for a credit that never arrives — the ESP32 DMA wedge that freezes
-             * playback silently after a track switch (log goes quiet, only a
-             * reboot recovers). The full-ring silence fill above (hard switch)
-             * already overwrites every descriptor with silence WHILE the channel
-             * is ENABLED, and auto_clear zeroes each descriptor as it is
-             * transmitted, so the previous track's residual PCM ("上一首残音")
-             * is gone without ever touching the channel. See the architecture
-             * comment near the top of this file: the channel is enabled once at
-             * init and left RUNNING; the flush must not stop/start it. */
+            /* i2s_seam_rearm() above DOES a disable()+enable() — this is now the
+             * intended seam re-arm, not the avoided path. On the i2s_std driver
+             * (used here) disable+enable correctly re-initialises the TX
+             * descriptor queue and restarts the DMA, whereas the old ADF
+             * driver's "enable() doesn't refill the credit queue" wedge no
+             * longer applies. The previous attempt (flood silence while
+             * ENABLED) left the second track dead on this build, so we now
+             * reset. See i2s_seam_rearm() for details. */
             s_flush_req = false;
             s_flush_fill = false;
             if (s_flush_done != NULL) {
                 xSemaphoreGive(s_flush_done);   /* unblock the waiting caller */
+            }
+            if (s_diag_arm) {
+                ESP_LOGW(TAG,
+                         "[SEAMDIAG] pre: active=%d parked=%d route=%d dis=%d "
+                         "ring=%u w=%u sil=%u drop=%u post=%d",
+                         (int)s_player_active, (int)s_parked, (int)s_route,
+                         (int)s_i2s_disabled, (unsigned)s_ring_bytes,
+                         (unsigned)s_w_chunks, (unsigned)s_sil_chunks,
+                         (unsigned)s_drop_inactive, (int)s_post_peak);
+                s_diag_arm = false;
             }
         }
         bool paused = (s_route == AUDIO_ROUTE_BT) || s_parked;
@@ -690,28 +766,15 @@ static void i2s_writer_task(void *arg)
                 vRingbufferReturnItem(s_pcm_rb, pit);   /* dropped, not played */
             }
             vTaskDelay(pdMS_TO_TICKS(I2S_DMA_DRAIN_MS));
-            /* Overwrite the DMA descriptor ring with silence while the channel
-             * stays ENABLED. The just-ended track's PCM left in descriptors
-             * AHEAD of the DMA pointer is erased so it cannot leak as
-             * "上一首残音" into the next track on resume. We deliberately NEVER
-             * disable() the channel here: i2s_channel_disable() resets the TX
-             * descriptor credit queue that i2s_channel_enable() does NOT refill,
-             * which wedges the ESP32 I2S out-link (first chunk plays, then
-             * permanent silence — "press play, then nothing"). The channel is
-             * enabled once at init and left RUNNING; park just drops the tail
-             * and waits, and auto_clear clocks silence while we block. (Mirror
-             * of the silence-fill in the flush block above.) */
-            if (s_i2s_chan != NULL) {
-                size_t filled = 0;
-                const size_t ring_bytes =
-                    (size_t)I2S_DMA_DESC_NUM * 1024U * 4U; /* desc * frames * bytes/frame */
-                while (filled < ring_bytes) {
-                    if (!i2s_write_bounded(silence, sizeof(silence))) {
-                        break;   /* DMA wedged: skip the silence pre-fill */
-                    }
-                    filled += sizeof(silence);
-                }
-            }
+            /* Reset + overwrite the DMA descriptor ring at park. i2s_seam_rearm()
+             * does a disable+enable (which re-initialises the descriptor queue on
+             * the i2s_std driver) and then floods silence, erasing any
+             * previous-track PCM left in descriptors AHEAD of the DMA pointer so
+             * it cannot leak as "上一首残音". The channel is then left RUNNING but
+             * this task blocks below, so the DMA idles and BCLK stops — the amp
+             * powers down. (The old comment warning that disable() "wedges the
+             * out-link" referred to the ADF I2S driver, not i2s_std.) */
+            i2s_seam_rearm();
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  /* wait for resume / flush */
             continue;
         }
@@ -732,15 +795,34 @@ static void i2s_writer_task(void *arg)
                  * silence instead, so a stop is silent at once instead of playing
                  * the previous track's tail out — the "停止先 mute" guarantee. */
                 vRingbufferReturnItem(s_pcm_rb, item);
-                i2s_write_bounded(silence, sizeof(silence));
+                i2s_write_bounded(s_seam_silence, sizeof(s_seam_silence));
+                s_drop_inactive++;
+                s_sil_chunks++;
             } else {
                 /* On a DMA stall the item is returned to the ring and retried
                  * next loop (self-heal); a wedged link is logged, never frozen. */
+                const int16_t *dp = (const int16_t *)item;
+                size_t dn = written / 2;
+                for (size_t i = 0; i < dn; i++) {
+                    int32_t a = dp[i] < 0 ? -dp[i] : dp[i];
+                    if (a > s_post_peak) {
+                        s_post_peak = a;
+                    }
+                }
                 i2s_write_bounded(item, written);
                 vRingbufferReturnItem(s_pcm_rb, item);
+                s_w_chunks++;
+                if (s_diag_first) {
+                    ESP_LOGW(TAG,
+                             "[SEAMDIAG] first real PCM -> DMA: post_peak=%d "
+                             "(writer handed track2 audio to the out-link)",
+                             (int)s_post_peak);
+                    s_diag_first = false;
+                }
             }
         } else {
-            i2s_write_bounded(silence, sizeof(silence));
+            i2s_write_bounded(s_seam_silence, sizeof(s_seam_silence));
+            s_sil_chunks++;
         }
     }
 }
@@ -750,6 +832,18 @@ static esp_err_t audio_create_channel(void)
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     chan_cfg.dma_desc_num  = I2S_DMA_DESC_NUM;
     chan_cfg.dma_frame_num = 1024;
+    /* CRITICAL fix for "auto-advance silent / next track dead after a seam":
+     * this is the real .auto_clear the architecture comment (top of file) claims
+     * is in place but was never actually set. In this IDF (v6.1) auto_clear lives
+     * on the *channel* config, not the std config. With it OFF, when the PCM ring
+     * drains the ESP32 I2S TX out-link STOPS; the next i2s_channel_write() then
+     * blocks forever waiting for a DMA credit that never arrives -> the next track
+     * is silent (or, if we tore the channel to recover, I2S0 stays wedged). With it
+     * ON, the driver memsets each TX descriptor after send (see i2s_dma_tx_callback
+     * in esp_driver_i2s/i2s_common.c), so the out-link keeps looping silence while
+     * idle and a new i2s_channel_write() is picked up immediately. No channel
+     * stop/start, no DMA wedge, seamless auto-advance. */
+    chan_cfg.auto_clear = true;
     esp_err_t rc = i2s_new_channel(&chan_cfg, &s_i2s_chan, NULL);
     if (rc != ESP_OK) {
         ESP_LOGE(TAG, "[AUDIO] i2s_new_channel failed: %s", esp_err_to_name(rc));
@@ -837,7 +931,7 @@ void hw_audio_init(void)
      * that drops must return immediately, regardless of which UI page is shown,
      * so a speaker session resumes without waiting for the user to poll. */
     s_route = AUDIO_ROUTE_SPEAKER;
-    bt_audio_set_conn_state_cb(hw_audio_on_bt_conn_state);
+    bluetooth_audio_set_conn_state_cb(hw_audio_on_bt_conn_state);
 }
 
 
@@ -1034,7 +1128,7 @@ void hw_audio_set_sample_rate(uint32_t sample_rate_hz)
     if (audio_route_is_bt()) {
         /* BT takes the original PCM; the SBC encoder handles its own rate.
          * No resampling, no I2S channel involved. */
-        bt_audio_set_sample_rate(sample_rate_hz);
+        bluetooth_audio_set_sample_rate(sample_rate_hz);
         return;
     }
     /* Speaker route: arm the resampler (or bypass when the decoder rate
@@ -1085,16 +1179,25 @@ void hw_audio_pipeline_flush(void)
 {
     s_last_write_us = 0;
     if (s_route == AUDIO_ROUTE_BT) {
-        bt_audio_flush_pcm_ring();
+        bluetooth_audio_flush_pcm_ring();
         return;
     }
-    /* Speaker route: ask the writer task to drop the queued PCM and reset the
-     * DMA queue (auto_clear alone does NOT reset the queue, which is what let
-     * it desync and wedge on repeat). The task owns the channel, so this is
-     * the only safe place to toggle disable/enable.
+    /* Speaker route: ask the writer task to drop the queued PCM AND re-arm the
+     * DMA out-link by flooding the descriptor ring with silence (s_flush_fill).
+     *
+     * auto_clear alone is NOT enough on this IDF build: when the PCM ring
+     * drains at a track seam the TX out-link desyncs and the next track's
+     * i2s_channel_write() is never picked up -> the second song is silent while
+     * the decode side keeps reporting ok (the ring still drains). Flooding
+     * fresh silence descriptors re-links the out-link so track2 is picked up.
+     * This is the same re-arm hw_audio_pipeline_switch() does for manual next;
+     * natural advance used to be a "soft" flush (no re-arm) for a gapless seam,
+     * but the desync left the second track dead, so we now pay the ~278 ms
+     * silence gap at every seam to guarantee it plays. (Shrinkable later once
+     * the exact desync window is measured.)
      *
      * Synchronous: block until the writer has actually dropped the ring and
-     * reset the DMA queue. A mere flag + notify is not enough — the caller
+     * re-armed the DMA. A mere flag + notify is not enough — the caller
      * (decode loop) then immediately opens a NEW track and writes its first
      * PCM; without waiting, that first chunk could land in the ring and be
      * discarded by the still-pending flush, cutting the new song's head. The
@@ -1103,6 +1206,7 @@ void hw_audio_pipeline_flush(void)
     if (s_i2s_task == NULL) {
         return;   /* no writer to flush (init failed / not yet up) */
     }
+    s_flush_fill = true;   /* re-arm the out-link at the seam (see above) */
     s_flush_req = true;
     xTaskNotifyGive(s_i2s_task);   /* wake the writer if it is parked */
     if (s_flush_done != NULL) {
@@ -1119,7 +1223,7 @@ void hw_audio_pipeline_switch(void)
 {
     s_last_write_us = 0;
     if (s_route == AUDIO_ROUTE_BT) {
-        bt_audio_flush_pcm_ring();
+        bluetooth_audio_flush_pcm_ring();
         return;
     }
     if (s_i2s_task == NULL) {
@@ -1229,7 +1333,7 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
         /* 路由到 BT 时,扬声器 i2s_std 频道已由 writer task 在 set_route 中
            pause(BCLK 停),这里只做 BT 发送与增益。 */
         /* Bluetooth route: volume only, full band. The blocking send inside
-         * bt_audio_write_pcm() paces the decoder. The send is now BOUNDED
+         * bluetooth_audio_write_pcm() paces the decoder. The send is now BOUNDED
          * (~2 s): a stalled BT sink surfaces as AUDIO_WRITE_STALLED here,
          * which the player counts and turns into a visible pipeline error —
          * the decode task is never left blocked inside this call forever. */
@@ -1257,7 +1361,7 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
             stereo_frames[i] = (int16_t)((t * g) >> 15);
         }
         s_vol_gain_sm = g;
-        bool bt_ok = bt_audio_write_pcm(stereo_frames, frames);
+        bool bt_ok = bluetooth_audio_write_pcm(stereo_frames, frames);
         return bt_ok ? AUDIO_WRITE_OK : AUDIO_WRITE_STALLED;
     }
 

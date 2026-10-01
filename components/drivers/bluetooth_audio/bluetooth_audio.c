@@ -1,8 +1,8 @@
-﻿/*
+/*
  * Hardware layer: Bluetooth A2DP Source audio output.
- * See bt_audio.h.
+ * See bluetooth_audio.h.
  *
- * Pipeline: decode task -> hw_audio_write_pcm() -> bt_audio_write_pcm() ->
+ * Pipeline: decode task -> hw_audio_write_pcm() -> bluetooth_audio_write_pcm() ->
  * PCM ring -> A2DP source data callback -> Bluedroid (SBC encode inside the
  * stack) -> Bluetooth sink. The PCM we receive is already high-pass filtered
  * and volume-scaled, so the listener hears exactly the local mix.
@@ -12,7 +12,7 @@
  *   the user picks one in the BLUETOOTH UI page -> esp_a2d_source_connect() ->
  *   CONNECTED -> CHECK_SRC_RDY -> MEDIA START -> data callback pulls PCM.
  */
-#include "bt_audio.h"
+#include "bluetooth_audio.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -26,7 +26,7 @@
 #include "esp_timer.h"
 #include "sdkconfig.h"
 
-static const char *TAG = "bt_audio";
+static const char *TAG = "bluetooth_audio";
 
 static volatile bool s_enabled;      /* user wants BT output (settings) */
 static volatile bool s_connected;    /* an A2DP sink is connected */
@@ -40,7 +40,7 @@ static volatile bt_pair_state_t s_pair_state;
 static volatile uint32_t s_passkey;  /* SSP numeric-comparison code */
 
 /* AVRCP remote-control handlers registered by the application (see below).
- * Kept outside the #if so bt_audio_set_avrc_*_cb() compiles even when Bluetooth
+ * Kept outside the #if so bluetooth_audio_set_avrc_*_cb() compiles even when Bluetooth
  * is disabled in the build —the handlers are simply never invoked then. */
 static bt_avrc_cmd_cb_t s_avrc_cmd_cb;
 static bt_avrc_volume_cb_t s_avrc_vol_cb;
@@ -62,8 +62,8 @@ static bt_conn_state_cb_t s_conn_state_cb;
 #define BT_SEND_MAX_WAITS      40   /* bounded back-pressure: 40 x 50 ms = ~2 s */
 #define BT_INQ_LEN             10          /* inquiry duration, 1.28s units */
 
-/* Teardown safety. bt_audio_disable() defers the real stack deinit to the
- * FreeRTOS Timer task (bt_audio_teardown): deinit'ing A2DP while Bluedroid
+/* Teardown safety. bluetooth_audio_disable() defers the real stack deinit to the
+ * FreeRTOS Timer task (bluetooth_audio_teardown): deinit'ing A2DP while Bluedroid
  * still has an armed media watchdog alarm (or while the link is still up)
  * crashes the BTC task. The teardown first asks the link to drop, then polls
  * s_connected with a bounded retry budget; the safety window covers a lost
@@ -114,12 +114,12 @@ static volatile bool s_disabling;
  * pull more PCM (and the decode side must not push more) once the profiles
  * start going away —feeding SBC during A2DP deinit can crash the BTC task. */
 static volatile bool s_tx_stopped;
-/* True while bt_audio_teardown() is executing (in the Timer task). A
- * concurrent bt_audio_enable() (LVGL task) cannot start Bluedroid while the
+/* True while bluetooth_audio_teardown() is executing (in the Timer task). A
+ * concurrent bluetooth_audio_enable() (LVGL task) cannot start Bluedroid while the
  * stack is being deinit'ed from another task, so it defers via
  * s_reenable_pending instead and the teardown re-initialises at the end. */
 static volatile bool s_teardown_running;
-/* Set by bt_audio_enable() when it arrived during a running teardown; the
+/* Set by bluetooth_audio_enable() when it arrived during a running teardown; the
  * teardown honours it either by cancelling (link still dropping / stack
  * still up) or by re-running the full init once deinit finished. */
 static volatile bool s_reenable_pending;
@@ -297,7 +297,7 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
  * (deferred from the BTC callback) so the esp_*_deinit() calls never execute
  * inside the BTC task itself —doing that there would deadlock. The Timer-task
  * context also lets Bluedroid finish disarming the media watchdog alarm first. */
-static void bt_audio_teardown(void *param1, uint32_t param2);
+static void bluetooth_audio_teardown(void *param1, uint32_t param2);
 
 static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
 {
@@ -313,7 +313,7 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
              * failure) may have frozen it; the link is live now. */
             s_tx_stopped = false;
             if (s_disabling) {
-                /* bt_audio_disable() raced with the connect completing:
+                /* bluetooth_audio_disable() raced with the connect completing:
                  * drop the fresh link so the disconnect-complete event can
                  * run the deferred teardown. */
                 esp_a2d_source_disconnect(s_peer_bda);
@@ -380,7 +380,7 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
                  * watchdog alarm. Defer the actual deinit to the Timer task:
                  * running esp_*_deinit() from inside this BTC callback would
                  * post to the BTC queue and deadlock. */
-                xTimerPendFunctionCall(bt_audio_teardown,
+                xTimerPendFunctionCall(bluetooth_audio_teardown,
                                        NULL, 0, pdMS_TO_TICKS(10));
             }
         }
@@ -502,11 +502,11 @@ static int32_t a2d_data_cb(uint8_t *buf, int32_t len)
     return len;
 }
 
-void bt_audio_init(void)
+void bluetooth_audio_init(void)
 {
     /* At boot we only allocate the PCM ring (cheap, no BT controller needed).
      * The Bluetooth controller / Bluedroid stack / A2DP source are brought up
-     * lazily by bt_audio_enable() the first time the user opens the BLUETOOTH
+     * lazily by bluetooth_audio_enable() the first time the user opens the BLUETOOTH
      * page, so the device stays silent at boot instead of advertising an A2DP
      * source before anyone asks for Bluetooth. */
     s_ring_storage = heap_caps_malloc(BT_PCM_RING_BYTES, MALLOC_CAP_SPIRAM);
@@ -527,7 +527,7 @@ void bt_audio_init(void)
 /* Bring up the Bluetooth controller, Bluedroid stack and A2DP Source role.
  * Safe to call repeatedly (idempotent); the first call does the real work.
  * Call when the user opens the BLUETOOTH page, not at boot. */
-void bt_audio_enable(void)
+void bluetooth_audio_enable(void)
 {
     if (s_teardown_running) {
         /* A teardown is mid-flight (it runs in the Timer task). Starting the
@@ -540,7 +540,7 @@ void bt_audio_enable(void)
         return;
     }
     if (s_initialized) {
-        /* Already up. Clear any teardown that bt_audio_disable() deferred
+        /* Already up. Clear any teardown that bluetooth_audio_disable() deferred
          * while a link was dropping: the user flipped BT back ON before the
          * deferred teardown ran, so we keep the stack and just drop the link. */
         s_disabling = false;
@@ -625,7 +625,7 @@ void bt_audio_enable(void)
  * live: while streaming, Bluedroid arms a media watchdog alarm, and deinit()-ing
  * the source profile before that alarm fires (or is disarmed) makes it run into
  * freed control blocks —a NULL-deref crash in the BTC task. Re-checks
- * s_disabling so a concurrent bt_audio_enable() can cancel a pending teardown
+ * s_disabling so a concurrent bluetooth_audio_enable() can cancel a pending teardown
  * (the user flipped BT back ON before it ran). */
 /* True while the stack has link-layer activity that makes a profile deinit
  * unsafe: a live A2DP link, an active inquiry, or a connect/pair attempt
@@ -640,7 +640,7 @@ static bool bt_link_busy(void)
         || s_pair_state == BT_PAIR_OK;
 }
 
-static void bt_audio_teardown(void *param1, uint32_t param2)
+static void bluetooth_audio_teardown(void *param1, uint32_t param2)
 {
     (void)param1;
     (void)param2;
@@ -661,7 +661,7 @@ static void bt_audio_teardown(void *param1, uint32_t param2)
      * while Bluedroid still has an armed media watchdog alarm or is
      * mid-connect. The bounded retry budget means a stuck link cannot hold
      * the teardown forever. Re-check s_disabling afterwards so a concurrent
-     * bt_audio_enable() can cancel the teardown even mid-wait. */
+     * bluetooth_audio_enable() can cancel the teardown even mid-wait. */
     int waited = 0;
     while (bt_link_busy() && waited < BT_TD_MAX_RECHECK && !s_reenable_pending) {
         vTaskDelay(pdMS_TO_TICKS(BT_TD_RECHECK_MS));
@@ -669,7 +669,7 @@ static void bt_audio_teardown(void *param1, uint32_t param2)
     }
     if (!s_disabling || s_reenable_pending) {
         /* Re-enabled while we were waiting: keep the stack up and undo the
-         * flags the deferred bt_audio_enable() set. (The disconnect issued
+         * flags the deferred bluetooth_audio_enable() set. (The disconnect issued
          * above, if any, completes on its own — same as the pre-teardown
          * cancellation path.) */
         s_teardown_running = false;
@@ -684,7 +684,7 @@ static void bt_audio_teardown(void *param1, uint32_t param2)
                       "tearing down anyway", waited * BT_TD_RECHECK_MS);
     }
     /* From here on the teardown is no longer cancellable: publish the stack
-     * as down FIRST so a concurrent bt_audio_enable() can never take the
+     * as down FIRST so a concurrent bluetooth_audio_enable() can never take the
      * "already up" shortcut into a half-destroyed stack — it defers via
      * s_reenable_pending and is re-initialised at the end of this function.
      * Bluedroid requires the AVRCP Target to be torn down *before* the A2DP
@@ -698,7 +698,7 @@ static void bt_audio_teardown(void *param1, uint32_t param2)
     esp_bt_controller_disable();
     esp_bt_controller_deinit();
 
-    /* Reset all state so the next bt_audio_enable() starts from scratch. */
+    /* Reset all state so the next bluetooth_audio_enable() starts from scratch. */
     s_connected   = false;
     s_streaming   = false;
     s_enabled     = false;
@@ -725,15 +725,15 @@ static void bt_audio_teardown(void *param1, uint32_t param2)
          * same call path the UI uses). */
         s_reenable_pending = false;
         ESP_LOGI(TAG, "re-enabling Bluetooth after deferred teardown");
-        bt_audio_enable();
+        bluetooth_audio_enable();
     }
 }
 
 /* Tear the stack down and power off the controller —the reverse of
- * bt_audio_enable(). Idempotent: returns immediately if already down or a
+ * bluetooth_audio_enable(). Idempotent: returns immediately if already down or a
  * teardown is already pending. The real work is deferred to the disconnect
- * event when a link is live (see bt_audio_teardown for why). */
-void bt_audio_disable(void)
+ * event when a link is live (see bluetooth_audio_teardown for why). */
+void bluetooth_audio_disable(void)
 {
     if (!s_initialized || s_disabling) {
         return;
@@ -742,7 +742,7 @@ void bt_audio_disable(void)
     if (s_connected || s_discovering || s_pair_state != BT_PAIR_IDLE) {
         /* A live (or in-flight) link: stop the media stream and kick a
          * disconnect, then defer the teardown to the Timer task —it re-checks
-         * the link with a bounded retry budget (see bt_audio_teardown) instead
+         * the link with a bounded retry budget (see bluetooth_audio_teardown) instead
          * of relying on the disconnect-complete event alone. The second
          * pending call is the safety net: if that event is lost, the teardown
          * still runs after BT_TD_SAFETY_MS, polls for the link to drop, and
@@ -761,8 +761,8 @@ void bt_audio_disable(void)
             esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
         }
         esp_a2d_source_disconnect(s_peer_bda);
-        xTimerPendFunctionCall(bt_audio_teardown, NULL, 0, 0);
-        xTimerPendFunctionCall(bt_audio_teardown, NULL, 0,
+        xTimerPendFunctionCall(bluetooth_audio_teardown, NULL, 0, 0);
+        xTimerPendFunctionCall(bluetooth_audio_teardown, NULL, 0,
                                pdMS_TO_TICKS(BT_TD_SAFETY_MS));
         ESP_LOGI(TAG, "BT disable pending disconnect");
         return;
@@ -771,10 +771,10 @@ void bt_audio_disable(void)
     /* No active link: the alarm is not armed, so teardown inline (UI task
      * context, safe) is fine. Set s_disabling first so the re-check passes. */
     s_disabling = true;
-    bt_audio_teardown(NULL, 0);
+    bluetooth_audio_teardown(NULL, 0);
 }
 
-void bt_audio_set_enabled(bool enabled)
+void bluetooth_audio_set_enabled(bool enabled)
 {
     s_enabled = enabled;
     if (!enabled) {
@@ -790,7 +790,7 @@ void bt_audio_set_enabled(bool enabled)
     }
 }
 
-void bt_audio_scan_start(void)
+void bluetooth_audio_scan_start(void)
 {
     /* Never scan while linked: inquiry steals RF bandwidth from the A2DP
      * stream and makes playback stutter. */
@@ -810,22 +810,22 @@ void bt_audio_scan_start(void)
     }
 }
 
-bool bt_audio_is_scanning(void)
+bool bluetooth_audio_is_scanning(void)
 {
     return s_discovering;
 }
 
-int bt_audio_device_count(void)
+int bluetooth_audio_device_count(void)
 {
     return s_dev_count;
 }
 
-uint32_t bt_audio_device_version(void)
+uint32_t bluetooth_audio_device_version(void)
 {
     return s_dev_version;
 }
 
-const char *bt_audio_device_name(int index)
+const char *bluetooth_audio_device_name(int index)
 {
     static char fallback[18];
     if (index < 0 || index >= s_dev_count) {
@@ -890,7 +890,7 @@ static void bt_conn_retry_cb(TimerHandle_t t)
     bt_conn_start();
 }
 
-bool bt_audio_connect_index(int index)
+bool bluetooth_audio_connect_index(int index)
 {
     if (!s_initialized || s_disabling || index < 0 || index >= s_dev_count) {
         return false;
@@ -923,7 +923,7 @@ bool bt_audio_connect_index(int index)
         esp_bt_gap_cancel_discovery();      /* radio can't scan and dial */
     }
     memcpy(s_peer_bda, s_devs[index].bda, sizeof(esp_bd_addr_t));
-    snprintf(s_peer_name, sizeof(s_peer_name), "%s", bt_audio_device_name(index));
+    snprintf(s_peer_name, sizeof(s_peer_name), "%s", bluetooth_audio_device_name(index));
     s_enabled = true;                       /* connecting implies BT output on */
     s_conn_auto = true;                     /* keep auto-retrying until linked */
     s_conn_retries = 0;
@@ -936,7 +936,7 @@ bool bt_audio_connect_index(int index)
     return bt_conn_start();
 }
 
-void bt_audio_disconnect(void)
+void bluetooth_audio_disconnect(void)
 {
     /* User-initiated drop: cancel any pending auto-retry. */
     s_conn_auto = false;
@@ -951,17 +951,17 @@ void bt_audio_disconnect(void)
 
 /* Auto-retry progress for the in-flight dial-out, surfaced to the UI so it can
  * show "retrying k/max". Both are 0 when idle / Bluetooth disabled. */
-uint8_t bt_audio_retry_count(void)
+uint8_t bluetooth_audio_retry_count(void)
 {
     return s_conn_retries;
 }
 
-uint8_t bt_audio_retry_max(void)
+uint8_t bluetooth_audio_retry_max(void)
 {
     return BT_CONNECT_MAX_RETRY;
 }
 
-const char *bt_audio_peer_name(void)
+const char *bluetooth_audio_peer_name(void)
 {
     return s_peer_name;
 }
@@ -990,7 +990,7 @@ static bool bt_ring_send(const void *data, size_t bytes)
     return true;
 }
 
-void bt_audio_set_sample_rate(uint32_t rate_hz)
+void bluetooth_audio_set_sample_rate(uint32_t rate_hz)
 {
     if (rate_hz == 0 || rate_hz == s_in_rate) {
         return;
@@ -1007,7 +1007,7 @@ void bt_audio_set_sample_rate(uint32_t rate_hz)
  * stream rate). Returns false if the sink stalled (ring full for ~2 s) and
  * the chunk was abandoned; the caller reports the pipeline error instead of
  * faking normal playback. */
-bool bt_audio_write_pcm(const int16_t *stereo_frames, size_t frames)
+bool bluetooth_audio_write_pcm(const int16_t *stereo_frames, size_t frames)
 {
     if (!s_enabled || !s_streaming || s_pcm_ring == NULL || frames == 0) {
         return true;
@@ -1055,7 +1055,7 @@ bool bt_audio_write_pcm(const int16_t *stereo_frames, size_t frames)
  * at a repeat-one seam before the inter-pass pause; drains exactly like the
  * established sites above and is safe against a concurrent A2DP data
  * callback (ringbuffer receive hands out distinct items). */
-void bt_audio_flush_pcm_ring(void)
+void bluetooth_audio_flush_pcm_ring(void)
 {
     if (s_pcm_ring == NULL) {
         return;
@@ -1070,88 +1070,88 @@ void bt_audio_flush_pcm_ring(void)
 
 #else /* Bluetooth / A2DP not compiled in */
 
-void bt_audio_init(void)
+void bluetooth_audio_init(void)
 {
     ESP_LOGW(TAG, "Bluetooth/A2DP not enabled in build (see sdkconfig)");
 }
 
-void bt_audio_enable(void)
+void bluetooth_audio_enable(void)
 {
     /* No Bluetooth in this build: nothing to bring up. */
 }
 
-void bt_audio_disable(void)
+void bluetooth_audio_disable(void)
 {
     /* No Bluetooth in this build: nothing to tear down. */
 }
 
-void bt_audio_set_enabled(bool enabled)
+void bluetooth_audio_set_enabled(bool enabled)
 {
     (void)enabled;                          /* stays off without BT support */
 }
 
-void bt_audio_write_pcm(const int16_t *stereo_frames, size_t frames)
+void bluetooth_audio_write_pcm(const int16_t *stereo_frames, size_t frames)
 {
     (void)stereo_frames;
     (void)frames;
 }
 
-void bt_audio_set_sample_rate(uint32_t rate_hz)
+void bluetooth_audio_set_sample_rate(uint32_t rate_hz)
 {
     (void)rate_hz;
 }
 
-void bt_audio_flush_pcm_ring(void)
+void bluetooth_audio_flush_pcm_ring(void)
 {
     /* No Bluetooth in this build: nothing to flush. */
 }
 
-void bt_audio_scan_start(void)
+void bluetooth_audio_scan_start(void)
 {
 }
 
-bool bt_audio_is_scanning(void)
+bool bluetooth_audio_is_scanning(void)
 {
     return false;
 }
 
-int bt_audio_device_count(void)
+int bluetooth_audio_device_count(void)
 {
     return 0;
 }
 
-uint32_t bt_audio_device_version(void)
+uint32_t bluetooth_audio_device_version(void)
 {
     return 0;
 }
 
-const char *bt_audio_device_name(int index)
+const char *bluetooth_audio_device_name(int index)
 {
     (void)index;
     return "";
 }
 
-bool bt_audio_connect_index(int index)
+bool bluetooth_audio_connect_index(int index)
 {
     (void)index;
     return false;
 }
 
-void bt_audio_disconnect(void)
+void bluetooth_audio_disconnect(void)
 {
 }
 
-uint8_t bt_audio_retry_count(void)
-{
-    return 0;
-}
-
-uint8_t bt_audio_retry_max(void)
+uint8_t bluetooth_audio_retry_count(void)
 {
     return 0;
 }
 
-const char *bt_audio_peer_name(void)
+uint8_t bluetooth_audio_retry_max(void)
+{
+    return 0;
+}
+
+const char *bluetooth_audio_peer_name(void)
 {
     return "";
 }
@@ -1161,37 +1161,37 @@ const char *bt_audio_peer_name(void)
 /* AVRCP handler registration. Lives outside the #if because it only stores the
  * callback pointers (defined above); the callbacks fire only when Bluetooth is
  * actually up, so no stub is needed for the no-BT build. */
-void bt_audio_set_avrc_cmd_cb(bt_avrc_cmd_cb_t cb)
+void bluetooth_audio_set_avrc_cmd_cb(bt_avrc_cmd_cb_t cb)
 {
     s_avrc_cmd_cb = cb;
 }
 
-void bt_audio_set_avrc_volume_cb(bt_avrc_volume_cb_t cb)
+void bluetooth_audio_set_avrc_volume_cb(bt_avrc_volume_cb_t cb)
 {
     s_avrc_vol_cb = cb;
 }
 
-void bt_audio_set_conn_state_cb(bt_conn_state_cb_t cb)
+void bluetooth_audio_set_conn_state_cb(bt_conn_state_cb_t cb)
 {
     s_conn_state_cb = cb;
 }
 
-bt_pair_state_t bt_audio_pair_state(void)
+bt_pair_state_t bluetooth_audio_pair_state(void)
 {
     return s_pair_state;
 }
 
-uint32_t bt_audio_passkey(void)
+uint32_t bluetooth_audio_passkey(void)
 {
     return s_passkey;
 }
 
-bool bt_audio_is_enabled(void)
+bool bluetooth_audio_is_enabled(void)
 {
     return s_enabled;
 }
 
-bool bt_audio_is_connected(void)
+bool bluetooth_audio_is_connected(void)
 {
     return s_connected;
 }

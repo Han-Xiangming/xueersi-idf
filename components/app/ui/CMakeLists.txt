@@ -4,7 +4,7 @@ idf_component_register(
     REQUIRES audio
              battery
              board
-             bt_audio
+             bluetooth_audio
              buttons
              ebook
              esp_timer

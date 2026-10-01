@@ -61,7 +61,7 @@ ESP32（WROVER-B，PSRAM 8MB）@ 240MHz
 - 路由互斥：蓝牙开启且已连接 → 仅走 BT（I2S 不喂数据，喇叭静音）；否则走喇叭；播放器经 `hw_audio_set_player_active()` 声明总线归属。
 - 详见 `docs/audio.md`。
 
-## 7. 蓝牙（components/drivers/bt_audio/bt_audio.c）
+## 7. 蓝牙（components/drivers/bluetooth_audio/bluetooth_audio.c）
 
 - BT Classic + Bluedroid，A2DP Source + AVRCP Target，懒启动（进蓝牙页才拉栈），见 `docs/bluetooth.md`。
 
@@ -73,7 +73,7 @@ esp_log_level_set("BT_L2CAP", WARN)     降噪（BT 拥塞回调日志泛滥，�
   → hw_buttons_init()        GPIO + 消抖
   → hw_lcd_init()            SPI/panel/ST7789 初始化
   → hw_audio_init()          I2S + MAX98357（直写 DMA，无 feed 任务）
-  → bt_audio_init()          环形缓冲（不碰蓝牙控制器）
+  → bluetooth_audio_init()          环形缓冲（不碰蓝牙控制器）
   → 注册 AVRCP 回调（cmd / volume）
   → hw_sd_try_mount()        SD 挂载（可失败）
   → player_init() / ebook_init()   后台扫描/解码任务

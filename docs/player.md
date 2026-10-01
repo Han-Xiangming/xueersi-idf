@@ -68,5 +68,5 @@ main.c:       player_init()（创建任务）；AVRCP PLAY/PAUSE/STOP → player
 ui.c:         播放器页构建/轮询时读 player_scan_count/name/version；按键 → player_play/toggle/stop
 audio.c:      hw_audio_set_sample_rate() 随 MP3 采样率热重配 I2S（不停通道）；
               PCM 由解码任务 DSP 后直写 I2S DMA（无 ring/feed 任务）；蓝牙连接时路由到 A2DP（见 audio.md）
-bt_audio.c:   蓝牙开启且已连接时，PCM 经音量后路由到 A2DP 而非 I2S（见 audio.md）
+bluetooth_audio.c:   蓝牙开启且已连接时，PCM 经音量后路由到 A2DP 而非 I2S（见 audio.md）
 ```

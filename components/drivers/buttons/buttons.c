@@ -79,14 +79,18 @@ void hw_buttons_init(void)
     }
 }
 
-/* Media keys are delivered single-shot: report the press only on the poll
- * where the debounce settles, then look released while the button is still
- * held. This keeps LVGL's keypad state machine out of long-press
- * auto-repeat (which re-sends the same key every 90 ms while held), so one
- * START/MENU press performs exactly one action. */
-static bool key_is_media(uint32_t key)
+/* Keys that must act exactly once per physical press. The raw driver reports
+ * LV_INDEV_STATE_PRESSED on EVERY poll while a button is held, and LVGL's
+ * keypad state machine turns that into auto-repeat (re-sends the key every
+ * ~90 ms while held). For an action key like play/pause that is fatal: a
+ * slightly long press fires player_toggle() an ODD number of times and leaves
+ * playback paused with no resume -> the "frozen, silent" stall. Report these
+ * keys single-shot (press on the first settling poll, then release while held)
+ * so one press = one action. Navigation keys (up/down) keep auto-repeat so the
+ * list can be scrolled by holding them. */
+static bool key_is_single_shot(uint32_t key)
 {
-    return key == LV_KEY_MEDIA_PANEL;
+    return key == LV_KEY_MEDIA_PANEL || key == LV_KEY_ENTER;
 }
 
 void hw_buttons_read(lv_indev_t *indev, lv_indev_data_t *data)
@@ -97,7 +101,7 @@ void hw_buttons_read(lv_indev_t *indev, lv_indev_data_t *data)
     static int stable_index = -1;
     static uint32_t raw_changed_ms = 0;
     static uint32_t last_key = LV_KEY_ENTER;
-    static int media_hold_index = -1;
+    static int single_shot_hold_index = -1;
 
     int raw_index = -1;
     const uint32_t now_ms = lv_tick_get();
@@ -122,9 +126,9 @@ void hw_buttons_read(lv_indev_t *indev, lv_indev_data_t *data)
 
     if (stable_index >= 0) {
         const uint32_t key = s_buttons[stable_index].key;
-        if (key_is_media(key)) {
-            if (stable_index != media_hold_index) {
-                media_hold_index = stable_index;   /* first settling poll: press */
+        if (key_is_single_shot(key)) {
+            if (stable_index != single_shot_hold_index) {
+                single_shot_hold_index = stable_index;   /* first settling poll: press */
                 last_key = key;
                 data->state = LV_INDEV_STATE_PRESSED;
                 data->key = key;
@@ -135,13 +139,13 @@ void hw_buttons_read(lv_indev_t *indev, lv_indev_data_t *data)
             }
             return;
         }
-        media_hold_index = -1;
+        single_shot_hold_index = -1;
         last_key = key;
         data->state = LV_INDEV_STATE_PRESSED;
         data->key = last_key;
     }
     else {
-        media_hold_index = -1;
+        single_shot_hold_index = -1;
         data->state = LV_INDEV_STATE_RELEASED;
         data->key = last_key;
     }

@@ -6,7 +6,7 @@
 
 ```text
 MP3 解码（helix） ──> hw_audio_write_pcm() → 按路由分发
-  ├─ 蓝牙已连接 + 开启 → 音量（~5ms 平滑，全频段）→ bt_audio_write_pcm() → BT 环形缓冲(128KB) → A2DP
+  ├─ 蓝牙已连接 + 开启 → 音量（~5ms 平滑，全频段）→ bluetooth_audio_write_pcm() → BT 环形缓冲(128KB) → A2DP
   └─ 喇叭 → 800Hz 保护高通 → 响度低音架 → 音量（平滑）→ 软限幅 → xRingbufferSend() 送 PCM 环形缓冲
                                        → DMA writer 任务 → i2s_channel_write() → I2S(MAX98357)
 ```

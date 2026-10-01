@@ -87,7 +87,7 @@ ESP32-WROVER-B (主控)
 
 ```text
 main/main.c            —— 启动装配，初始化各驱动、创建 LVGL 与 UI、运行主循环
-components/drivers/    —— 硬件层：buttons / lcd / audio / bt_audio / battery / sd
+components/drivers/    —— 硬件层：buttons / lcd / audio / bluetooth_audio / battery / sd
 components/app/        —— 应用层：ui（LVGL 界面） / player（MP3） / ebook（TXT）
 components/board/      —— 板级硬件配置（board_config.h）
 components/fonts/      —— 中文 CJK 点阵字体（lv_font_cn_16，16px）
@@ -238,7 +238,7 @@ MAX98357 由 BCLK 内部派生主时钟，因此 **不需要 MCLK**。
 | `components/drivers/buttons/`     | 6 键输入 + 消抖，LVGL keypad 读取回调             |
 | `components/drivers/lcd/`         | ST7789 驱动 + LVGL 显示绑定 + 背光 PWM          |
 | `components/drivers/audio/`       | I2S → MAX98357，路由/音量/采样率/ PCM 写入         |
-| `components/drivers/bt_audio/`    | 蓝牙 A2DP SOURCE + AVRCP + 扫描/配对/连接管理      |
+| `components/drivers/bluetooth_audio/`    | 蓝牙 A2DP SOURCE + AVRCP + 扫描/配对/连接管理      |
 | `components/drivers/battery/`     | 电池电压采样 + 开路电压查表              |
 | `components/drivers/sd/`          | SDSPI 挂载状态与访问                          |
 | `components/app/ui/`              | LVGL 分页 UI（播放器/电子书/设置/蓝牙）            |

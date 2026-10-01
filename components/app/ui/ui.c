@@ -15,7 +15,7 @@
 #include "buttons.h"
 #include "audio.h"
 #include "battery.h"
-#include "bt_audio.h"
+#include "bluetooth_audio.h"
 #include "lcd.h"
 #include "sd.h"
 #include "ui.h"
@@ -138,7 +138,7 @@ static const setting_entry_t s_settings_table[SETTING_COUNT] = {
 static uint8_t s_backlight = 60;
 
 /* Bluetooth output master switch (settings page ON/OFF). Persisted to NVS;
- * restored at boot. Drives bt_audio_set_enabled() — the audio routing gate. */
+ * restored at boot. Drives bluetooth_audio_set_enabled() — the audio routing gate. */
 static bool s_bt_on;
 
 /* Auto screen-off: idle timeout in seconds. 0 = never (disable standby).
@@ -180,7 +180,7 @@ static void ui_settings_load(void)
     if (nvs_get_i32(h, UI_NVS_VOLUME, &v) == ESP_OK && v >= 0 && v <= 100) {
         hw_audio_set_speaker_volume((uint8_t)v);
     } else {
-        hw_audio_set_speaker_volume(30);   /* default speaker volume 30% */
+        hw_audio_set_speaker_volume(80);   /* default speaker volume 80% */
     }
     v = -1;
     if (nvs_get_i32(h, UI_NVS_VOLBT, &v) == ESP_OK && v >= 0 && v <= 100) {
@@ -198,7 +198,7 @@ static void ui_settings_load(void)
     int32_t bt = 0;
     if (nvs_get_i32(h, UI_NVS_BT, &bt) == ESP_OK) {
         s_bt_on = (bt != 0);
-        bt_audio_set_enabled(s_bt_on);
+        bluetooth_audio_set_enabled(s_bt_on);
     }
     int32_t bl = -1;
     if (nvs_get_i32(h, UI_NVS_BACKL, &bl) == ESP_OK && bl >= 0 && bl <= 100) {
@@ -325,7 +325,7 @@ static const int s_bt_row_y[BT_LIST_ROWS] = {38, 64, 90, 116, 142, 168};
 static int s_bt_sel;
 /* Snapshot of the BT device list so the UI does not re-format device names
  * (incl. the MAC-address fallback) on every 16 ms tick. Refreshed only when
- * bt_audio_device_version() advances. */
+ * bluetooth_audio_device_version() advances. */
 static uint32_t s_bt_list_ver;
 static int      s_bt_list_cnt;
 static char     s_bt_list_name[BT_MAX_DEVICES][BT_DEV_NAME_LEN];
@@ -821,7 +821,7 @@ static const char *ui_set_bt_text(void)
      * reflects reality after a connect. */
     if (!s_bt_on) {
         snprintf(buf, sizeof(buf), "关");
-    } else if (bt_audio_is_connected()) {
+    } else if (bluetooth_audio_is_connected()) {
         snprintf(buf, sizeof(buf), "已连接");
     } else {
         snprintf(buf, sizeof(buf), "开");
@@ -892,9 +892,9 @@ static void ui_set_bt_lr(int dir)
      * persisted to NVS on the next flush. Switching OFF also powers the
      * Bluetooth controller fully down (if it was up) to save power. */
     s_bt_on = (dir > 0);
-    bt_audio_set_enabled(s_bt_on);
+    bluetooth_audio_set_enabled(s_bt_on);
     if (!s_bt_on) {
-        bt_audio_disable();
+        bluetooth_audio_disable();
     }
     ui_settings_mark_dirty(SETTINGS_DIRTY_BT);
     set_action(s_bt_on ? "蓝牙开" : "蓝牙关");
@@ -918,7 +918,7 @@ static void ui_set_bt_enter(void)
      * SETTING_BTOUT row (关/开/已连接) consistent with the live state. */
     if (!s_bt_on) {
         s_bt_on = true;
-        bt_audio_set_enabled(true);
+        bluetooth_audio_set_enabled(true);
         ui_settings_mark_dirty(SETTINGS_DIRTY_BT);
     }
     ui_enter_page(UI_PAGE_BT);
@@ -1096,7 +1096,7 @@ static void ui_build_bt(lv_obj_t *page)
     s_ui.hint = ui_label(page, "上/下选 A连接 Select扫描 B返回", 214, UI_GRAY,
                          &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
 
-    bt_audio_scan_start();   /* scan once on entry; SELECT re-scans */
+    bluetooth_audio_scan_start();   /* scan once on entry; SELECT re-scans */
 }
 
 /* Book display name. Keep the full filename (including the ".txt" suffix) so
@@ -1399,7 +1399,7 @@ static void ui_enter_page(ui_page_t page)
     /* Bring the Bluetooth stack up only when the user actually opens the
      * BLUETOOTH page (it is deferred from boot). Idempotent. */
     if (page == UI_PAGE_BT) {
-        bt_audio_enable();
+        bluetooth_audio_enable();
     }
     s_ui.page = ui_make_page(0);
     s_ui.title = NULL;
@@ -1432,20 +1432,20 @@ static bool ui_external_changed(void)
 
     /* Bluetooth state affects both the BLUETOOTH page and the SETTINGS
      * "BT OUT" row, so watch it on every page. */
-    uint32_t v   = bt_audio_device_version();
-    int cnt     = bt_audio_device_count();
-    bt_pair_state_t ps = bt_audio_pair_state();
-    bool conn    = bt_audio_is_connected();
-    bool scan    = bt_audio_is_scanning();
+    uint32_t v   = bluetooth_audio_device_version();
+    int cnt     = bluetooth_audio_device_count();
+    bt_pair_state_t ps = bluetooth_audio_pair_state();
+    bool conn    = bluetooth_audio_is_connected();
+    bool scan    = bluetooth_audio_is_scanning();
     if (v != s_ext_bt_ver || cnt != s_ext_bt_count || ps != s_ext_bt_pair
         || conn != s_ext_bt_conn || scan != s_ext_bt_scan
-        || bt_audio_retry_count() != s_ext_bt_retry) {
+        || bluetooth_audio_retry_count() != s_ext_bt_retry) {
         s_ext_bt_ver   = v;
         s_ext_bt_count = cnt;
         s_ext_bt_pair  = ps;
         s_ext_bt_conn  = conn;
         s_ext_bt_scan  = scan;
-        s_ext_bt_retry = bt_audio_retry_count();
+        s_ext_bt_retry = bluetooth_audio_retry_count();
         changed = true;
     }
 
@@ -2183,21 +2183,21 @@ void ui_refresh(void)
         break;
     }
     case UI_PAGE_BT: {
-        int count = bt_audio_device_count();
+        int count = bluetooth_audio_device_count();
         if (s_bt_sel >= count) {
             s_bt_sel = count > 0 ? count - 1 : 0;
         }
 
-        /* Refresh the cached device list only when bt_audio says it changed
+        /* Refresh the cached device list only when bluetooth_audio says it changed
          * (a device added, or a nameless device's name arrived). This avoids
          * re-formatting the MAC-address fallback string for every visible row
          * on every 16 ms tick. */
-        uint32_t ver = bt_audio_device_version();
+        uint32_t ver = bluetooth_audio_device_version();
         if (ver != s_bt_list_ver) {
             s_bt_list_ver = ver;
             s_bt_list_cnt = count;
             for (int i = 0; i < count && i < BT_MAX_DEVICES; i++) {
-                strncpy(s_bt_list_name[i], bt_audio_device_name(i),
+                strncpy(s_bt_list_name[i], bluetooth_audio_device_name(i),
                         BT_DEV_NAME_LEN - 1);
                 s_bt_list_name[i][BT_DEV_NAME_LEN - 1] = '\0';
             }
@@ -2217,7 +2217,7 @@ void ui_refresh(void)
             if (idx < count) {
                 const char *nm = (idx < s_bt_list_cnt && idx < BT_MAX_DEVICES)
                                  ? s_bt_list_name[idx]
-                                 : bt_audio_device_name(idx);
+                                 : bluetooth_audio_device_name(idx);
                 ui_label_set(s_ui.bt_cursor[i], sel ? ">" : " ");
                 /* Paint the row color every refresh so the first paint after
                  * entering shows the selected row in cyan. */
@@ -2234,9 +2234,9 @@ void ui_refresh(void)
             s_paint_bt_sel = s_bt_sel;
         }
 
-        if (bt_audio_is_connected()) {
+        if (bluetooth_audio_is_connected()) {
             char st[28];
-            snprintf(st, sizeof(st), "已连接 %s", bt_audio_peer_name());
+            snprintf(st, sizeof(st), "已连接 %s", bluetooth_audio_peer_name());
             st[27] = '\0';
             ui_label_set(s_ui.bt_status, st);
             ui_set_hint("A断开 B返回");
@@ -2244,32 +2244,32 @@ void ui_refresh(void)
              * decoded audio goes to Bluetooth instead of the speaker. */
             hw_audio_set_route(AUDIO_ROUTE_BT);
         }
-        else if (bt_audio_pair_state() == BT_PAIR_PAIRING) {
+        else if (bluetooth_audio_pair_state() == BT_PAIR_PAIRING) {
             /* Show the SSP passkey so the user can verify it on the sink. */
             char st[28];
-            snprintf(st, sizeof(st), "配对码 %06u", (unsigned)bt_audio_passkey());
+            snprintf(st, sizeof(st), "配对码 %06u", (unsigned)bluetooth_audio_passkey());
             st[27] = '\0';
             ui_label_set(s_ui.bt_status, st);
             ui_set_hint("配对中... B返回");
         }
-        else if (bt_audio_pair_state() == BT_PAIR_CONNECTING) {
-            uint8_t rc = bt_audio_retry_count();
-            uint8_t rm = bt_audio_retry_max();
+        else if (bluetooth_audio_pair_state() == BT_PAIR_CONNECTING) {
+            uint8_t rc = bluetooth_audio_retry_count();
+            uint8_t rm = bluetooth_audio_retry_max();
             char st[28];
             if (rc > 0) {
                 snprintf(st, sizeof(st), "重试中 %u/%u", (unsigned)rc, (unsigned)rm);
             } else {
-                snprintf(st, sizeof(st), "配对中 %s", bt_audio_peer_name());
+                snprintf(st, sizeof(st), "配对中 %s", bluetooth_audio_peer_name());
             }
             st[27] = '\0';
             ui_label_set(s_ui.bt_status, st);
             ui_set_hint("连接中... B返回");
         }
-        else if (bt_audio_pair_state() == BT_PAIR_FAIL) {
+        else if (bluetooth_audio_pair_state() == BT_PAIR_FAIL) {
             ui_label_set(s_ui.bt_status, "配对失败");
             ui_set_hint("A重试 B返回");
         }
-        else if (bt_audio_is_scanning()) {
+        else if (bluetooth_audio_is_scanning()) {
             char st[28];
             snprintf(st, sizeof(st), "扫描中... %d", count);
             st[27] = '\0';
@@ -2504,16 +2504,16 @@ static void ui_action(void)
         }
         break;
     case UI_PAGE_BT:
-        if (bt_audio_is_connected()) {
+        if (bluetooth_audio_is_connected()) {
             set_action("断开中");
-            bt_audio_disconnect();
+            bluetooth_audio_disconnect();
             /* Return output to the speaker immediately (the route is explicit;
              * we don't wait for the link to actually drop). */
             hw_audio_set_route(AUDIO_ROUTE_SPEAKER);
         }
-        else if (bt_audio_device_count() > 0) {
+        else if (bluetooth_audio_device_count() > 0) {
             set_action("连接中");
-            if (!bt_audio_connect_index(s_bt_sel)) {
+            if (!bluetooth_audio_connect_index(s_bt_sel)) {
                 set_action("连接失败");
             }
         }
@@ -2629,7 +2629,7 @@ static void ui_adjust(int step)
         }
         break;
     case UI_PAGE_BT: {
-        int count = bt_audio_device_count();
+        int count = bluetooth_audio_device_count();
         if (count > 0) {
             s_bt_sel = (s_bt_sel - step + count) % count;
         }
@@ -2928,7 +2928,7 @@ else if (s_ui.page_id == UI_PAGE_EBOOK_LIST) {
         }
         else if (s_ui.page_id == UI_PAGE_BT) {
             /* Select starts a fresh sink scan. */
-            bt_audio_scan_start();
+            bluetooth_audio_scan_start();
             set_action("扫描中");
         }
     }

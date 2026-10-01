@@ -2,7 +2,7 @@ idf_component_register(
     SRCS "audio.c"
     INCLUDE_DIRS "."
     REQUIRES board
-             bt_audio
+             bluetooth_audio
              esp_driver_i2s
              speexdsp
 )

@@ -50,6 +50,14 @@
  * this long, the decode task is stuck (SD read hang, BT send hang, ...) and
  * the watchdog stops playback instead of faking an endless "playing" state. */
 #define PLAYER_STALL_MS          12000
+/* Pause-spin safety net. A real pause sets s_state==PLAYER_PAUSED, which the
+ * stall watchdog (player_watch_task) deliberately SKIPS, so a lost resume
+ * notify leaves the decode loop spinning in its pause wait forever, silently
+ * feeding the WDT -> the "frozen log, never recovers" failure (see the comment
+ * at the pause spin). This timeout force-resumes after the pause has been
+ * stuck far longer than any legitimate hold, so the device can never wedge
+ * silently; the log makes a lost-resume visible instead of invisible. */
+#define PAUSE_STUCK_MS           30000
 /* Decode task priority: MUST stay ABOVE LVGL_TASK_PRIORITY (7, see ui.h).
  *
  * The decode task is the only real-time consumer here: it must refill the I2S
@@ -938,6 +946,72 @@ static uint32_t s_tm_out_us;
 static uint32_t s_tm_frames;
 static int64_t  s_tm_last_log_us;
 
+/* --- Debug PCM peak meter (debug build aid) ------------------------------
+ * A track can decode into perfectly valid-looking frames (healthy [TIMING]
+ * cadence) while the sample values are silence — a file that decodes to zeros,
+ * or a format the decoder mis-handles. The log cannot see sample values, so we
+ * meter the decoded PCM here: track the per-bar peak (max |sample|), tally the
+ * write results, and log ~1 s. This cleanly separates "source/decoder silence"
+ * (peak ~ 0) from a DMA/output failure (peak high but no sound). Reset per
+ * track where s_dbg_frames is reset below. */
+static int32_t  s_pk_peak;
+static int32_t  s_pk_raw_peak;   /* pre-DSP (raw decoder) peak, for split attribution */
+static uint32_t s_pk_frames;
+static uint32_t s_pk_ok;
+static uint32_t s_pk_stall;
+static uint32_t s_pk_aband;
+static int64_t  s_pk_last_us;
+
+static void dbg_peak(const int16_t *b, size_t n, audio_write_result_t wr)
+{
+    for (size_t i = 0; i < n; i++) {
+        int32_t a = b[i] < 0 ? -b[i] : b[i];
+        if (a > s_pk_peak) {
+            s_pk_peak = a;
+        }
+    }
+    s_pk_frames++;
+    if (wr == AUDIO_WRITE_OK) {
+        s_pk_ok++;
+    }
+    else if (wr == AUDIO_WRITE_STALLED) {
+        s_pk_stall++;
+    }
+    else {
+        s_pk_aband++;
+    }
+    const int64_t now = esp_timer_get_time();
+    if (now - s_pk_last_us > 1000000) {
+        ESP_LOGW(TAG,
+                 "[PCMDBG] peak=%d (%.1f%%) raw=%d (%.1f%%) frames=%u ok=%u stall=%u aband=%u "
+                 "name='%s'",
+                 (int)s_pk_peak, s_pk_peak * 100.0f / 32768.0f,
+                 (int)s_pk_raw_peak, s_pk_raw_peak * 100.0f / 32768.0f,
+                 (unsigned)s_pk_frames, (unsigned)s_pk_ok,
+                 (unsigned)s_pk_stall, (unsigned)s_pk_aband, s_name);
+        s_pk_peak = 0;
+        s_pk_raw_peak = 0;
+        s_pk_frames = 0;
+        s_pk_ok = 0;
+        s_pk_stall = 0;
+        s_pk_aband = 0;
+        s_pk_last_us = now;
+    }
+}
+
+/* Pre-DSP (raw decoder) peak, measured BEFORE hw_audio_write_pcm so we can
+ * split the total attenuation between the decoder output and the DSP gain
+ * chain (volume + ReplayGain + master + limiter). */
+static void dbg_peak_raw(const int16_t *b, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        int32_t a = b[i] < 0 ? -b[i] : b[i];
+        if (a > s_pk_raw_peak) {
+            s_pk_raw_peak = a;
+        }
+    }
+}
+
 /* Decode a single frame and stream it. Returns false on EOF/error. */
 static bool decode_frame(bool *rate_set)
 {
@@ -1085,7 +1159,9 @@ static bool decode_frame(bool *rate_set)
         /* Stereo / multichannel: outputSamps is the total sample count, so the
          * number of stereo frames to write is outputSamps / 2. This is the path
          * every stereo/joint-stereo file takes. */
+        dbg_peak_raw(s_pcm, (size_t)info.outputSamps);
         wr = hw_audio_write_pcm(s_pcm, (size_t)(info.outputSamps / 2));
+        dbg_peak(s_pcm, (size_t)info.outputSamps, wr);
     }
     else if (info.nChans == 1) {
         /* Genuine mono output from the decoder: upmix to stereo by duplicating
@@ -1093,11 +1169,13 @@ static bool decode_frame(bool *rate_set)
          * mislabeled frame can never overflow s_stereo (MP3_PCM_MAX / 2 frames). */
         const int frames = (info.outputSamps < MP3_PCM_MAX / 2)
                                ? info.outputSamps : (MP3_PCM_MAX / 2);
+        dbg_peak_raw(s_pcm, (size_t)info.outputSamps);
         for (int i = 0; i < frames; i++) {
             s_stereo[2 * i] = s_pcm[i];
             s_stereo[2 * i + 1] = s_pcm[i];
         }
         wr = hw_audio_write_pcm(s_stereo, (size_t)frames);
+        dbg_peak(s_stereo, (size_t)(frames * 2), wr);
     }
     else {
         /* nChans == 0 (a malformed first frame some decoders report): there is
@@ -1106,11 +1184,11 @@ static bool decode_frame(bool *rate_set)
         wr = AUDIO_WRITE_OK;
     }
     if (wr == AUDIO_WRITE_STALLED) {
-        /* The I2S DMA is not consuming (bounded write timed out). The writer
-         * now self-heals a wedged channel by rebuilding it (see
-         * hw_audio_write_pcm), so a one-off hitch must not abort the track:
-         * only N CONSECUTIVE stalls count. The pipeline error is the honest
-         * outcome when even the rebuild fails. */
+        /* The I2S DMA is not consuming (bounded write timed out). With
+         * .auto_clear = true the TX out-link never stops, so a stall now means a
+         * genuine pipeline problem (not a wedged out-link a rebuild would fix).
+         * A one-off hitch must not abort the track: only N CONSECUTIVE stalls
+         * count; the pipeline error is the honest outcome. */
         if (++s_pcm_stalls >= TRACK_MAX_PIPELINE_STALLS) {
             ESP_LOGE(TAG, "audio pipeline stalled %d times, aborting track",
                      s_pcm_stalls);
@@ -1193,12 +1271,16 @@ static void decode_loop(void)
              * ESP32 I2S out-link by flooding fresh descriptors ("re-arm DMA
              * descriptors"), which recovers a DMA desync that otherwise leaves the
              * NEXT track silent — the UI shows it playing but no audio comes out.
-             * Natural-end auto-advance therefore now uses the HARD flush: the long
-             * idle in hw_audio_drain_blocking() can desync the out-link, and only
-             * the full-ring silence re-arm restores it. The cost is a ~280 ms seam
-             * gap (the silence fill), accepted to kill the silent "next song"
-             * failure. The soft flush (no re-arm) is now used only if a caller
-             * passes soft=true; the natural-end / repeat-one paths pass false. */
+             * The silent "next song" failure was NOT an out-link desync to re-arm
+             * with silence: it was the I2S TX out-link genuinely STOPPING when the
+             * PCM ring drained (i2s_channel_write then blocks forever for a credit
+             * that never arrives). Fixed structurally in audio.c via .auto_clear =
+             * true: the DMA loops the ring transmitting silence while idle, so a new
+             * write is always picked up and the next track plays with no stop/start.
+             * With auto_clear the HARD flush is no longer needed to re-arm, so
+             * auto-advance / repeat-one pass soft=true for a seamless seam (no
+             * ~280 ms gap). The hard flush still erases residual PCM ahead of the
+             * pointer on a manual next/prev ("上一首残音"). */
             if (s_switch_soft) {
                 hw_audio_pipeline_flush();
             } else if (s_ever_played) {
@@ -1266,6 +1348,8 @@ static void decode_loop(void)
             bool rate_set = false;
             int frame_cnt = 0;
             s_dbg_frames = 0;             /* reset debug frame counter */
+            s_pk_peak = 0; s_pk_raw_peak = 0; s_pk_frames = 0;
+            s_pk_ok = 0; s_pk_stall = 0; s_pk_aband = 0;
             while (!s_stop_req && !s_new_req) {
                 /* Decode-progress heartbeat for the stall watchdog: this
                  * runs once per frame, so while PLAYING a healthy pipeline
@@ -1299,11 +1383,32 @@ static void decode_loop(void)
                      * never recovers" failure. Letting the beat go stale makes
                      * that state visible and self-recovering instead. */
                     ESP_LOGI(TAG, "paused: waiting for resume");
+                    uint32_t paused_for = 0;
                     while (s_pause_req && !s_stop_req && !s_new_req) {
 #if defined(CONFIG_ESP_TASK_WDT_EN)
                         esp_task_wdt_reset();
 #endif
-                        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2000));
+                        if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2000)) == pdFALSE) {
+                            paused_for += 2000;
+                            if (paused_for >= PAUSE_STUCK_MS) {
+                                /* A pause should only persist while the user is
+                                 * actually holding it. Waiting this long with no
+                                 * resume and no stop/track-switch means the resume
+                                 * notify was lost (the documented "frozen log,
+                                 * never recovers" failure). Force-resume so the
+                                 * device can never wedge silently, and log it so
+                                 * the lost-resume is visible instead of invisible.
+                                 * Mirrors the player_toggle() resume path. */
+                                ESP_LOGE(TAG,
+                                         "[WATCHDOG] pause flag stuck %ums; "
+                                         "force-resuming playback",
+                                         (unsigned)paused_for);
+                                s_pause_req = false;
+                                s_state = PLAYER_PLAYING;
+                                hw_audio_set_player_active(true);
+                                break;
+                            }
+                        }
                     }
                     if (s_stop_req || s_new_req) {
                         break;   /* stop or track switch: end this track */
@@ -1337,7 +1442,7 @@ static void decode_loop(void)
                              s_index, s_name);
                     hw_audio_pipeline_flush();
                     vTaskDelay(pdMS_TO_TICKS(REPEAT_ONE_GAP_MS));
-                    player_play_index_ex(s_index, false);  /* 显式 index 重播:硬切换 re-arm,防单曲循环无声 */
+                    player_play_index_ex(s_index, true);   /* 单曲循环:auto_clear 保证 DMA 不停止,软切换无缝 */
                     continue;   /* 重载块按 s_new_index 重开当前曲目 */
                 }
                 /* 兜底：当前曲目不在列表（无显式 index）时原地 rewind */
@@ -1410,7 +1515,7 @@ static void decode_loop(void)
         }
         ESP_LOGI(TAG, "[MODE] natural end: repeat=%d from %d -> %d (cnt=%d)",
                  (int)s_repeat, s_index, next, cnt);
-        player_play_index_ex(next, false);  /* 自然结束:硬切换(整环静音 re-arm)修续播无声 */
+        player_play_index_ex(next, true);   /* 自然结束:auto_clear 已保证 DMA 不停止,软切换无缝续播 */
         continue;   /* loop top picks up s_new_req and starts the next song */
     }
     /* Decode loop is leaving for good (stop / watchdog / too many failures):
@@ -1858,9 +1963,11 @@ void player_play_index_ex(int i, bool soft)
         return;
     }
     /* 显式给出列表下标：重载块优先采用该 index 而非路径回查，保证自动连播/
-     * 错误前进始终基于确定的 index（见 decode_loop 重载块）。soft=true 走软切换
-     * (仅丢弃 ring，不 re-arm DMA 出链)；false 走硬切换 (整环静音覆盖，re-arm 出链，
-     * 修"续播无声")。自然结束与单曲循环均传 false 以 re-arm，代价是 ~280ms 接缝静音。 */
+     * 错误前进始终基于确定的 index（见 decode_loop 重载块）。
+     * soft=true -> hw_audio_pipeline_flush()；false -> hw_audio_pipeline_switch()。
+     * 二者现在都会 re-arm DMA 出链（audio.c 的 i2s_seam_rearm 做 disable+enable
+     * 重置 descriptor 队列，修"续播无声"），区别只剩等待时长/命名，不再决定
+     * 是否 re-arm。自然结束与单曲循环传 true（软切换，省 ~280ms 接缝静音）。 */
     s_new_index = i;
     s_switch_soft = soft;
     /* Play by absolute path from the (immutable) playlist snapshot. The index
