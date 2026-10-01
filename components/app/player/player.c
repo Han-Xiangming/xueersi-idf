@@ -1187,15 +1187,18 @@ static void decode_loop(void)
              * "上一首残音" bug.
              *
              * Hard vs soft: a hard switch (hw_audio_pipeline_switch) ALSO
-             * overwrites the whole DMA descriptor ring with silence, killing
-             * previous-track PCM left in descriptors AHEAD of the DMA pointer —
-             * that is what the soft flush alone could not remove, and it is what
-             * the "still has residual" reports were about. Use it on any real
-             * switch that has audio to clear (s_ever_played), but NOT on the
-             * first-ever play (nothing to clear -> no pointless ~280 ms gap) and
-             * NOT on natural-end (the ring is already drained by
-             * hw_audio_drain_blocking(), so a hard fill would add a spurious gap
-             * and wreck the perceptible seam). */
+             * overwrites the whole DMA descriptor ring with silence. It does two
+             * things: (1) kills previous-track PCM left in descriptors AHEAD of
+             * the DMA pointer (the "still has residual" fix), and (2) re-links the
+             * ESP32 I2S out-link by flooding fresh descriptors ("re-arm DMA
+             * descriptors"), which recovers a DMA desync that otherwise leaves the
+             * NEXT track silent — the UI shows it playing but no audio comes out.
+             * Natural-end auto-advance therefore now uses the HARD flush: the long
+             * idle in hw_audio_drain_blocking() can desync the out-link, and only
+             * the full-ring silence re-arm restores it. The cost is a ~280 ms seam
+             * gap (the silence fill), accepted to kill the silent "next song"
+             * failure. The soft flush (no re-arm) is now used only if a caller
+             * passes soft=true; the natural-end / repeat-one paths pass false. */
             if (s_switch_soft) {
                 hw_audio_pipeline_flush();
             } else if (s_ever_played) {
@@ -1334,7 +1337,7 @@ static void decode_loop(void)
                              s_index, s_name);
                     hw_audio_pipeline_flush();
                     vTaskDelay(pdMS_TO_TICKS(REPEAT_ONE_GAP_MS));
-                    player_play_index_ex(s_index, true);   /* 显式 index 重播当前曲目 */
+                    player_play_index_ex(s_index, false);  /* 显式 index 重播:硬切换 re-arm,防单曲循环无声 */
                     continue;   /* 重载块按 s_new_index 重开当前曲目 */
                 }
                 /* 兜底：当前曲目不在列表（无显式 index）时原地 rewind */
@@ -1407,7 +1410,7 @@ static void decode_loop(void)
         }
         ESP_LOGI(TAG, "[MODE] natural end: repeat=%d from %d -> %d (cnt=%d)",
                  (int)s_repeat, s_index, next, cnt);
-        player_play_index_ex(next, true);   /* 自然结束：ring 已排空，软切换保边界 */
+        player_play_index_ex(next, false);  /* 自然结束:硬切换(整环静音 re-arm)修续播无声 */
         continue;   /* loop top picks up s_new_req and starts the next song */
     }
     /* Decode loop is leaving for good (stop / watchdog / too many failures):
@@ -1855,9 +1858,9 @@ void player_play_index_ex(int i, bool soft)
         return;
     }
     /* 显式给出列表下标：重载块优先采用该 index 而非路径回查，保证自动连播/
-     * 错误前进始终基于确定的 index（见 decode_loop 重载块）。soft=true marks
-     * the reload as a natural-end / repeat-one seam so it uses the soft flush
-     * (no extra silence gap); false is a real switch that hard-flushes. */
+     * 错误前进始终基于确定的 index（见 decode_loop 重载块）。soft=true 走软切换
+     * (仅丢弃 ring，不 re-arm DMA 出链)；false 走硬切换 (整环静音覆盖，re-arm 出链，
+     * 修"续播无声")。自然结束与单曲循环均传 false 以 re-arm，代价是 ~280ms 接缝静音。 */
     s_new_index = i;
     s_switch_soft = soft;
     /* Play by absolute path from the (immutable) playlist snapshot. The index
