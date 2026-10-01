@@ -832,7 +832,10 @@ static esp_err_t audio_create_channel(void)
     }
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(s_rate),
-        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(16, I2S_SLOT_MODE_STEREO),
+        /* MAX98357 is a codec-less Class-D DAC that expects standard Philips
+         * I2S. MSB/left-justified shifts every sample by one BCLK -> "滋滋滋"
+         * static while real PCM still reaches the DMA (post_peak > 0). */
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(16, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = PIN_NUM_I2S_BCLK,
