@@ -186,8 +186,10 @@ void app_main(void)
     ESP_LOGI(TAG, "Xiaomiao LVGL 9.5 dashboard boot");
 
     /* On-device log mirror: ring-buffer + drain task writes every log line to
-     * /sdcard/logs/app.log so the device is diagnosable without a UART. Must
-     * exist before the vprintf hook so the early boot lines are captured. */
+     * /sdcard/logs/app_NNNN.log (ring of newest segments) so the device is
+     * diagnosable without a UART. Must exist before the vprintf hook so the
+     * early boot lines are captured. Call log_sink_flush() before any
+     * esp_restart()/fatal path to persist the incident lines. */
     log_sink_init();
 
     /* Non-blocking console: a wedged UART must never freeze a task that

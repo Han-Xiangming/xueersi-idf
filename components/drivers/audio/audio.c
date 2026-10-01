@@ -675,26 +675,7 @@ static void i2s_writer_task(void *arg)
     static uint32_t s_sil_chunks = 0;   /* silence chunks emitted */
     static uint32_t s_drop_inactive = 0;/* real PCM dropped because !active */
     static int32_t  s_post_peak = 0;    /* peak of POST-DSP PCM sent to DMA */
-    static int64_t  s_hb_us = 0;
     for (;;) {
-        int64_t now = esp_timer_get_time();
-        if (now - s_hb_us > 1000000) {
-            /* Debug heartbeat: what the writer is actually doing. If w=0 but the
-             * decode side reports ok=39 (ring filling), the PCM is being dropped
-             * (drop_inact) or we are parked -> seam state bug. If w is high but
-             * post_peak is tiny, the DSP is attenuating the track into silence. */
-            ESP_LOGW(TAG,
-                     "[WRTR] active=%d parked=%d route=%d dis=%d ring=%u "
-                     "w=%u sil=%u drop_inact=%u post_peak=%d (%.1f%%)",
-                     (int)s_player_active, (int)s_parked, (int)s_route,
-                     (int)s_i2s_disabled, (unsigned)s_ring_bytes,
-                     (unsigned)s_w_chunks, (unsigned)s_sil_chunks,
-                     (unsigned)s_drop_inactive, (int)s_post_peak,
-                     s_post_peak * 100.0f / 32768.0f);
-            s_w_chunks = 0; s_sil_chunks = 0; s_drop_inactive = 0;
-            s_post_peak = 0;
-            s_hb_us = now;
-        }
         if (s_flush_req) {
             /* Drop the queued PCM so the next track starts clean. The channel is
              * deliberately NOT disabled/re-enabled here (see the note below): the

@@ -1,19 +1,39 @@
 /*
- * On-device log sink: ring-buffer + drain task that writes every esp_log line
- * to /sdcard/logs/app.log. See log_sink.h.
+ * On-device log sink: StreamBuffer ring + drain task that mirrors every
+ * esp_log line to a file on the SD card.
  *
- * CRITICAL: FATFS only updates a file's directory entry (its on-disk size)
- * on f_close / f_sync. A bare fflush() only flushes the libc buffer down to the
- * VFS; the file would then show as 0 bytes on the card even though the data
- * sectors were written. We fsync() after every write (and on open) so the size
- * is always current and a pulled card shows real content.
+ * Files: per-session, named /sdcard/logs/app_NNNN.log (NNNN resumes across
+ * reboots so segments never collide). A ring keeps at most RING_FILES of the
+ * newest segments; older ones are deleted so the card can't fill up.
+ *
+ * Batched writes: lines are accumulated in the libc write buffer (setvbuf)
+ * and only flushed + fsync'd when dirty and the drain task goes idle, on
+ * rotation, on close, or on an explicit log_sink_flush(). We deliberately do
+ * NOT fsync per line: FATFS rewrites the directory entry on every f_sync, so
+ * per-line syncing would hammer the SD (wear + latency) for no real benefit —
+ * the UART already carries the live copy, and losing a few hundred ms of the
+ * SD mirror on a power drop is acceptable.
+ *
+ * CRITICAL: FATFS only updates a file's directory entry (its on-disk size) on
+ * f_close / f_sync. A bare fflush() only flushes the libc buffer down to the
+ * VFS; the file would then show as 0 bytes on the card. That is why the sync
+ * steps above use fflush() + fsync().
+ *
+ * Crash capture: this sink is a best-effort mirror. For the *cause* of a crash,
+ * enable ESP-IDF core dump to SD/UART (CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH)
+ * rather than hand-rolling a panic SD write (the SD/FATFS stack is unsafe in
+ * panic context).
  */
 #include "log_sink.h"
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <inttypes.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <dirent.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -22,23 +42,91 @@
 #include "sd.h"
 
 #define LOG_DIR        "/sdcard/logs"
-#define LOG_FILE       "/sdcard/logs/app.log"
-#define LOG_FILE_BAK   "/sdcard/logs/app.log.bak"
+#define LOG_NAME_PFX   "app_"
+#define LOG_NAME_MAX   64
+#define RING_FILES     5              /* keep at most this many session logs */
 #define STREAM_BYTES   (8 * 1024)
-#define LINE_CAP       (512 + 16)      /* must cover XM_LOG_BUF (512) */
+#define LINE_CAP       (512 + 16)     /* must cover XM_LOG_BUF (512) */
 #define FILE_CAP       (2 * 1024 * 1024)
+#define WRITE_BUF      (4 * 1024)     /* libc write buffer */
 #define RECV_MS        500
 
 static StreamBufferHandle_t s_stream;
 static FILE *s_fp;
 static size_t s_size;
 static bool s_active;
+static bool s_dirty;          /* unsynced writes since last fsync */
+static uint32_t s_seq;        /* current segment number */
 
 static void ensure_dir(void)
 {
     struct stat st;
     if (stat(LOG_DIR, &st) != 0) {
         mkdir(LOG_DIR, 0755);
+    }
+}
+
+/* Highest existing segment number in LOG_DIR (0 if none). Lets a new boot
+ * resume the sequence so filenames never collide with a previous session. */
+static uint32_t scan_max_seq(void)
+{
+    uint32_t max = 0;
+    DIR *d = opendir(LOG_DIR);
+    if (d == NULL) {
+        return 0;
+    }
+    struct dirent *e;
+    size_t pfx = strlen(LOG_NAME_PFX);
+    while ((e = readdir(d)) != NULL) {
+        size_t len = strlen(e->d_name);
+        if (len < pfx + 4 || strncmp(e->d_name, LOG_NAME_PFX, pfx) != 0) {
+            continue;
+        }
+        if (strcmp(e->d_name + len - 4, ".log") != 0) {
+            continue;
+        }
+        uint32_t v = (uint32_t)strtoul(e->d_name + pfx, NULL, 10);
+        if (v > max) {
+            max = v;
+        }
+    }
+    closedir(d);
+    return max;
+}
+
+/* Delete the oldest segment if the ring is full. Called before creating a new
+ * segment so the new one is never the one pruned. */
+static void prune_ring(void)
+{
+    uint32_t oldest = 0;
+    bool have = false;
+    int count = 0;
+    DIR *d = opendir(LOG_DIR);
+    if (d == NULL) {
+        return;
+    }
+    struct dirent *e;
+    size_t pfx = strlen(LOG_NAME_PFX);
+    while ((e = readdir(d)) != NULL) {
+        size_t len = strlen(e->d_name);
+        if (len < pfx + 4 || strncmp(e->d_name, LOG_NAME_PFX, pfx) != 0) {
+            continue;
+        }
+        if (strcmp(e->d_name + len - 4, ".log") != 0) {
+            continue;
+        }
+        uint32_t v = (uint32_t)strtoul(e->d_name + pfx, NULL, 10);
+        count++;
+        if (!have || v < oldest) {
+            oldest = v;
+            have = true;
+        }
+    }
+    closedir(d);
+    if (count >= RING_FILES && have) {
+        char path[LOG_NAME_MAX];
+        snprintf(path, sizeof(path), "%s/%s%04" PRIu32 ".log", LOG_DIR, LOG_NAME_PFX, oldest);
+        unlink(path);
     }
 }
 
@@ -56,20 +144,31 @@ static void fsync_fp(void)
 static void open_file(void)
 {
     ensure_dir();
-    s_fp = fopen(LOG_FILE, "ab");
+    if (s_seq == 0) {
+        s_seq = scan_max_seq() + 1;   /* first segment this boot */
+    } else {
+        s_seq++;                      /* new segment after rotation */
+    }
+    char path[LOG_NAME_MAX];
+    snprintf(path, sizeof(path), "%s/%s%04" PRIu32 ".log", LOG_DIR, LOG_NAME_PFX, s_seq);
+    prune_ring();
+
+    s_fp = fopen(path, "ab");
     if (s_fp == NULL) {
         s_active = false;
         return;
     }
-    fseek(s_fp, 0, SEEK_END);
+    setvbuf(s_fp, NULL, _IOFBF, WRITE_BUF);
     s_size = (size_t)ftell(s_fp);
     /* Session marker: proves the file opened. If this line is present but the
      * expected logs are not, the enqueue side is broken; if it is absent, the
      * open failed (card not mounted / dir unwritable). */
-    fputs("=== log session start ===\n", s_fp);
+    const char *base = strrchr(path, '/') + 1;
+    fprintf(s_fp, "=== log start: %s ===\n", base);
     fflush(s_fp);
     fsync_fp();
     s_size = (size_t)ftell(s_fp);
+    s_dirty = false;
     s_active = true;
 }
 
@@ -83,14 +182,14 @@ static void close_file(void)
     }
     s_active = false;
     s_size = 0;
+    s_dirty = false;
 }
 
-/* Rotate to a single backup once the file grows past FILE_CAP, so the card
- * never fills up from a log flood during a long debugging session. */
+/* Start a fresh segment once the current one grows past FILE_CAP, so a single
+ * long session can't fill the card. The ring keeps the newest RING_FILES. */
 static void rotate(void)
 {
     close_file();
-    rename(LOG_FILE, LOG_FILE_BAK);   /* overwrite previous backup */
     open_file();
 }
 
@@ -123,9 +222,14 @@ static void drain_task(void *arg)
         size_t got = xStreamBufferReceive(s_stream, buf, sizeof(buf),
                                           pdMS_TO_TICKS(RECV_MS));
         if (got == 0) {
-            /* Idle: flush + sync so a power drop loses at most ~500 ms. */
-            fflush(s_fp);
-            fsync_fp();
+            /* Idle: flush + sync only if we actually wrote since the last
+             * sync, so an idle drain task never pounds the FAT directory
+             * entry. A power drop loses at most ~RECV_MS of buffered lines. */
+            if (s_dirty) {
+                fflush(s_fp);
+                fsync_fp();
+                s_dirty = false;
+            }
             continue;
         }
 
@@ -137,8 +241,7 @@ static void drain_task(void *arg)
             continue;
         }
         s_size += wr;
-        fflush(s_fp);
-        fsync_fp();   /* keep the FAT directory entry (file size) current */
+        s_dirty = true;   /* synced later (idle / rotate / flush / close) */
         if (s_size >= FILE_CAP) {
             rotate();
         }
@@ -149,6 +252,18 @@ void log_sink_init(void)
 {
     s_stream = xStreamBufferCreate(STREAM_BYTES, 1);
     xTaskCreate(drain_task, "log_sink", 4096, NULL, 1, NULL);
+}
+
+/* Force any buffered logs to disk now. Call from error/critical paths so the
+ * "incident" lines are durable even if the device then resets. Best-effort. */
+void log_sink_flush(void)
+{
+    if (!s_active || s_fp == NULL) {
+        return;
+    }
+    fflush(s_fp);
+    fsync_fp();
+    s_dirty = false;
 }
 
 /* Called from the IRAM vprintf hook. Non-blocking: copies into the ring

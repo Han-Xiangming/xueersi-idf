@@ -946,71 +946,6 @@ static uint32_t s_tm_out_us;
 static uint32_t s_tm_frames;
 static int64_t  s_tm_last_log_us;
 
-/* --- Debug PCM peak meter (debug build aid) ------------------------------
- * A track can decode into perfectly valid-looking frames (healthy [TIMING]
- * cadence) while the sample values are silence — a file that decodes to zeros,
- * or a format the decoder mis-handles. The log cannot see sample values, so we
- * meter the decoded PCM here: track the per-bar peak (max |sample|), tally the
- * write results, and log ~1 s. This cleanly separates "source/decoder silence"
- * (peak ~ 0) from a DMA/output failure (peak high but no sound). Reset per
- * track where s_dbg_frames is reset below. */
-static int32_t  s_pk_peak;
-static int32_t  s_pk_raw_peak;   /* pre-DSP (raw decoder) peak, for split attribution */
-static uint32_t s_pk_frames;
-static uint32_t s_pk_ok;
-static uint32_t s_pk_stall;
-static uint32_t s_pk_aband;
-static int64_t  s_pk_last_us;
-
-static void dbg_peak(const int16_t *b, size_t n, audio_write_result_t wr)
-{
-    for (size_t i = 0; i < n; i++) {
-        int32_t a = b[i] < 0 ? -b[i] : b[i];
-        if (a > s_pk_peak) {
-            s_pk_peak = a;
-        }
-    }
-    s_pk_frames++;
-    if (wr == AUDIO_WRITE_OK) {
-        s_pk_ok++;
-    }
-    else if (wr == AUDIO_WRITE_STALLED) {
-        s_pk_stall++;
-    }
-    else {
-        s_pk_aband++;
-    }
-    const int64_t now = esp_timer_get_time();
-    if (now - s_pk_last_us > 1000000) {
-        ESP_LOGW(TAG,
-                 "[PCMDBG] peak=%d (%.1f%%) raw=%d (%.1f%%) frames=%u ok=%u stall=%u aband=%u "
-                 "name='%s'",
-                 (int)s_pk_peak, s_pk_peak * 100.0f / 32768.0f,
-                 (int)s_pk_raw_peak, s_pk_raw_peak * 100.0f / 32768.0f,
-                 (unsigned)s_pk_frames, (unsigned)s_pk_ok,
-                 (unsigned)s_pk_stall, (unsigned)s_pk_aband, s_name);
-        s_pk_peak = 0;
-        s_pk_raw_peak = 0;
-        s_pk_frames = 0;
-        s_pk_ok = 0;
-        s_pk_stall = 0;
-        s_pk_aband = 0;
-        s_pk_last_us = now;
-    }
-}
-
-/* Pre-DSP (raw decoder) peak, measured BEFORE hw_audio_write_pcm so we can
- * split the total attenuation between the decoder output and the DSP gain
- * chain (volume + ReplayGain + master + limiter). */
-static void dbg_peak_raw(const int16_t *b, size_t n)
-{
-    for (size_t i = 0; i < n; i++) {
-        int32_t a = b[i] < 0 ? -b[i] : b[i];
-        if (a > s_pk_raw_peak) {
-            s_pk_raw_peak = a;
-        }
-    }
-}
 
 /* Decode a single frame and stream it. Returns false on EOF/error. */
 static bool decode_frame(bool *rate_set)
@@ -1159,9 +1094,7 @@ static bool decode_frame(bool *rate_set)
         /* Stereo / multichannel: outputSamps is the total sample count, so the
          * number of stereo frames to write is outputSamps / 2. This is the path
          * every stereo/joint-stereo file takes. */
-        dbg_peak_raw(s_pcm, (size_t)info.outputSamps);
         wr = hw_audio_write_pcm(s_pcm, (size_t)(info.outputSamps / 2));
-        dbg_peak(s_pcm, (size_t)info.outputSamps, wr);
     }
     else if (info.nChans == 1) {
         /* Genuine mono output from the decoder: upmix to stereo by duplicating
@@ -1169,13 +1102,11 @@ static bool decode_frame(bool *rate_set)
          * mislabeled frame can never overflow s_stereo (MP3_PCM_MAX / 2 frames). */
         const int frames = (info.outputSamps < MP3_PCM_MAX / 2)
                                ? info.outputSamps : (MP3_PCM_MAX / 2);
-        dbg_peak_raw(s_pcm, (size_t)info.outputSamps);
         for (int i = 0; i < frames; i++) {
             s_stereo[2 * i] = s_pcm[i];
             s_stereo[2 * i + 1] = s_pcm[i];
         }
         wr = hw_audio_write_pcm(s_stereo, (size_t)frames);
-        dbg_peak(s_stereo, (size_t)(frames * 2), wr);
     }
     else {
         /* nChans == 0 (a malformed first frame some decoders report): there is
@@ -1348,8 +1279,6 @@ static void decode_loop(void)
             bool rate_set = false;
             int frame_cnt = 0;
             s_dbg_frames = 0;             /* reset debug frame counter */
-            s_pk_peak = 0; s_pk_raw_peak = 0; s_pk_frames = 0;
-            s_pk_ok = 0; s_pk_stall = 0; s_pk_aband = 0;
             while (!s_stop_req && !s_new_req) {
                 /* Decode-progress heartbeat for the stall watchdog: this
                  * runs once per frame, so while PLAYING a healthy pipeline
