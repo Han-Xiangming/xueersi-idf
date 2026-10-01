@@ -25,8 +25,24 @@ void hw_lcd_display_on(void);
 /* True once the first frame has been pushed to the panel. */
 bool hw_lcd_first_flush_done(void);
 
-/* Set backlight brightness as a percentage (0..100) via PWM on PIN_NUM_LCD_BL. */
+/* Number of discrete backlight levels (0..HW_LCD_BACKLIGHT_STEPS). The gamma
+ * LUT in lcd.c has HW_LCD_BACKLIGHT_STEPS + 1 entries. */
+#define HW_LCD_BACKLIGHT_STEPS   32
+
+/* Set backlight brightness as a percentage (0..100) via PWM on PIN_NUM_LCD_BL.
+ * Snapped to the nearest gamma level. Kept for config restore / legacy callers. */
 void hw_lcd_set_backlight(uint8_t percent);
+
+/* Step the backlight by delta levels (negative = dimmer) and apply it at once.
+ * Clamped to 0..HW_LCD_BACKLIGHT_STEPS. Returns the resulting brightness as a
+ * percentage (0..100), which the UI can persist straight to NVS. */
+uint8_t hw_lcd_step_backlight(int8_t delta);
+
+/* Set the backlight directly by level (0..HW_LCD_BACKLIGHT_STEPS). */
+void hw_lcd_set_backlight_step(uint8_t step);
+
+/* Current backlight level (0..HW_LCD_BACKLIGHT_STEPS). */
+uint8_t hw_lcd_get_backlight_step(void);
 
 /* Current backlight brightness as a percentage (0..100), or 0 before the
  * backlight has been initialised. */

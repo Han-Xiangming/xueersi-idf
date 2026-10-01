@@ -53,29 +53,36 @@ static volatile bool s_lcd_first_flush_done;
 
 /* Non-linear (gamma-corrected) brightness curve. Human perception of
  * brightness is roughly logarithmic, so a linear 0..100% -> 0..1023 duty
- * map makes low steps invisible and high steps jumpy. This 33-entry LUT
- * (index 0..32, i.e. 32 steps) is precomputed as:
- *     duty = round(BL_DUTY_MAX * (i / 32)^2.2)
- * so equal percentage steps feel uniform to the eye. */
-#define BL_LUT_STEPS          32
+ * map makes low steps invisible and high steps jumpy. This (BL_LUT_STEPS+1)
+ * entry LUT (index 0..BL_LUT_STEPS, i.e. BL_LUT_STEPS levels) is precomputed
+ * as:
+ *     duty = round(BL_DUTY_MAX * (i / BL_LUT_STEPS)^2.2)
+ * so equal percentage steps feel uniform to the eye. BL_LUT_STEPS mirrors the
+ * public HW_LCD_BACKLIGHT_STEPS in lcd.h. */
+#define BL_LUT_STEPS          HW_LCD_BACKLIGHT_STEPS
 static const uint16_t s_bl_lut[BL_LUT_STEPS + 1] = {
     0, 0, 2, 6, 11, 17, 26, 36, 48, 63, 79, 98, 118, 141, 166, 193,
     223, 255, 289, 326, 364, 406, 449, 494, 543, 593, 646, 701, 764, 820,
     887, 957, 1023
 };
 
-/* Map a 0..100 % brightness to a 10-bit LEDC duty via the gamma LUT. */
-static inline uint32_t bl_percent_to_duty(uint8_t percent)
+/* Map a 0..100 % brightness to the nearest LUT level (0..BL_LUT_STEPS). */
+static inline uint8_t bl_percent_to_step(uint8_t percent)
 {
     if (percent > 100) {
         percent = 100;
     }
-    const uint8_t idx = (uint8_t)(((uint16_t)percent * BL_LUT_STEPS + 50) / 100);
-    return s_bl_lut[idx];
+    return (uint8_t)(((uint16_t)percent * BL_LUT_STEPS + 50) / 100);
+}
+
+/* Map a 0..100 % brightness to a 10-bit LEDC duty via the gamma LUT. */
+static inline uint32_t bl_percent_to_duty(uint8_t percent)
+{
+    return s_bl_lut[bl_percent_to_step(percent)];
 }
 
 static bool s_bl_inited;
-static uint8_t s_bl_percent = 100;   /* last set brightness, for hw_lcd_get_backlight */
+static uint8_t s_bl_step = BL_LUT_STEPS;   /* current level 0..BL_LUT_STEPS, full by default */
 
 /* Flush completion tracking. lvgl_flush_cb() queues one tx_color per row
  * (see below); every queued transfer produces one lcd_flush_ready_cb() from
@@ -433,24 +440,67 @@ static void backlight_init(void)
     s_bl_inited = true;
 }
 
-/* Set backlight brightness as a percentage (0..100). Clamped to range. */
+/* Set backlight brightness as a percentage (0..100). Clamped to range and
+ * snapped to the nearest gamma level. Kept for config restore / legacy callers. */
 void hw_lcd_set_backlight(uint8_t percent)
 {
-    if (percent > 100) {
-        percent = 100;
-    }
     if (!s_bl_inited) {
         backlight_init();
     }
-    s_bl_percent = percent;            /* remember for hw_lcd_get_backlight */
-    const uint32_t duty = bl_percent_to_duty(percent);
+    s_bl_step = bl_percent_to_step(percent);
+    const uint32_t duty = s_bl_lut[s_bl_step];
     ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, duty));
     ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL));
 }
 
+/* Step the backlight by delta levels (negative = dimmer) and apply it
+ * immediately. Clamped to 0..BL_LUT_STEPS. Returns the resulting brightness
+ * as a percentage (0..100), which the UI can persist straight to NVS. */
+uint8_t hw_lcd_step_backlight(int8_t delta)
+{
+    if (!s_bl_inited) {
+        backlight_init();
+    }
+    int step = (int)s_bl_step + (int)delta;
+    if (step < 0) {
+        step = 0;
+    } else if (step > BL_LUT_STEPS) {
+        step = BL_LUT_STEPS;
+    }
+    s_bl_step = (uint8_t)step;
+    const uint32_t duty = s_bl_lut[s_bl_step];
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, duty));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL));
+    return (uint8_t)(((uint16_t)s_bl_step * 100 + (BL_LUT_STEPS / 2)) / BL_LUT_STEPS);
+}
+
+/* Set the backlight directly by level (0..BL_LUT_STEPS). */
+void hw_lcd_set_backlight_step(uint8_t step)
+{
+    if (step > BL_LUT_STEPS) {
+        step = BL_LUT_STEPS;
+    }
+    if (!s_bl_inited) {
+        backlight_init();
+    }
+    s_bl_step = step;
+    const uint32_t duty = s_bl_lut[s_bl_step];
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, duty));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL));
+}
+
+/* Current backlight level (0..BL_LUT_STEPS). */
+uint8_t hw_lcd_get_backlight_step(void)
+{
+    return s_bl_inited ? s_bl_step : 0;
+}
+
 uint8_t hw_lcd_get_backlight(void)
 {
-    return s_bl_inited ? s_bl_percent : 0;
+    if (!s_bl_inited) {
+        return 0;
+    }
+    return (uint8_t)(((uint16_t)s_bl_step * 100 + (BL_LUT_STEPS / 2)) / BL_LUT_STEPS);
 }
 
 bool hw_lcd_first_flush_done(void)
@@ -492,10 +542,10 @@ void hw_lcd_activity(void)
             st7789_delay_ms(20);
         }
         /* Restore the user-configured brightness (PWM duty). */
-        const uint32_t duty = bl_percent_to_duty(s_bl_percent);
+        const uint32_t duty = s_bl_lut[s_bl_step];
         ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, duty));
         ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL));
-        ESP_LOGI(TAG, "Screen wake (backlight %u%%)", s_bl_percent);
+        ESP_LOGI(TAG, "Screen wake (backlight %u/%u)", s_bl_step, BL_LUT_STEPS);
     }
 }
 

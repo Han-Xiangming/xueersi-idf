@@ -877,12 +877,11 @@ static void ui_set_gain_lr(int dir)
 
 static void ui_set_bl_lr(int dir)
 {
-    /* 1% steps within 0..10, else 5% steps. */
-    int v = (int)s_backlight;
-    int step = (v <= 10) ? 1 : 5;
-    v += dir * step;
-    s_backlight = (uint8_t)MAX(0, MIN(v, 100));
-    hw_lcd_set_backlight(s_backlight);
+    /* Step by one gamma level per press (HW_LCD_BACKLIGHT_STEPS levels total).
+     * Each press is guaranteed to change the brightness, and equal presses
+     * feel uniform to the eye. Holding the key auto-repeats this callback,
+     * giving natural acceleration. The returned percentage is what we persist. */
+    s_backlight = hw_lcd_step_backlight((int8_t)dir);
     ui_settings_mark_dirty(SETTINGS_DIRTY_BACKL);
 }
 
