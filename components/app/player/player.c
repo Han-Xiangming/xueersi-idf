@@ -243,6 +243,22 @@ static TaskHandle_t s_watch_task;   /* decode-stall watchdog (see player_watch_t
  * player_rescan() / SD remount remain the explicit invalidation paths. */
 static bool s_pub_is_whole_card;   /* published snapshot == whole-card list */
 
+/* SD card "generation": bumped whenever the card is (re)mounted so an
+ * in-memory whole-card snapshot can be invalidated WITHOUT a synchronous
+ * FATFS walk on the UI task. s_loaded_sd_epoch records the generation under
+ * which the current whole-card snapshot was published; a mismatch means the
+ * card changed and the cache must be re-validated before the in-memory list
+ * is trusted. This is what lets player re-entry skip the signature walk
+ * entirely (the old code re-validated on every entry, stalling the UI). */
+static uint32_t s_sd_epoch;
+static uint32_t s_loaded_sd_epoch;
+
+/* Pending scan request kind. true => whole-card, cache preferred (try the
+ * on-card cache, fall back to a real scan). false => scan the folder in
+ * s_load_root (incl. the forced whole-card scan used by player_rescan()).
+ * The signature walk / cache load runs on the scan_task, never the UI task. */
+static bool s_req_cache;
+
 /* How many directory levels below PLAYER_ROOT the source signature samples.
  * 2 => root + its subdirs + their subdirs' entries are all hashed (file
  * mtimes included), so a song added anywhere within two levels is detected.
@@ -453,6 +469,11 @@ static void player_load_folder(const char *root)
     /* Remember what we just published: the whole-card list only when the
      * scan root was the card root (drives the whole-card cache reuse). */
     s_pub_is_whole_card = (strcmp(root, PLAYER_ROOT) == 0);
+    if (s_pub_is_whole_card) {
+        /* Stamp the SD generation so a later player re-entry knows this
+         * snapshot is current for the card that's plugged in now. */
+        s_loaded_sd_epoch = s_sd_epoch;
+    }
     /* The on-card cache represents the WHOLE-CARD list only. A sub-folder
      * browse must NOT overwrite it, or the next player entry (which always
      * loads the cache as "整卡") would show the wrong list. Persist the
@@ -480,7 +501,21 @@ static void scan_task(void *arg)
         s_scan_busy = true;
         do {
             s_scan_pending = false;
-            player_load_folder(s_load_root);
+            if (s_req_cache) {
+                /* Whole-card load, cache preferred. playlist_load_from_cache()
+                 * does the (bounded) source-signature walk itself — but here
+                 * it runs on THIS task, NOT the LVGL UI task, so a player
+                 * re-entry never stalls the UI. On a miss / stale cache it
+                 * returns 0 and we fall through to a real whole-card scan
+                 * (which rewrites the cache). */
+                playlist_t *work =
+                    (s_playlist == &s_pl_a) ? &s_pl_b : &s_pl_a;
+                if (playlist_load_from_cache(work) == 0) {
+                    player_load_folder(PLAYER_ROOT);
+                }
+            } else {
+                player_load_folder(s_load_root);
+            }
         } while (s_scan_pending);   /* a request landed mid-load: redo */
         s_scan_busy = false;
     }
@@ -498,24 +533,13 @@ void player_load(playlist_src_t src, const char *root)
     if (root == NULL) {
         root = PLAYER_ROOT;
     }
-    /* Whole-card requests are served from the on-card cache (or the
-     * in-memory snapshot) instead of a full FATFS walk: the cache IS the
-     * whole-card list, and staleness is detected by the source-signature
-     * check (playlist_cache_valid()) — so a card changed while powered off is
-     * transparently re-scanned. An explicit rescan / SD remount still force
-     * it. Only a sub-folder request needs a real scan. */
-    if (strcmp(root, PLAYER_ROOT) == 0 && !s_scan_busy && !s_scan_pending) {
-        if (s_pub_is_whole_card && playlist_cache_valid()) {
-            return;   /* already showing the fresh whole-card list */
-        }
-        playlist_t *work = (s_playlist == &s_pl_a) ? &s_pl_b : &s_pl_a;
-        if (playlist_load_from_cache(work) > 0) {
-            return;   /* served from cache; no walk needed */
-        }
-        /* Cache unusable: fall through to a real scan (which rewrites it). */
-    }
+    /* Sub-folder (and forced whole-card) requests are handed straight to the
+     * background scan_task — no synchronous SD I/O here. The whole-card
+     * cache-preferred path is player_scan_with_cache() (s_req_cache = true);
+     * this function always does a real folder scan. */
     strncpy(s_load_root, root, sizeof(s_load_root) - 1);
     s_load_root[sizeof(s_load_root) - 1] = '\0';
+    s_req_cache = false;
     s_scan_pending = true;
     if (s_scan_task != NULL) {
         xTaskNotifyGive(s_scan_task);
@@ -1652,6 +1676,7 @@ static int playlist_load_from_cache(playlist_t *work)
     snprintf(s_src_name, sizeof(s_src_name), "整卡");
     playlist_publish(work, n, PL_SRC_FOLDER);
     s_pub_is_whole_card = true;
+    s_loaded_sd_epoch = s_sd_epoch;   /* cache mirrors the current card */
     ESP_LOGI(TAG, "loaded %d entries from cache %s", n, PLAYER_CACHE_FILE);
     return n;
 }
@@ -1673,22 +1698,25 @@ void player_scan_with_cache(void)
     if (s_scan_busy || s_scan_pending) {
         return;
     }
-    /* In-memory snapshot reuse: the published list is already the fresh
-     * whole-card list (cache valid — source signature matches — since it was
-     * loaded or written), so a player re-entry needs no SD I/O and no
-     * re-publish — no version bump, no UI repaint churn. */
-    if (s_pub_is_whole_card && playlist_cache_valid()) {
+    /* Fast path: the in-memory snapshot is already the whole-card list built
+     * for the CURRENT SD card (the generation matches), so it is authoritative
+     * — no SD I/O and NO source-signature walk. This is what makes a player
+     * re-entry instant instead of blocking the LVGL task on a synchronous
+     * FATFS walk (the old playlist_cache_valid() call here caused the stutter
+     * when pressing A). The walk only runs on boot / after a card change. */
+    if (s_pub_is_whole_card && s_loaded_sd_epoch == s_sd_epoch) {
         return;
     }
-    playlist_t *work = (s_playlist == &s_pl_a) ? &s_pl_b : &s_pl_a;
-    int n = playlist_load_from_cache(work);
-    if (n == 0) {
-        /* No usable cache: do a real background scan; scan_task writes the
-         * cache on completion. Use the whole-card root. */
-        ESP_LOGI(TAG, "no cache, scanning SD");
-        player_load(PL_SRC_FOLDER, PLAYER_ROOT);
+    /* Otherwise (first boot, or the card changed since we last loaded) defer
+     * the potentially-expensive cache validation + load to the background scan
+     * task. It tries the on-card cache (a cheap read) and only does the bounded
+     * signature walk / full scan if the cache is stale or absent — never on
+     * the UI task. The UI shows "加载中" until the list publishes. */
+    s_req_cache = true;
+    s_scan_pending = true;
+    if (s_scan_task != NULL) {
+        xTaskNotifyGive(s_scan_task);
     }
-    /* Else: cache published instantly; nothing else to do. */
 }
 
 void player_rescan(void)
@@ -1697,6 +1725,17 @@ void player_rescan(void)
     unlink(PLAYER_CACHE_FILE);
     ESP_LOGI(TAG, "forced rescan of SD");
     player_load(PL_SRC_FOLDER, PLAYER_ROOT);
+}
+
+void player_notify_sd_remount(void)
+{
+    /* The card changed (removed / reinserted / a different card). Bump the
+     * generation so player_scan_with_cache()'s fast path is skipped and the
+     * next whole-card load re-validates the cache against the NEW card. We do
+     * NOT walk here — that stays on the background scan_task. Idempotent-ish:
+     * repeated calls just keep the epoch ahead of s_loaded_sd_epoch until the
+     * next successful whole-card publish. */
+    s_sd_epoch++;
 }
 
 player_state_t player_state(void)

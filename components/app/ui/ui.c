@@ -1461,6 +1461,7 @@ static bool ui_external_changed(void)
             ui_discover_ebook_sources();
             s_paint_eb_src_sel = -1;
         }
+        player_notify_sd_remount();   /* card changed: invalidate old snapshot */
         player_scan_with_cache();   /* prefer cache; scan only if absent */
         /* A background scan may now be running; if we're showing the track
          * list, suppress the stale rows until it publishes (same guard as

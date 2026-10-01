@@ -155,6 +155,13 @@ void player_scan_with_cache(void);
  * scan never leaves a half-stale cache behind. */
 void player_rescan(void);
 
+/* Tell the player the SD card was (re)mounted / swapped. Bumps an internal
+ * generation so the next whole-card load re-validates the on-card cache
+ * against the NEW card instead of trusting a stale in-memory snapshot. Cheap
+ * and non-blocking; the actual re-validation is deferred to the background
+ * scan task. Call this from the SD hotplug handler. */
+void player_notify_sd_remount(void);
+
 /* True if a readable playlist cache exists on the SD card right now. The UI
  * uses this to label the refresh affordance ("有缓存" vs "无缓存"). */
 bool player_cache_exists(void);
