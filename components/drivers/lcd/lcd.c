@@ -50,6 +50,30 @@ static volatile bool s_lcd_first_flush_done;
 #define BL_LEDC_SPEED_HZ      5000
 #define BL_LEDC_DUTY_RES      LEDC_TIMER_10_BIT   /* 0..1023 */
 #define BL_DUTY_MAX           ((1 << 10) - 1)
+
+/* Non-linear (gamma-corrected) brightness curve. Human perception of
+ * brightness is roughly logarithmic, so a linear 0..100% -> 0..1023 duty
+ * map makes low steps invisible and high steps jumpy. This 33-entry LUT
+ * (index 0..32, i.e. 32 steps) is precomputed as:
+ *     duty = round(BL_DUTY_MAX * (i / 32)^2.2)
+ * so equal percentage steps feel uniform to the eye. */
+#define BL_LUT_STEPS          32
+static const uint16_t s_bl_lut[BL_LUT_STEPS + 1] = {
+    0, 0, 2, 6, 11, 17, 26, 36, 48, 63, 79, 98, 118, 141, 166, 193,
+    223, 255, 289, 326, 364, 406, 449, 494, 543, 593, 646, 701, 764, 820,
+    887, 957, 1023
+};
+
+/* Map a 0..100 % brightness to a 10-bit LEDC duty via the gamma LUT. */
+static inline uint32_t bl_percent_to_duty(uint8_t percent)
+{
+    if (percent > 100) {
+        percent = 100;
+    }
+    const uint8_t idx = (uint8_t)(((uint16_t)percent * BL_LUT_STEPS + 50) / 100);
+    return s_bl_lut[idx];
+}
+
 static bool s_bl_inited;
 static uint8_t s_bl_percent = 100;   /* last set brightness, for hw_lcd_get_backlight */
 
@@ -419,7 +443,7 @@ void hw_lcd_set_backlight(uint8_t percent)
         backlight_init();
     }
     s_bl_percent = percent;            /* remember for hw_lcd_get_backlight */
-    const uint32_t duty = (BL_DUTY_MAX * percent) / 100;
+    const uint32_t duty = bl_percent_to_duty(percent);
     ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, duty));
     ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL));
 }
@@ -468,7 +492,7 @@ void hw_lcd_activity(void)
             st7789_delay_ms(20);
         }
         /* Restore the user-configured brightness (PWM duty). */
-        const uint32_t duty = (BL_DUTY_MAX * s_bl_percent) / 100;
+        const uint32_t duty = bl_percent_to_duty(s_bl_percent);
         ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, duty));
         ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL));
         ESP_LOGI(TAG, "Screen wake (backlight %u%%)", s_bl_percent);
