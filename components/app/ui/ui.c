@@ -19,6 +19,7 @@
 #include "lcd.h"
 #include "sd.h"
 #include "ui.h"
+#include "ui_strings.h"
 #include "player.h"
 #include "ebook.h"
 
@@ -123,14 +124,14 @@ typedef struct {
 } setting_entry_t;
 
 static const setting_entry_t s_settings_table[SETTING_COUNT] = {
-    [SETTING_VOLUME]      = {"音量",    ui_set_vol_text,   ui_set_vol_lr,   NULL},
-    [SETTING_MASTER_GAIN] = {"总增益",  ui_set_gain_text,  ui_set_gain_lr,  NULL},
-    [SETTING_BACKLIGHT]   = {"背光",    ui_set_bl_text,    ui_set_bl_lr,    NULL},
+    [SETTING_VOLUME]      = {UI_STR_SET_VOL,    ui_set_vol_text,   ui_set_vol_lr,   NULL},
+    [SETTING_MASTER_GAIN] = {UI_STR_SET_GAIN,  ui_set_gain_text,  ui_set_gain_lr,  NULL},
+    [SETTING_BACKLIGHT]   = {UI_STR_SET_BACKLIGHT,    ui_set_bl_text,    ui_set_bl_lr,    NULL},
     [SETTING_BTOUT]       = {"蓝牙",    ui_set_bt_text,    ui_set_bt_lr,    ui_set_bt_enter},
-    [SETTING_STANDBY]     = {"息屏",    ui_set_sleep_text, ui_set_sleep_lr, NULL},
-    [SETTING_RESCAN]      = {"重建播放列表", ui_set_rescan_text, NULL,       ui_set_rescan_enter},
-    [SETTING_RESET]       = {"重置NVS", ui_set_reset_text, NULL,             ui_set_reset_enter},
-    [SETTING_CLEAR_PROG]  = {"清除阅读进度", ui_set_clear_text, NULL,        ui_set_clear_enter},
+    [SETTING_STANDBY]     = {UI_STR_SET_STANDBY,    ui_set_sleep_text, ui_set_sleep_lr, NULL},
+    [SETTING_RESCAN]      = {UI_STR_SET_RESCAN, ui_set_rescan_text, NULL,       ui_set_rescan_enter},
+    [SETTING_RESET]       = {UI_STR_SET_RESET, ui_set_reset_text, NULL,             ui_set_reset_enter},
+    [SETTING_CLEAR_PROG]  = {UI_STR_SET_CLEAR_PROG, ui_set_clear_text, NULL,        ui_set_clear_enter},
 };
 
 /* Backlight brightness (0..100 %), driven via PWM on PIN_NUM_LCD_BL.
@@ -833,7 +834,7 @@ static const char *ui_set_sleep_text(void)
 {
     static char buf[24];
     if (s_standby_opt == STANDBY_OPT_NEVER) {
-        snprintf(buf, sizeof(buf), "永不");
+        snprintf(buf, sizeof(buf), UI_STR_NEVER);
     } else {
         snprintf(buf, sizeof(buf), "%u秒",
                  (unsigned)s_standby_opts[s_standby_opt]);
@@ -849,13 +850,13 @@ static const char *ui_set_rescan_text(void)
      * full-card scan that rewrites the cache. s_cache_present is refreshed
      * only when the scan version changes (in the refresh loop), never
      * per-frame. */
-    snprintf(buf, sizeof(buf), s_cache_present ? "有缓存" : "无缓存");
+    snprintf(buf, sizeof(buf), s_cache_present ? UI_STR_CACHE_YES : UI_STR_CACHE_NO);
     return buf;
 }
 
 static const char *ui_set_reset_text(void)
 {
-    return "按A还原";
+    return UI_STR_RESTORE;
 }
 
 /* Left/right adjust callbacks. Each owns its dirty-mark + set_action. */
@@ -930,14 +931,14 @@ static void ui_set_rescan_enter(void)
      * scan. The scan is asynchronous; the player falls back to a real scan
      * whenever the cache is absent, so this is safe even while playing. */
     player_rescan();
-    set_action("重建中...");
+    set_action(UI_STR_RESCANNING);
 }
 
 static void ui_set_reset_enter(void)
 {
     /* Restore NVS to factory defaults: wipe the whole NVS partition and
      * reboot. Boot will re-create every setting at its default. */
-    set_action("重置中...");
+    set_action(UI_STR_RESETTING);
     ui_refresh();
     nvs_flash_erase();
     esp_restart();
@@ -945,7 +946,7 @@ static void ui_set_reset_enter(void)
 
 static const char *ui_set_clear_text(void)
 {
-    return "按A清除";
+    return UI_STR_CLEAR_A;
 }
 
 static void ui_set_clear_enter(void)
@@ -953,7 +954,7 @@ static void ui_set_clear_enter(void)
     /* Wipe all saved reading positions (v2 + legacy v1) so books that were
      * resuming to the wrong place start fresh at page 1. */
     ebook_progress_clear_all();
-    set_action("已清除进度");
+    set_action(UI_STR_CLEARED);
     ui_refresh();
 }
 
@@ -989,7 +990,7 @@ static void ui_build_settings(lv_obj_t *page)
         s_ui.set_value[i] = val;
     }
 
-    s_ui.hint = ui_label(page, "上/下选 A进入 左/右设 B返回", 204,
+    s_ui.hint = ui_label(page, UI_STR_HINT_NAV_LR, 204,
                          UI_GRAY, &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
 }
 
@@ -1065,8 +1066,8 @@ static void ui_build_player(lv_obj_t *page)
         s_ui.pl_text[i] = txt;
     }
 
-    s_ui.pl_prog = ui_label(page, "选择来源", 196, UI_GRAY, &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
-    s_ui.hint = ui_label(page, "上/下选 A进入 B返回", 214, UI_GRAY, &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
+    s_ui.pl_prog = ui_label(page, UI_STR_SEL_MUSIC, 196, UI_GRAY, &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
+    s_ui.hint = ui_label(page, UI_STR_HINT_NAV, 214, UI_GRAY, &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
 }
 
 /* Bluetooth page: entering it kicks off a scan; the list fills live. */
@@ -1168,9 +1169,9 @@ static void ui_build_ebook_list(lv_obj_t *page)
         s_ui.eb_text[i] = txt;
     }
 
-    s_ui.eb_status = ui_label(page, "选择阅读来源", 196, UI_GRAY,
+    s_ui.eb_status = ui_label(page, UI_STR_SEL_EBOOK, 196, UI_GRAY,
                               &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
-    s_ui.hint = ui_label(page, "上/下选 A进入 B返回", 214, UI_GRAY,
+    s_ui.hint = ui_label(page, UI_STR_HINT_NAV, 214, UI_GRAY,
                          &lv_font_cn_16, LV_TEXT_ALIGN_CENTER);
 }
 
@@ -1617,13 +1618,13 @@ static int ui_label_width_px(const char *s)
 }
 
 /* Short name of the current repeat mode for the status texts and the
- * floating-panel 循环 button: "单曲" / "列表" / "随机". */
+ * floating-panel 循环 button: UI_STR_REPEAT_ONE / UI_STR_REPEAT_LIST / UI_STR_REPEAT_RANDOM. */
 static const char *ui_repeat_text(void)
 {
     switch (player_repeat_mode()) {
-    case PLAYER_REPEAT_ONE:    return "单曲";
-    case PLAYER_REPEAT_RANDOM: return "随机";
-    default:                   return "列表";
+    case PLAYER_REPEAT_ONE:    return UI_STR_REPEAT_ONE;
+    case PLAYER_REPEAT_RANDOM: return UI_STR_REPEAT_RANDOM;
+    default:                   return UI_STR_REPEAT_LIST;
     }
 }
 
@@ -1631,19 +1632,19 @@ static bool s_panel_open;
 static int  s_panel_sel;   /* 0..4, index into the five controls */
 
 static const char *const s_panel_labels[PLAYER_PANEL_NBTN] = {
-    "上一曲", "播放", "下一曲", "停止", "循环",
+    UI_STR_PREV, UI_STR_PLAY, UI_STR_NEXT, UI_STR_STOP, UI_STR_LOOP,
 };
 /* The play/pause button label is state-dependent (player-page convention:
- * "暂停" while playing, "继续" while paused); the repeat button shows the
- * current mode ("单曲"/"列表"/"随机") so pressing it reads as "cycle to the
+ * UI_STR_PAUSE while playing, UI_STR_RESUME while paused); the repeat button shows the
+ * current mode (UI_STR_REPEAT_ONE/UI_STR_REPEAT_LIST/UI_STR_REPEAT_RANDOM) so pressing it reads as "cycle to the
  * next mode". */
 static const char *ui_panel_btn_text(int i)
 {
     if (i == 1) {
         switch (player_state()) {
-        case PLAYER_PLAYING: return "暂停";
-        case PLAYER_PAUSED:  return "继续";
-        default:             return "播放";
+        case PLAYER_PLAYING: return UI_STR_PAUSE;
+        case PLAYER_PAUSED:  return UI_STR_RESUME;
+        default:             return UI_STR_PLAY;
         }
     }
     if (i == 4) {
@@ -1659,7 +1660,7 @@ static const char *ui_panel_btn_text(int i)
  *   row 1: track name (left) + ">>列表"/"||单曲"/"--随机" (right)
  *   row 2: five controls, laid out from the exact label widths with a
  *          uniform 12 px gap, centered in the panel
- *   row 3: hint "左/右选 A确认 B关闭" */
+ *   row 3: hint UI_STR_HINT_PANEL */
 static void ui_build_player_panel(void)
 {
     lv_obj_t *panel = lv_obj_create(lv_screen_active());
@@ -1726,7 +1727,7 @@ static void ui_build_player_panel(void)
     }
 
     lv_obj_t *hint = lv_label_create(panel);
-    lv_label_set_text(hint, "左/右选 A确认 B关闭");
+    lv_label_set_text(hint, UI_STR_HINT_PANEL);
     lv_label_set_long_mode(hint, LV_LABEL_LONG_MODE_CLIP);
     lv_obj_set_pos(hint, 10, 104);
     /* Fixed height instead of LV_SIZE_CONTENT: the size would be computed
@@ -1750,7 +1751,7 @@ static void ui_refresh_player_panel(void)
 
     static char s_panel_name_buf[MP3_NAME_LEN + 8];
     if (st == PLAYER_IDLE) {
-        snprintf(s_panel_name_buf, sizeof(s_panel_name_buf), "未播放");
+        snprintf(s_panel_name_buf, sizeof(s_panel_name_buf), UI_STR_NOT_PLAYING);
     }
     else {
         snprintf(s_panel_name_buf, sizeof(s_panel_name_buf), "%s",
@@ -1778,28 +1779,28 @@ static void ui_panel_activate(void)
     case 0:   /* 上一曲 */
         if (player_state() != PLAYER_IDLE) {
             player_prev();
-            set_action("上一曲");
+            set_action(UI_STR_PREV);
         }
         else {
-            set_action("未播放");
+            set_action(UI_STR_NOT_PLAYING);
         }
         break;
     case 1:   /* 播放 / 暂停 / 继续 */
         if (player_state() != PLAYER_IDLE) {
             player_toggle();
-            set_action(player_state() == PLAYER_PLAYING ? "播放中" : "已暂停");
+            set_action(player_state() == PLAYER_PLAYING ? UI_STR_PLAYING : UI_STR_PAUSED);
         }
         else {
-            set_action("未播放");
+            set_action(UI_STR_NOT_PLAYING);
         }
         break;
     case 2:   /* 下一曲 */
         if (player_state() != PLAYER_IDLE) {
             player_next();
-            set_action("下一曲");
+            set_action(UI_STR_NEXT);
         }
         else {
-            set_action("未播放");
+            set_action(UI_STR_NOT_PLAYING);
         }
         break;
     case 4:   /* 循环: 切换播放模式 (列表循环 -> 单曲循环 -> 随机 -> 列表...).
@@ -1807,14 +1808,14 @@ static void ui_panel_activate(void)
                * the next one. */
         player_repeat_toggle();
         set_action(player_repeat_mode() == PLAYER_REPEAT_ONE
-                       ? "已切换单曲循环"
+                       ? UI_STR_LOOP_ONE
                        : player_repeat_mode() == PLAYER_REPEAT_RANDOM
-                             ? "已切换随机播放" : "已切换列表循环");
+                             ? UI_STR_LOOP_RANDOM : UI_STR_LOOP_LIST);
         break;
     default:  /* 停止 */
         if (player_state() != PLAYER_IDLE) {
             player_stop();
-            set_action("已停止");
+            set_action(UI_STR_STOPPED);
         }
         break;
     }
@@ -1998,7 +1999,7 @@ void ui_refresh(void)
         if (sel_changed) {
             s_paint_set_sel = s_setting_sel;
         }
-        ui_set_hint("上/下选 A进入 B返回");
+        ui_set_hint(UI_STR_HINT_NAV);
         break;
     }
     case UI_PAGE_PLAYER: {
@@ -2042,8 +2043,8 @@ void ui_refresh(void)
                 s_paint_mp3_top = top;
             }
             ui_label_set(s_ui.status, "--");
-            ui_pl_prog("选择播放来源", false);
-            ui_set_hint("上/下选 A进入 B返回");
+            ui_pl_prog(UI_STR_SEL_MUSIC, false);
+            ui_set_hint(UI_STR_HINT_NAV);
             break;
         }
 
@@ -2145,7 +2146,7 @@ void ui_refresh(void)
         ui_label_set(s_ui.status, stbuf);
         if (st == PLAYER_IDLE) {
             if (player_scan_busy()) {
-                ui_pl_prog("加载中...", false);
+                ui_pl_prog(UI_STR_LOADING, false);
             }
             else {
                 const char *idle_msg = s_mp3_count
@@ -2165,13 +2166,13 @@ void ui_refresh(void)
             ui_refresh_prog_marquee();
         }
         if (st == PLAYER_PLAYING) {
-            ui_set_hint("左/右切歌 上/下音量 A暂停 Select循环");
+            ui_set_hint(UI_STR_HINT_SEEK_PLAY);
         }
         else if (st == PLAYER_PAUSED) {
-            ui_set_hint("左/右切歌 上/下音量 A继续 Select循环");
+            ui_set_hint(UI_STR_HINT_SEEK_PAUSE);
         }
         else {
-            ui_set_hint("左/右切歌 上/下选择 A播放 Select循环");
+            ui_set_hint(UI_STR_HINT_SEEK_IDLE);
         }
         /* Sticky playback-error toast: while an error is set and nothing is
          * playing, re-arm the toast every refresh so the hint row keeps
@@ -2328,8 +2329,8 @@ void ui_refresh(void)
                 s_paint_eb_src_sel = s_eb_src_sel;
                 s_paint_eb_src_top = top;
             }
-            ui_label_set(s_ui.eb_status, "选择阅读来源");
-            ui_set_hint("上/下选 A进入 B返回");
+            ui_label_set(s_ui.eb_status, UI_STR_SEL_EBOOK);
+            ui_set_hint(UI_STR_HINT_NAV);
             break;
         }
 
@@ -2403,7 +2404,7 @@ void ui_refresh(void)
                      ebook_current_src_name(), count);
             ui_label_set(s_ui.eb_status, buf);
         }
-        ui_set_hint("上/下选 A打开 B返回");
+        ui_set_hint(UI_STR_HINT_EBOOK_OPEN);
         break;
     }
     case UI_PAGE_EBOOK_READ: {
@@ -2486,17 +2487,17 @@ static void ui_action(void)
             break;
         }
         if (s_mp3_count == 0) {
-            set_action(player_scan_busy() ? "加载中..." : "无MP3文件");
+            set_action(player_scan_busy() ? UI_STR_LOADING : "无MP3文件");
             break;
         }
         if (player_state() == PLAYER_PLAYING || player_state() == PLAYER_PAUSED) {
             /* Feedback first, then the toggle: the message anticipates the
              * flipped state (toggle always flips). */
-            set_action(player_state() == PLAYER_PLAYING ? "已暂停" : "播放中");
+            set_action(player_state() == PLAYER_PLAYING ? UI_STR_PAUSED : UI_STR_PLAYING);
             player_toggle();
         }
         else {
-            set_action("播放中");
+            set_action(UI_STR_PLAYING);
             /* 直接用 UI 已知的下标起播，跳过 player_play() 内的路径回查：保证
              * s_index 从第一首起就恒为有效显式下标，避免极端情况下（列表被扫描
              * 任务换源/重排）路径回查失败导致 s_index=-1，进而连播/切歌算错。 */
@@ -2523,7 +2524,7 @@ static void ui_action(void)
         break;
     case UI_PAGE_SETTINGS: {
         /* A press dispatches to the selected item's on_enter callback. Action
-         * items (重建列表 / 重置NVS) do their work there; the 蓝牙 item opens
+         * items (刷新播放列表 / 恢复出厂设置) do their work there; the 蓝牙 item opens
          * the Bluetooth management screen. Items with no on_enter are inert. */
         const setting_entry_t *e = &s_settings_table[s_setting_sel];
         if (e->on_enter) {
