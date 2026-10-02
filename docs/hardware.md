@@ -72,13 +72,13 @@ esp_log_level_set("BT_L2CAP", WARN)     降噪（BT 拥塞回调日志泛滥，�
   → nvs_flash_init
   → hw_buttons_init()        GPIO + 消抖
   → hw_lcd_init()            SPI/panel/ST7789 初始化
-  → hw_audio_init()          I2S + MAX98357（直写 DMA，无 feed 任务）
+  → hw_audio_init()          I2S + MAX98357（8KB ring + i2s_wr 写任务）
   → bluetooth_audio_init()          环形缓冲（不碰蓝牙控制器）
   → 注册 AVRCP 回调（cmd / volume）
   → hw_sd_try_mount()        SD 挂载（可失败）
   → player_init() / ebook_init()   后台扫描/解码任务
   → lv_init → hw_lcd_create_display → ui_input_init → ui_start_tick_timer
-  → xTaskCreate(lvgl_task, "lvgl", 10KB, 优先级 5)
+  → xTaskCreate(lvgl_task, "lvgl", 16KB, 优先级 7)
 ```
 
 `lvgl_task`：`ui_create` → `lv_refr_now` → 等待 LCD 首帧 flush 完成后 `hw_lcd_display_on()` 点亮背光（避免开机白屏）；随后 ~60Hz 循环：每 `UI_REFRESH_PERIOD_MS=16ms` 调 `ui_refresh()`，`lv_timer_handler()` 延迟钳制在 1~16ms（`LVGL_TASK_MIN/MAX_DELAY_MS`）。

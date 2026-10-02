@@ -112,7 +112,7 @@ y=204  上下文提示（连接/断开/重试/扫描）
 
 - 进入页面即 `bluetooth_audio_scan_start()`；设备列表只在 `bluetooth_audio_device_version()` 递增时重格式化（MAC 回退名不反复拼接）。
 - 配对状态机：CONNECTING → PAIRING（SSP，显示 6 位配对码）→ OK/FAIL；失败 A 重试。
-- 连接自动重试（2s 退避，最多 4 次）期间仍显示"连接中..."，由 `bluetooth_audio` 内部处理（见 `docs/bluetooth.md`）。
+- 连接自动重试（3.5s 退避，最多 4 次）期间仍显示"连接中..."，由 `bluetooth_audio` 内部处理（见 `docs/bluetooth.md`）。
 
 ## 9. 阅读页布局
 

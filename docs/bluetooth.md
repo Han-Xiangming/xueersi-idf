@@ -7,13 +7,13 @@
 ```text
 掌机（A2DP Source / AVRCP Target，设备名 "Xiaomao MP3"）
   │
-  ├─ A2DP：解码 PCM（路由自 audio.c）→ 内部重采样 → SBC（Bluedroid 编码，bitpool 上限 64）→ 蓝牙耳机/音箱
+  ├─ A2DP：解码 PCM（路由自 audio.c）→ 内部重采样 → SBC（Bluedroid 编码，bitpool 上限 33）→ 蓝牙耳机/音箱
   └─ AVRCP：耳机媒体键（播放/暂停/上/下曲）+ 绝对音量 → 本地回调
 
 PCM 环形缓冲 128KB（bluetooth_audio_init 分配，优先 PSRAM；~740ms @44.1kHz 立体声）
 ```
 
-- 目标 ESP-IDF v6.1（当前使用 v6.1-beta1），`CONFIG_BT_ENABLED` + `CONFIG_BT_A2DP_ENABLE`。
+- 目标 ESP-IDF v6.1（正式版，IDF 路径 `D:\esp\v6.1\esp-idf`），`CONFIG_BT_ENABLED` + `CONFIG_BT_A2DP_ENABLE`。
 - 所有入口在蓝牙被裁剪时均为安全 no-op。
 - **懒启动**：`bluetooth_audio_init()` 只分配环形缓冲，不碰控制器；`bluetooth_audio_enable()`（进入蓝牙页时调用）才拉起控制器 + Bluedroid + A2DP Source，避免开机即广播 A2DP。
 - 只启用 BR/EDR（A2DP 不需要 BLE），启动时释放 BLE 内存；本机设为**可连接但不可发现**（源角色向外拨号）。
@@ -38,14 +38,14 @@ bluetooth_audio_is_scanning()    扫描中
 bluetooth_audio_device_count()   已发现设备数（扫描期间增长，最多 8 台）
 bluetooth_audio_device_version() 列表变更计数（UI 只在递增时重格式化）
 bluetooth_audio_device_name(i)   设备名（无名设备回退 MAC）
-bluetooth_audio_connect_index(i) 连接第 i 台（取消扫描、开启 BT 输出）
+bluetooth_audio_connect_index(i) 连接第 i 台（取消扫描、置起自动重试）
 bluetooth_audio_disconnect()     断开但保留栈
 bluetooth_audio_peer_name()      已连/连接中设备名
 ```
 
 - 配对进度 `bt_pair_state_t`：`CONNECTING → PAIRING（SSP 数值比较，`bluetooth_audio_passkey()` 取 6 位密钥给 UI 显示）→ OK / FAIL`。
 - **扫描过滤**：仅保留 COD 有效（`esp_bt_gap_is_valid_cod`）的设备；已去掉 RENDERING-only 过滤，手机/音箱等省略 rendering 服务位的设备也能看到（能否 A2DP 连接仍由对端决定）。
-- **连接自动重试**：首次拨号常因 "remote features unknown" 竞态失败，FreeRTOS 定时器以 2s 退避自动重拨（`bluetooth_audio_connect_index` 置起 `s_conn_auto`），最多 4 次后才回到 UI "A重试"，避免用户反复按 A。
+- **连接自动重试**：首次拨号常因 "remote features unknown" 竞态失败，FreeRTOS 定时器以 3.5s 退避自动重拨（`bluetooth_audio_connect_index` 置起 `s_conn_auto`），最多 4 次后才回到 UI "A重试"，避免用户反复按 A。重试跑在 Timer 服务任务而非 BTC 任务，重拨时不会阻塞协议栈回调。
 
 ## 4. PCM 输入与重采样
 
@@ -55,7 +55,11 @@ bluetooth_audio_set_sample_rate(hz)    A2DP/SBC 恒 44.1kHz，其它采样率内
                                 （否则远端会变速变调）；流开始前丢弃上一会话残留 PCM
 ```
 
-- 路由由 audio.c 决定：蓝牙连接且开启时，`hw_audio_write_pcm()` 只喂蓝牙（音量、全频段），I2S 完全静默；未连接/关闭时只走喇叭（见 `docs/audio.md` §1）。
+- 路由由 `audio.c` 的单一状态 `s_route` 决定，**与蓝牙链路状态解耦**：`hw_audio_write_pcm()` 只在开头读一次路由，绝不探测是否已连接。
+  - 用户在蓝牙页**连接成功后**显式触发 `hw_audio_set_route(AUDIO_ROUTE_BT)`，PCM 才改喂蓝牙（音量、全频段，无喇叭侧的 HPF/限幅）。
+  - **连接成功不会自动抢路由**——否则正在放音的喇叭会话会被静默劫持；必须由用户操作。
+  - **链路掉线会自动回喇叭**（`hw_audio_on_bt_conn_state`），无论当前在哪个 UI 页，保证喇叭会话立刻恢复。
+  - 设置页的蓝牙总开关只改 `s_enabled` / 拆栈，**不切路由**（见 `docs/audio.md` §1）。
 - 数据回调 `a2d_data_cb`：栈按 44.1kHz 拉取；欠载时补静音保证流不断；teardown 期间返回 0 让 Bluedroid 自行静音填充。
 
 ## 5. AVRCP 远端控制（TG 角色）
@@ -85,4 +89,4 @@ ui.c：      蓝牙页刷新设备列表/配对状态/连接名；设置页 BT �
 - 源角色一次只能连一台 sink。
 - 扫描为 GAP inquiry，范围/速度受蓝牙射频环境限制。
 - SBC 编码 CPU 开销随 44.1kHz 固定，重采样在内部完成。
-- SBC bitpool 上限 64（A2DP 最大值，44.1kHz joint stereo ≈ 385 kbps）以追求最高音质；若弱 sink 出现 L2CAP 拥塞，可降到 53/45/37 换稳定。
+- SBC bitpool 上限 **33**（`BT_SBC_MAX_BITPOOL`，44.1kHz joint stereo ≈ 229 kbps）。已从最初的 64 逐级下调（64 → 53 → 45 → 33）以消除弱 sink 上的 L2CAP 拥塞与爆音；若对端 sink 表现良好且追求音质，可回调到 45/53 试。

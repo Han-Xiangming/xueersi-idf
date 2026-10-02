@@ -7,7 +7,7 @@
  * PCM in via bluetooth_audio_write_pcm(); this module owns the Bluetooth stack,
  * sink discovery/connection and a small PCM ring buffer.
  *
- * Targets ESP-IDF v5.x (verified against 5.5). Every entry point is a safe
+ * Targets ESP-IDF v6.1 (verified against 6.1.0). Every entry point is a safe
  * no-op when Bluetooth / A2DP is disabled in the build
  * (CONFIG_BT_ENABLED && CONFIG_BT_A2DP_ENABLE).
  */

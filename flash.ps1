@@ -8,7 +8,7 @@ if (-not (Test-Path $Activate)) {
     Write-Host "Regenerating IDF activate script ..."
     $Py = "C:\Users\OpenTankOfBeta\.espressif\python_env\idf6.1_py3.13_env\Scripts\python.exe"
     if (-not (Test-Path $Py)) { $Py = "python" }
-    $Out = & $Py "D:\esp\v6.1-beta1\tools\activate.py" --export
+    $Out = & $Py "D:\esp\v6.1\esp-idf\tools\activate.py" --export
     if ($LASTEXITCODE -ne 0 -or -not $Out) {
         Write-Error "Failed to generate IDF activate script"
         exit 1

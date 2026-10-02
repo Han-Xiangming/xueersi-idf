@@ -10,14 +10,17 @@
 
 ```text
 player.c
-  ├─ player_task（16KB 栈，优先级 5）
+  ├─ mp3_player（16KB 栈，优先级 8，绑 Core 1）
   │    解码循环：读文件 → helix 解码 → hw_audio_write_pcm()（带背压）
-  ├─ scan_task（4KB 栈，优先级 4）
+  ├─ mp3_scan（4KB 栈，优先级 4）
   │    后台扫描 /sdcard/Music 的 .mp3 → 双缓冲快照发布曲目列表
+  ├─ mp3_watch（4KB 栈，优先级 2）
+  │    解码停顿看门狗 + 喂 RTC WDT
   └─ 状态机       IDLE / PLAYING / PAUSED
 ```
 
-- 解码 PCM 缓冲（`s_pcm` / `s_stereo`）放 PSRAM（`EXT_RAM_BSS_ATTR`），不占内部 DRAM。
+- 优先级层级（Core 1）：解码 `mp3_player`(8) > `lvgl`(7) > `i2s_wr`(6) > `mp3_scan`(4) > `mp3_watch`(2)。解码必须高于 LVGL 才能及时喂 DMA（`player.c` 注释）。
+- 解码 PCM 缓冲：`s_pcm`（立体声，常见情况）**刻意留在内部 DRAM**——它是每 ~40Hz 交给 `hw_audio_write_pcm` 的缓冲，放 PSRAM 会把 cache-workaround 拷贝压到热路径上（蓝牙控制器负载下的已知崩溃源）；仅单声道上混用的 `s_stereo` 放 PSRAM（`EXT_RAM_BSS_ATTR`）以节省 DRAM 预算。
 
 ## 2. 曲目列表（后台扫描）
 
@@ -51,7 +54,7 @@ FATFS 目录遍历在 SDSPI 上耗时数十 ms，故列表由**独立扫描任�
 - 暂停/停止不阻塞：`hw_audio_write_pcm()` 在 `s_player_active=false` 时直接返回放弃剩余数据。
 - 解码健壮性：除「无同步字 / 解码错误过多（512 次）」外，新增**零进度护栏**——连续 16 帧「解码成功但既没消耗字节也没产出样本」的畸形帧判定为损坏并跳过该曲，专门防 libhelix 在特定帧上原地自旋（CPU 跑满、把停顿看门狗饿死、无任何日志的「静默冻结」）。解码任务同时订阅 ESP 任务看门狗（5s 卡死即带 backtrace 重启）作为最后兜底。
 - 播放进度（字节偏移百分比）对 VBR MP3 不准确，UI 不展示（`player.h` 注释明示）。
-- 采样率随首帧变化：`hw_audio_set_sample_rate()` 由解码任务同步调用，I2S 通过重建通道换速（见 `docs/audio.md` §2）。
+- 采样率随首帧变化：`hw_audio_set_sample_rate()` 由解码任务同步调用。但 **I2S 通道不再重建**：通道在 init 时以 44100 建好并一路保持 RUNNING，非 44100 的音源由 `audio.c` 内的 SpeexDSP 定点重采样器（`quality=2`）软转（见 `docs/audio.md` §2）。重建通道会重置 DMA 描述符 credit 队列且不会 refill，是历史上"切歌后整条 I2S 静默卡死"的根因。
 
 ## 4. 循环模式与曲目切换
 
@@ -66,7 +69,8 @@ FATFS 目录遍历在 SDSPI 上耗时数十 ms，故列表由**独立扫描任�
 ```text
 main.c:       player_init()（创建任务）；AVRCP PLAY/PAUSE/STOP → player_toggle/stop
 ui.c:         播放器页构建/轮询时读 player_scan_count/name/version；按键 → player_play/toggle/stop
-audio.c:      hw_audio_set_sample_rate() 随 MP3 采样率热重配 I2S（不停通道）；
-              PCM 由解码任务 DSP 后直写 I2S DMA（无 ring/feed 任务）；蓝牙连接时路由到 A2DP（见 audio.md）
-bluetooth_audio.c:   蓝牙开启且已连接时，PCM 经音量后路由到 A2DP 而非 I2S（见 audio.md）
+audio.c:      hw_audio_set_sample_rate() 随 MP3 采样率热重配（不停通道，走 SpeexDSP 软重采样）；
+              PCM 经 DSP 后入 8KB ringbuf，由独立 i2s_wr 任务（优先级 6，绑 Core 1）写 I2S DMA；
+              路由 s_route 决定走喇叭还是 A2DP（见 audio.md）
+bluetooth_audio.c:   路由为 AUDIO_ROUTE_BT 时，PCM 经音量后走 A2DP 而非 I2S（见 audio.md）
 ```
