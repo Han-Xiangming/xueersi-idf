@@ -5,16 +5,32 @@
 ## 1. 总体结构
 
 ```text
-app/ui/ui.c（页面控制器，不依赖具体硬件）
-  ├─ 主菜单（BIOS 风格，仅列出部分页面）
-  ├─ 页面容器（ui_make_page，整屏 320×240，深底）
-  └─ hint 状态行（页面底部，toast 提示临时占用）
+components/app/ui/
+  ├─ ui_theme.h/.c        设计令牌层：色板、间距、行高、版面区段 + 基础控件工厂
+  │                       （ui_theme_page / ui_theme_label / ui_theme_bar /
+  │                        ui_theme_separator / ui_theme_text_set）
+  ├─ ui_widgets.h/.c      组件层：ui_list_t 列表视图（光标列 + 文本列 + 滚动窗口
+  │                       + 焦点着色），被音乐源/曲目、蓝牙设备、电子书源/书籍
+  │                       四张列表共用
+  ├─ ui_nav.h/.c          导航层：页面栈（前进 ui_go() 入栈，B 键沿栈回退）
+  ├─ ui_internal.h        页面与装配层之间的私有契约：ui_state_t（屏幕级控件
+  │                       状态）、共享工具函数、各页对外接口
+  ├─ ui_pages_player.c    音乐源选择 / 曲目列表 / 悬浮播控面板（含跑马灯）
+  ├─ ui_pages_ebook.c     电子书源选择 / 书列表 / 阅读页（含跳转浮层）
+  ├─ ui_pages_settings.c  设置项表 + NVS 持久化 + 各项回调
+  ├─ ui_pages_bt.c        蓝牙设备扫描 / 配对 / 连接
+  └─ ui.c                 装配层：屏幕、主菜单、电量表、按键路由、刷新调度
 ```
 
+- 页面文件各自持有本页状态（选中项、滚动窗口、跑马灯、paint guard），只向 `ui.c` 暴露 build / refresh / 按键处理接口（见 `ui_internal.h`）；装配层不再知道页面内部的变量名。
+- 进入页面时的准备工作（设置页重查缓存、播放器加载播放列表缓存、蓝牙栈上电）随页面走，放在各自的 build 函数里。
+
 - 入口：`ui_create()` 在 LVGL 任务中调用一次；`ui_refresh()` 由任务循环以 16ms 周期调用（`UI_REFRESH_PERIOD_MS`，main.c）。
-- **按需刷新**：`s_ui_dirty` 脏标记 + `ui_external_changed()` 轮询（蓝牙设备列表/版本、配对状态、SD 挂载、播放器状态、电子书扫描/页数版本），只在真变化时重建页面内容；`ui_label_set()` 对未变化的文本直接跳过 LVGL set，60Hz 空转不产生重绘。
-- 页面切换 `ui_enter_page()`：销毁旧页容器 → 按 `UI_PAGE_*` 重建 → 强制重绘；`ui_show_menu()` 隐藏/显示页面与菜单（无滑动动画）。
-- 主题色：`UI_CYAN=0x00E0E0`（选中/强调）、`UI_GRAY=0x808080`（普通文本）、`UI_BG_DARK=0x000000`、`UI_TITLE=0xFF8000`（标题栏）。
+- **按需刷新**：`s_ui_dirty` 脏标记 + `ui_external_changed()` 轮询（蓝牙设备列表/版本、配对状态、SD 挂载、播放器状态、电子书扫描/页数版本），只在真变化时重建页面内容；`ui_theme_text_set()` 对未变化的文本直接跳过 LVGL set，60Hz 空转不产生重绘。
+- 页面切换 `ui_enter_page()`：销毁旧页容器 → 按 `UI_PAGE_*` 重建 → 强制重绘。它**不动导航栈**：前进用 `ui_go()`（先入栈再显示），后退用 `ui_nav_back_or_menu()`（先出栈再显示父页，栈空则回主菜单）。分开是为了避免后退时重复入栈把用户困在子页。
+- 页面内的两级视图（播放器的「源选择 ↔ 曲目列表」、电子书的「源选择 ↔ 书列表」）不入栈：B 先在页内退回上一级视图，退到最外层才交给导航栈。
+- `ui_show_menu()` 隐藏/显示页面与菜单（无滑动动画），并清空导航栈。
+- 主题色与几何全部集中在 `ui_theme.h`：`UI_COLOR_ACCENT=0x00E0E0`（选中/强调）、`UI_COLOR_TEXT=0x808080`（普通文本）、`UI_COLOR_BG=0x000000`、`UI_COLOR_TITLE=0xFF8000`（标题栏），间距/行高/版面区段见该文件。**换肤只改这一个文件。**
 
 ## 2. 页面清单
 
