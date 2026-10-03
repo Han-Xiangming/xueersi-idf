@@ -46,6 +46,26 @@
 /* Consecutive tracks that failed to play before the player gives up and
  * stops (avoids cycling through a whole card of corrupt files forever). */
 #define TRACK_MAX_CONSEC_FAILS   8
+/* SD read errors are not always fatal. ferror() only says "the sector read
+ * failed", and the two causes we actually hit look identical from stdio:
+ *   - a CRC/SPI glitch on the card, and
+ *   - ESP_ERR_NO_MEM from the SD driver, i.e. the internal MALLOC_CAP_DMA pool
+ *     was momentarily exhausted (it used to abort playback outright once A2DP
+ *     came up and the BT controller took its share of internal DRAM).
+ * Neither is a property of the FILE, and neither leaves the stream desynced
+ * (a failed disk_read leaves fptr untouched, so re-issuing the fread is safe).
+ * So retry the same read a few times with a backoff before giving up: a
+ * transient resource shortage then costs one hiccup instead of the track. */
+#define TRACK_MAX_READ_RETRIES   3
+#define READ_RETRY_BACKOFF_MS    250
+/* A track that died only because reads kept failing has not been proven
+ * corrupt, so it must not burn the corrupt-file budget (8 strikes) — that
+ * turned one memory shortage into "every track fails, playback stops" within
+ * ~200 ms. Starved tracks get their own much smaller budget and a real pause
+ * between attempts, so a device that is genuinely out of memory stops after
+ * a few seconds instead of hammering the failing path. */
+#define TRACK_MAX_STARVED_FAILS  3
+#define STARVED_BACKOFF_MS       1500
 /* Decode-progress watchdog: while PLAYING, if no frame has been produced for
  * this long, the decode task is stuck (SD read hang, BT send hang, ...) and
  * the watchdog stops playback instead of faking an endless "playing" state. */
@@ -143,6 +163,15 @@ static int s_fail_count;
  * opposed to a natural EOF), so the end-of-track logic can auto-advance
  * instead of replaying a broken track under REPEAT_ONE. */
 static bool s_track_errored;
+/* Retries already spent on the current fread() after ferror() (see
+ * TRACK_MAX_READ_RETRIES). Reset on every successful read. */
+static int s_read_retries;
+/* The current track was aborted because reads kept failing, not because the
+ * file itself is bad. The end-of-track logic gives these a separate budget
+ * and a backoff instead of counting them as corrupt tracks. */
+static bool s_track_starved;
+/* Consecutive starved tracks; reset as soon as a track plays for real. */
+static int s_starve_count;
 /* Last playback error, sticky until the next track decodes its first frame
  * successfully. Read by the UI task, written by the player/watchdog tasks;
  * single-word stores are atomic on Xtensa. */
@@ -926,10 +955,33 @@ static bool rewind_track(void)
 }
 
 /* Read up to `want` bytes from the active source into `out`. Returns the
- * number of bytes actually read (0 at end of source). */
+ * number of bytes actually read (0 at end of source).
+ *
+ * ferror() is ambiguous (SD CRC glitch vs. the driver failing to allocate a
+ * DMA buffer) and neither cause invalidates the stream, so re-issue the same
+ * read with a backoff before letting the caller treat it as a dead track —
+ * see TRACK_MAX_READ_RETRIES. */
 static int src_read(void *out, int want)
 {
-    return (int)fread(out, 1, (size_t)want, s_src.fp);
+    for (;;) {
+        const int got = (int)fread(out, 1, (size_t)want, s_src.fp);
+        if (got > 0 || !ferror(s_src.fp)) {
+            s_read_retries = 0;   /* progress (or clean EOF): streak cleared */
+            return got;
+        }
+        if (s_stop_req || s_new_req) {
+            return 0;             /* leaving anyway; do not spend retries */
+        }
+        if (s_read_retries >= TRACK_MAX_READ_RETRIES) {
+            return 0;
+        }
+        s_read_retries++;
+        ESP_LOGW(TAG, "read error on '%s' (%d/%d), retrying in %d ms",
+                 s_name, s_read_retries, TRACK_MAX_READ_RETRIES,
+                 READ_RETRY_BACKOFF_MS);
+        clearerr(s_src.fp);        /* required, or the retry fails immediately */
+        vTaskDelay(pdMS_TO_TICKS(READ_RETRY_BACKOFF_MS));
+    }
 }
 
 /* Decode-timing instrumentation.
@@ -967,11 +1019,20 @@ static bool decode_frame(bool *rate_set)
              * occurred (ferror, e.g. an SDSPI CRC glitch). The old code treated
              * both as "song ended", which cut good tracks short on a transient
              * SD error and left no real notion of "audio is over". Tell them
-             * apart: an error is a hard failure; genuine EOF lets us stop
-             * hunting for more frames and end the track cleanly below. */
+             * apart: an error that survived src_read()'s retries is a hard
+             * failure; genuine EOF lets us stop hunting for more frames and
+             * end the track cleanly below. */
             if (ferror(s_src.fp)) {
-                ESP_LOGE(TAG, "read error on '%s', aborting track", s_name);
+                /* src_read() already re-issued this read with a backoff and
+                 * the stream is still dead. The most common cause is not the
+                 * file at all: the SD driver failing to get a DMA buffer out of
+                 * an exhausted internal MALLOC_CAP_DMA pool looks exactly like
+                 * this. Flag it as starved so the end-of-track logic does not
+                 * charge it to the corrupt-file budget. */
+                ESP_LOGE(TAG, "read error on '%s' after %d retries, aborting track",
+                         s_name, s_read_retries);
                 s_track_errored = true;
+                s_track_starved = true;
                 player_report_error(PLAYER_ERR_PIPELINE);
                 return false;
             }
@@ -1260,6 +1321,8 @@ static void decode_loop(void)
         }
 
         s_track_errored = false;
+        s_track_starved = false;   /* per-track: not proven corrupt yet */
+        s_read_retries = 0;
         if (!open_track()) {
             /* Failed to even open the file (deleted since the scan, card
              * hiccup, ...): report and fall through to the shared
@@ -1403,7 +1466,23 @@ static void decode_loop(void)
          * Give up after too many consecutive failures so a card full of bad
          * files ends in a visible error instead of a silent cycle. */
         if (s_track_errored) {
-            if (++s_fail_count >= TRACK_MAX_CONSEC_FAILS) {
+            /* A track lost to failing SD reads is not evidence of a bad file,
+             * so it gets its own budget and a real pause. Charging it to the
+             * 8-strike corrupt-file budget made one memory shortage look like
+             * "every track on the card is broken": eight tracks died within
+             * ~200 ms and playback stopped for good. */
+            if (s_track_starved) {
+                if (++s_starve_count >= TRACK_MAX_STARVED_FAILS) {
+                    ESP_LOGE(TAG, "%d tracks starved by failing SD reads, stopping",
+                             s_starve_count);
+                    break;
+                }
+                ESP_LOGW(TAG, "SD reads keep failing (%d/%d), pausing %d ms before the next track",
+                         s_starve_count, TRACK_MAX_STARVED_FAILS,
+                         STARVED_BACKOFF_MS);
+                vTaskDelay(pdMS_TO_TICKS(STARVED_BACKOFF_MS));
+            }
+            else if (++s_fail_count >= TRACK_MAX_CONSEC_FAILS) {
                 ESP_LOGE(TAG, "%d consecutive failed tracks, stopping",
                          s_fail_count);
                 break;
@@ -1422,6 +1501,7 @@ static void decode_loop(void)
             continue;
         }
         s_fail_count = 0;
+        s_starve_count = 0;
 
         /* Natural end of track: pick the next entry from the repeat mode.
          * (Single-track loop never reaches here: it replays the file in place
@@ -1823,6 +1903,7 @@ void player_play(const char *path)
      * reset the streak — the cap is what stops a corrupt-list cycle.) */
     if (s_state == PLAYER_IDLE) {
         s_fail_count = 0;
+        s_starve_count = 0;
     }
     /* `path` is absolute if it begins with '/', else it's a legacy basename
      * resolved under PLAYER_ROOT. Either way the full path is what we open. */

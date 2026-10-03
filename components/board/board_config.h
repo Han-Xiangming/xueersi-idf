@@ -19,11 +19,21 @@
 #define LCD_H_RES               320
 #define LCD_V_RES               240
 
-/* Partial-refresh draw buffers: 40 of 240 lines
+/* Partial-refresh draw buffers: 20 of 240 lines
  * so LVGL renders and flushes only dirty regions instead of the whole panel.
  * Two buffers let LVGL render the next chunk while the previous one is being
- * flushed over SPI. */
-#define LCD_DRAW_BUF_LINES      40
+ * flushed over SPI.
+ *
+ * These buffers cannot live in PSRAM: ESP32's SPI DMA cannot reach it, and
+ * heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA) never matches a
+ * PSRAM heap (its caps carry MALLOC_CAP_SPIRAM|MALLOC_CAP_DEFAULT but no
+ * MALLOC_CAP_DMA), so alloc_draw_buf() always lands on the internal DMA pool.
+ * That pool is the same one the SD card and the BT controller need, and it is
+ * small: 40 lines cost 2 x 320 x 40 x 2 = 51.2 KB of the ~300 KB of internal
+ * DRAM, which is what starved MALLOC_CAP_DMA once A2DP came up. 20 lines
+ * (2 x 12.8 KB) still keeps render/flush overlapped while handing back
+ * 25.6 KB; a full 320x240 flush is ~20 ms over SPI at 60 MHz either way. */
+#define LCD_DRAW_BUF_LINES      20
 #define LCD_DRAW_BUF_COUNT      2
 #define LCD_DPI                 60
 #define LCD_CMD_BITS            8

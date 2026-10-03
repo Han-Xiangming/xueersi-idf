@@ -10,6 +10,7 @@
 #include "driver/sdspi_host.h"
 #include "driver/spi_master.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
@@ -18,11 +19,70 @@
 
 static const char *TAG = "hw_sd";
 
+/* Pre-allocated bounce buffer for unaligned sector I/O.
+ *
+ * ESP32's SPI DMA can only touch internal DRAM, and the SDSPI host's alignment
+ * check rejects any destination that is not 4-byte aligned. FATFS hands us such
+ * buffers regularly, so every unaligned read/write fell into sdmmc_cmd.c's
+ * "allocate a temporary DMA buffer" branch, which does
+ * heap_caps_malloc(size, MALLOC_CAP_DMA) on EVERY sector access and frees it
+ * right after. That is fine until the internal DMA pool runs dry: the malloc
+ * folds the request down to a single 512-byte sector, still fails, and the
+ * access aborts with
+ *     sdmmc_cmd: allocate_dma_buf: not enough mem, err=0x101
+ * which is what wedged playback once the Bluetooth controller took its share
+ * of internal DRAM.
+ *
+ * Handing the driver one long-lived DMA buffer instead moves that allocation
+ * to mount time, when the pool still has room, and makes every later sector
+ * access allocation-free. The size is a throughput knob only: the driver
+ * clamps the tail chunk of a request to the remaining block count. */
+#define SD_DMA_BUF_BYTES         2048
+#define SD_DMA_MAX_CHUNK_BLOCKS  4
+
 static sdmmc_card_t *s_sd_card;
+static void *s_sd_dma_buf;
 static bool s_mounted;
 static char s_name[24];
 static uint32_t s_mb;
 static esp_err_t s_last_err = ESP_ERR_NOT_FOUND;
+
+/* Attach the bounce buffer to the mounted card. Best effort: on failure the
+ * driver keeps using per-access temporary buffers, i.e. the old behaviour. */
+static void sd_attach_dma_buf(void)
+{
+    if (s_sd_card == NULL || s_sd_dma_buf != NULL) {
+        return;
+    }
+
+    const size_t sector = s_sd_card->csd.sector_size;
+    if (sector == 0) {
+        return;
+    }
+
+    void *buf = heap_caps_aligned_alloc(4, SD_DMA_BUF_BYTES, MALLOC_CAP_DMA);
+    if (buf == NULL) {
+        ESP_LOGW(TAG, "no internal DMA memory for the %d B bounce buffer; "
+                      "unaligned sector I/O will allocate per access",
+                 SD_DMA_BUF_BYTES);
+        return;
+    }
+
+    size_t blocks = heap_caps_get_allocated_size(buf) / sector;
+    if (blocks > SD_DMA_MAX_CHUNK_BLOCKS) {
+        blocks = SD_DMA_MAX_CHUNK_BLOCKS;
+    }
+    if (blocks == 0) {
+        free(buf);
+        return;
+    }
+
+    s_sd_dma_buf                   = buf;
+    s_sd_card->host.dma_aligned_buffer = buf;
+    s_sd_card->host.unaligned_multi_block_rw_max_chunk_size = blocks;
+    ESP_LOGI(TAG, "SD bounce buffer: %u B internal DMA, %u sector(s) per chunk",
+             (unsigned)heap_caps_get_allocated_size(buf), (unsigned)blocks);
+}
 
 void hw_sd_try_mount(void)
 {
@@ -57,6 +117,7 @@ void hw_sd_try_mount(void)
     if (s_last_err == ESP_OK && s_sd_card) {
         s_mounted = true;
         s_last_err = ESP_OK;
+        sd_attach_dma_buf();
         memset(s_name, 0, sizeof(s_name));
         memcpy(s_name,
                s_sd_card->cid.name,
