@@ -137,7 +137,7 @@ static int16_t s_seam_silence[256 * 2];
  * "I2S write gap" underrun warnings appear. q2 (filt_len 16) is ~4x cheaper,
  * still a true windowed-sinc (vastly better than the old linear interpolator),
  * and leaves huge real-time slack; q1 (filt_len 8) is even faster if needed. */
-#define RESAMP_QUALITY     2      /* 0..10; ESP32 sweet spot (fast + sinc quality) */
+#define RESAMP_QUALITY     1      /* 0..10; ESP32 sweet spot (fast + sinc quality) */
 static SpeexResamplerState *s_resamp = NULL;  /* NULL => bypass */
 static bool                s_resamp_active;   /* true: src_rate != s_rate */
 

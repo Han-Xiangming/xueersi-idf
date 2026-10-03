@@ -91,9 +91,12 @@
  * back-pressure for most of each frame, so LVGL still gets the CPU it needs —
  * it just can no longer preempt a decode that is on the critical path.
  *
- * Pinned to core 1 because core 0 hosts the Bluetooth controller + stack. */
+ * Pinned to core 0: the decode + Speex resample burst must not preempt the
+ * lvgl render task (which stays pinned to core 1 at a lower priority). Core 0
+ * also hosts the BT controller/stack, but BT is event-driven and the player
+ * only runs on the speaker route, so the two seldom contend for CPU. */
 #define PLAYER_TASK_PRIORITY     8
-#define PLAYER_TASK_CORE         1
+#define PLAYER_TASK_CORE         0
 /* Pause between repeat-one passes. The previous pass's tail is flushed first
  * and the channel then clocks silence for this long, so the replay starts
  * from a clean boundary instead of the old ending running straight into the
@@ -145,6 +148,9 @@ static int s_no_sync_refills;
  * bytes past the real end must not be escalated into a false CORRUPT verdict.
  * Reset per track. */
 static bool s_at_eof;
+/* One-shot guard so the EOF-position diagnostic logs only the first time a
+ * track hits end-of-stream, not on every refill that re-checks s_at_eof. */
+static bool s_at_eof_logged;
 /* Consecutive MP3Decode failures in the current track (reset on success).
  * Guards against the byte-by-byte resync spinning forever on garbage. */
 static int s_track_errs;
@@ -885,6 +891,7 @@ static bool open_track(void)
     s_bytes_left = 0;
     s_consumed = 0;
     s_at_eof = false;        /* fresh track: not at end yet */
+    s_at_eof_logged = false;
     s_no_sync_refills = 0;   /* fresh track: restart sync-word watchdog */
     s_track_errs = 0;        /* fresh track: restart decode-error watchdog */
     s_pcm_stalls = 0;        /* fresh track: restart pipeline-stall watchdog */
@@ -997,6 +1004,10 @@ static uint32_t s_tm_dec_us;
 static uint32_t s_tm_out_us;
 static uint32_t s_tm_frames;
 static int64_t  s_tm_last_log_us;
+/* Throttle for the [TIMING] decode-heartbeat line. Was 2 s; raised to 10 s so
+ * steady-state playback stays quiet while still surfacing a CPU-budget breach
+ * (the "OVER" suffix) within one interval. */
+#define TIMING_LOG_INTERVAL_US  (30 * 1000 * 1000)
 
 
 /* Decode a single frame and stream it. Returns false on EOF/error. */
@@ -1037,6 +1048,21 @@ static bool decode_frame(bool *rate_set)
                 return false;
             }
             s_at_eof = true;   /* no more bytes will ever come from this file */
+            if (!s_at_eof_logged) {
+                s_at_eof_logged = true;
+                /* EOFDIAG: tell a genuinely short/truncated SD copy apart from a
+                 * mis-detected EOF. If 'at' is far below 'size' the file had more
+                 * bytes the decoder never reached (seek/corruption bug); if they
+                 * match, the SD copy really ended here. */
+                long at = ftell(s_src.fp);
+                fseek(s_src.fp, 0, SEEK_END);
+                long size = ftell(s_src.fp);
+                fseek(s_src.fp, at, SEEK_SET);
+                ESP_LOGW(TAG,
+                         "[EOFDIAG] '%s' feof at %ld / %ld bytes (%.1f%%)",
+                         s_name, at, size,
+                         size > 0 ? (double)at * 100.0 / (double)size : 0.0);
+            }
         }
         if (s_at_eof && s_bytes_left < 2) {
             return false;   /* natural end of file */
@@ -1217,7 +1243,7 @@ static bool decode_frame(bool *rate_set)
     s_tm_dec_us  += (uint32_t)(t_dec_done - t_read_done);
     s_tm_out_us  += (uint32_t)(t_out_done - t_dec_done);
     s_tm_frames++;
-    if (t_out_done - s_tm_last_log_us > 2000000) {
+    if (t_out_done - s_tm_last_log_us > TIMING_LOG_INTERVAL_US) {
         const uint32_t n = s_tm_frames;
         const uint32_t cpu_us   = (s_tm_read_us + s_tm_dec_us) / n;
         const uint32_t paced_ms = (s_tm_out_us / n + 500) / 1000;
