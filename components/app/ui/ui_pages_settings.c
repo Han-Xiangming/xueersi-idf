@@ -35,8 +35,9 @@
 /* Match the playlist row spacing (26px, starting at y=38) so the two
  * list-style pages line up visually. Seven rows: spacing compressed to
  * 24px so the last row (y=182, glyph ends ~198) clears the y=204 hint. */
-/* Eight rows at UI_ROW_H_SETTING (20 px): the last row sits at y=178 (glyph
- * ends ~194) and still clears the y=204 hint. */
+/* Rows are UI_ROW_H_SETTING (26 px, matching the list pages). The flat table
+ * allocates SETTING_COUNT slots, but the two-level group view only ever shows
+ * up to 3 rows, so content stays above the y=218 hint. */
 
 /* Cache-existence state shown by the "重建列表" settings item. We must NOT
  * call player_cache_exists() (a FATFS stat()) every refresh — it runs on
@@ -67,6 +68,33 @@ static void ui_set_clear_enter(void);
 static void ui_set_reset_enter(void);
 static void ui_set_bt_enter(void);
 
+/* Settings are grouped (P2): the flat list is split into Audio / Display /
+ * System. The launcher-stle two-level view (group list -> group items) reuses
+ * the same 8 row widgets; only what each row shows changes per level. */
+typedef enum {
+    SET_GRP_AUDIO = 0,
+    SET_GRP_DISPLAY,
+    SET_GRP_SYSTEM,
+    SET_GRP_COUNT,
+} settings_group_t;
+
+static const char *s_group_names[SET_GRP_COUNT] = {
+    [SET_GRP_AUDIO]   = "音频",
+    [SET_GRP_DISPLAY] = "显示",
+    [SET_GRP_SYSTEM]  = "系统",
+};
+
+/* Group -> member items (indices into s_settings_table). Column width 4;
+ * s_group_cnt says how many of each row are live. */
+static const setting_item_t s_group_items[SET_GRP_COUNT][4] = {
+    [SET_GRP_AUDIO]   = {SETTING_VOLUME, SETTING_MASTER_GAIN, SETTING_BTOUT},
+    [SET_GRP_DISPLAY] = {SETTING_BACKLIGHT, SETTING_STANDBY},
+    [SET_GRP_SYSTEM]  = {SETTING_RESCAN, SETTING_RESET, SETTING_CLEAR_PROG},
+};
+static const int s_group_cnt[SET_GRP_COUNT] = {
+    [SET_GRP_AUDIO] = 3, [SET_GRP_DISPLAY] = 2, [SET_GRP_SYSTEM] = 3,
+};
+
 /* A single settings row descriptor. Adding a setting = appending one row to
  * s_settings_table (and the matching SETTING_* enum). No switch/loop edits. */
 typedef struct {
@@ -74,17 +102,18 @@ typedef struct {
     const char *(*value_fn)(void);      /* right-side live value text */
     void (*on_lr)(int dir);             /* LEFT/RIGHT adjust (dir: -1/+1) */
     void (*on_enter)(void);             /* A press (NULL = not actionable) */
+    settings_group_t group;             /* which group page it lives under */
 } setting_entry_t;
 
 static const setting_entry_t s_settings_table[SETTING_COUNT] = {
-    [SETTING_VOLUME]      = {UI_STR_SET_VOL,    ui_set_vol_text,   ui_set_vol_lr,   NULL},
-    [SETTING_MASTER_GAIN] = {UI_STR_SET_GAIN,  ui_set_gain_text,  ui_set_gain_lr,  NULL},
-    [SETTING_BACKLIGHT]   = {UI_STR_SET_BACKLIGHT,    ui_set_bl_text,    ui_set_bl_lr,    NULL},
-    [SETTING_BTOUT]       = {"蓝牙",    ui_set_bt_text,    ui_set_bt_lr,    ui_set_bt_enter},
-    [SETTING_STANDBY]     = {UI_STR_SET_STANDBY,    ui_set_sleep_text, ui_set_sleep_lr, NULL},
-    [SETTING_RESCAN]      = {UI_STR_SET_RESCAN, ui_set_rescan_text, NULL,       ui_set_rescan_enter},
-    [SETTING_RESET]       = {UI_STR_SET_RESET, ui_set_reset_text, NULL,             ui_set_reset_enter},
-    [SETTING_CLEAR_PROG]  = {UI_STR_SET_CLEAR_PROG, ui_set_clear_text, NULL,        ui_set_clear_enter},
+    [SETTING_VOLUME]      = {UI_STR_SET_VOL,    ui_set_vol_text,   ui_set_vol_lr,   NULL,              SET_GRP_AUDIO},
+    [SETTING_MASTER_GAIN] = {UI_STR_SET_GAIN,  ui_set_gain_text,  ui_set_gain_lr,  NULL,              SET_GRP_AUDIO},
+    [SETTING_BACKLIGHT]   = {UI_STR_SET_BACKLIGHT,    ui_set_bl_text,    ui_set_bl_lr,    NULL,              SET_GRP_DISPLAY},
+    [SETTING_BTOUT]       = {"蓝牙",    ui_set_bt_text,    ui_set_bt_lr,    ui_set_bt_enter,  SET_GRP_AUDIO},
+    [SETTING_STANDBY]     = {UI_STR_SET_STANDBY,    ui_set_sleep_text, ui_set_sleep_lr, NULL,              SET_GRP_DISPLAY},
+    [SETTING_RESCAN]      = {UI_STR_SET_RESCAN, ui_set_rescan_text, NULL,       ui_set_rescan_enter, SET_GRP_SYSTEM},
+    [SETTING_RESET]       = {UI_STR_SET_RESET, ui_set_reset_text, NULL,             ui_set_reset_enter, SET_GRP_SYSTEM},
+    [SETTING_CLEAR_PROG]  = {UI_STR_SET_CLEAR_PROG, ui_set_clear_text, NULL,        ui_set_clear_enter, SET_GRP_SYSTEM},
 };
 
 /* Backlight brightness (0..100 %), driven via PWM on PIN_NUM_LCD_BL.
@@ -117,6 +146,12 @@ static standby_opt_t s_standby_opt = STANDBY_OPT_30S;  /* default 30 s */
  * (-1 forces a repaint right after the page is rebuilt). */
 static int s_setting_sel = 0;
 static int s_paint_set_sel = -1;
+
+/* Two-level view: the group list, or the items inside the selected group. The
+ * same 8 row widgets are reused; only their contents differ per level. */
+typedef enum { SET_VIEW_GROUPS = 0, SET_VIEW_ITEMS } settings_view_t;
+static settings_view_t s_set_view = SET_VIEW_GROUPS;
+static int s_set_group = 0;   /* which group the ITEMS view is showing */
 
 /* Settings persistence: volume and log level survive reboot via NVS.
  * NVS is initialised in app_main() before ui_create(), so these helpers
@@ -268,68 +303,148 @@ void ui_settings_flush(void)
 }
 void ui_refresh_settings(void)
 {
-        const bool sel_changed = (s_setting_sel != s_paint_set_sel);
-        /* Re-query cache existence only when the playlist scan version
-         * changes, not every frame — avoids hammering FATFS stat() while the
-         * toast is showing and makes scrolling feel responsive. */
-        const uint32_t scan_ver = player_scan_version();
-        if (scan_ver != s_cache_queried_ver) {
-            s_cache_present = player_cache_exists();
-            s_cache_queried_ver = scan_ver;
-        }
+    /* Re-query cache existence only when the playlist scan version changes, not
+     * every frame — avoids hammering FATFS stat() while a toast is showing. */
+    const uint32_t scan_ver = player_scan_version();
+    if (scan_ver != s_cache_queried_ver) {
+        s_cache_present = player_cache_exists();
+        s_cache_queried_ver = scan_ver;
+    }
+
+    /* Both views reuse the same 8 row widgets; only the row contents differ. */
+    if (s_set_view == SET_VIEW_GROUPS) {
+        const int n = SET_GRP_COUNT;
         for (int i = 0; i < SETTING_COUNT; i++) {
+            if (i < n) {
+                const int sel = (i == s_setting_sel);
+                /* Focus fill + accent text, painted every frame so a rebuild
+                 * can't leave a stale highlight on the wrong row. */
+                if (sel) {
+                    lv_obj_set_style_bg_color(s_ui.set_row[i],
+                                              ui_theme_color(UI_COLOR_PANEL), 0);
+                    lv_obj_set_style_bg_opa(s_ui.set_row[i], LV_OPA_COVER, 0);
+                }
+                else {
+                    lv_obj_set_style_bg_opa(s_ui.set_row[i], LV_OPA_TRANSP, 0);
+                }
+                ui_theme_text_set(s_ui.set_cursor[i], sel ? ">" : " ");
+                ui_theme_set_color(s_ui.set_cursor[i], UI_COLOR_ACCENT);
+                ui_theme_set_color(s_ui.set_text[i],
+                                   sel ? UI_COLOR_ACCENT : UI_COLOR_TEXT_DIM);
+                ui_theme_text_set(s_ui.set_text[i], s_group_names[i]);
+                ui_theme_set_color(s_ui.set_value[i], UI_COLOR_TEXT_DIM);
+                ui_theme_text_set(s_ui.set_value[i], "");
+            }
+            else {
+                ui_theme_text_set(s_ui.set_cursor[i], " ");
+                ui_theme_text_set(s_ui.set_text[i], "");
+                ui_theme_text_set(s_ui.set_value[i], "");
+                lv_obj_set_style_bg_opa(s_ui.set_row[i], LV_OPA_TRANSP, 0);
+            }
+        }
+        s_paint_set_sel = s_setting_sel;
+        ui_set_hint("A:进入  B:返回");
+        return;
+    }
+
+    /* ITEMS view: show the selected group's members. */
+    const int n = s_group_cnt[s_set_group];
+    const setting_item_t *items = s_group_items[s_set_group];
+    for (int i = 0; i < SETTING_COUNT; i++) {
+        if (i < n) {
             const int sel = (i == s_setting_sel);
+            const setting_entry_t *e = &s_settings_table[items[i]];
+            if (sel) {
+                lv_obj_set_style_bg_color(s_ui.set_row[i],
+                                          ui_theme_color(UI_COLOR_PANEL), 0);
+                lv_obj_set_style_bg_opa(s_ui.set_row[i], LV_OPA_COVER, 0);
+            }
+            else {
+                lv_obj_set_style_bg_opa(s_ui.set_row[i], LV_OPA_TRANSP, 0);
+            }
             ui_theme_text_set(s_ui.set_cursor[i], sel ? ">" : " ");
-            /* Set the highlight color every frame (not just on sel_changed):
-             * the list can be refreshed/rebuilt underneath us (e.g. cache load
-             * on player entry) and a sel_changed-gated repaint leaves a stale
-             * CYAN highlight on the wrong row. Cheap for a handful of rows. */
-            lv_obj_set_style_text_color(s_ui.set_cursor[i], lv_color_hex(UI_COLOR_ACCENT), 0);
-            lv_obj_set_style_text_color(s_ui.set_text[i],
-                                        lv_color_hex(sel ? UI_COLOR_ACCENT : UI_COLOR_TEXT), 0);
-            lv_obj_set_style_text_color(s_ui.set_value[i],
-                                        lv_color_hex(sel ? UI_COLOR_ACCENT : UI_COLOR_TEXT), 0);
-            const setting_entry_t *e = &s_settings_table[i];
-            const char *txt = e->value_fn ? e->value_fn() : "";
-            ui_theme_text_set(s_ui.set_value[i], txt);
+            ui_theme_set_color(s_ui.set_cursor[i], UI_COLOR_ACCENT);
+            ui_theme_set_color(s_ui.set_text[i],
+                               sel ? UI_COLOR_ACCENT : UI_COLOR_TEXT_DIM);
+            ui_theme_set_color(s_ui.set_value[i],
+                               sel ? UI_COLOR_ACCENT : UI_COLOR_TEXT_DIM);
+            ui_theme_text_set(s_ui.set_text[i], e->label);
+            ui_theme_text_set(s_ui.set_value[i], e->value_fn ? e->value_fn() : "");
         }
-        if (sel_changed) {
-            s_paint_set_sel = s_setting_sel;
+        else {
+            ui_theme_text_set(s_ui.set_cursor[i], " ");
+            ui_theme_text_set(s_ui.set_text[i], "");
+            ui_theme_text_set(s_ui.set_value[i], "");
+            lv_obj_set_style_bg_opa(s_ui.set_row[i], LV_OPA_TRANSP, 0);
         }
-        ui_set_hint(UI_STR_HINT_NAV);
+    }
+    s_paint_set_sel = s_setting_sel;
+    ui_set_hint("A:确定  ←→调  B:返回");
 }
 
 void ui_settings_action(void)
 {
-        /* A press dispatches to the selected item's on_enter callback. Action
-         * items (刷新播放列表 / 恢复出厂设置) do their work there; the 蓝牙 item opens
-         * the Bluetooth management screen. Items with no on_enter are inert. */
-        const setting_entry_t *e = &s_settings_table[s_setting_sel];
-        if (e->on_enter) {
-            e->on_enter();
-        }
+    if (s_set_view == SET_VIEW_GROUPS) {
+        /* Drill into the selected group. */
+        s_set_group = s_setting_sel;
+        s_set_view = SET_VIEW_ITEMS;
+        s_setting_sel = 0;
+        s_paint_set_sel = -1;
+        ui_mark_dirty();
+        ui_refresh();
+        return;
+    }
+    /* ITEMS view: dispatch to the selected item's on_enter (action items like
+     * 重建列表 / 恢复出厂; the 蓝牙 item opens the BT screen). Inert items do nothing. */
+    const setting_entry_t *e =
+        &s_settings_table[s_group_items[s_set_group][s_setting_sel]];
+    if (e->on_enter) {
+        e->on_enter();
+    }
 }
 
 void ui_settings_adjust(int step)
 {
-        s_setting_sel = (s_setting_sel - step + SETTING_COUNT) % SETTING_COUNT;
+    const int n = (s_set_view == SET_VIEW_GROUPS)
+                    ? SET_GRP_COUNT
+                    : s_group_cnt[s_set_group];
+    s_setting_sel = (s_setting_sel - step + n) % n;
 }
 
 void ui_settings_lr(int dir)
 {
-    if (ui_nav_current() != UI_PAGE_SETTINGS) {
+    if (s_set_view != SET_VIEW_ITEMS) {
         return;
     }
-    const setting_entry_t *e = &s_settings_table[s_setting_sel];
+    const setting_entry_t *e =
+        &s_settings_table[s_group_items[s_set_group][s_setting_sel]];
     if (e->on_lr) {
         e->on_lr(dir);          /* callback owns dirty-marking + set_action */
         ui_refresh();
     }
 }
 
+/* B on the items view steps back to the group list; on the group list it lets
+ * the caller pop the navigation stack. Returns true when handled internally. */
+bool ui_settings_esc(void)
+{
+    if (s_set_view == SET_VIEW_ITEMS) {
+        s_set_view = SET_VIEW_GROUPS;
+        s_setting_sel = s_set_group;
+        s_paint_set_sel = -1;
+        ui_mark_dirty();
+        ui_refresh();
+        return true;
+    }
+    return false;
+}
+
 void ui_settings_reset_paint(void)
 {
     s_paint_set_sel = -1;
+    s_set_view = SET_VIEW_GROUPS;
+    s_set_group = 0;
+    s_setting_sel = 0;
 }
 
 
@@ -506,6 +621,8 @@ static void ui_set_clear_enter(void)
 void ui_build_settings(lv_obj_t *page)
 {
     s_setting_sel = 0;
+    s_set_view = SET_VIEW_GROUPS;
+    s_set_group = 0;
     /* Force a fresh cache-existence query on the next refresh (the cached
      * value may be stale from a previous visit). */
     s_cache_queried_ver = 0;
@@ -515,33 +632,49 @@ void ui_build_settings(lv_obj_t *page)
 
     for (int i = 0; i < SETTING_COUNT; i++) {
         const int y = UI_SETTINGS_FIRST_Y + i * UI_ROW_H_SETTING;
-        lv_obj_t *cur = lv_label_create(page);
+
+        /* Row container carrying the focus fill (same treatment as the
+         * ui_list_t rows on the other pages). */
+        lv_obj_t *row = lv_obj_create(page);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_pos(row, 0, y);
+        lv_obj_set_size(row, UI_SCREEN_W, UI_ROW_H_SETTING);
+        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        /* The 16px font's line_height (30) is taller than this 20px row, and LVGL
+         * clips children to the parent by default — which would shave the bottom
+         * of every label. Let the text paint past the row box (it still lands
+         * well inside the screen and never overlaps the next row). */
+        lv_obj_add_flag(row, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+        s_ui.set_row[i] = row;
+
+        lv_obj_t *cur = lv_label_create(row);
         lv_label_set_text(cur, " ");
-        lv_obj_set_pos(cur, 8, y);
+        lv_obj_set_pos(cur, 8, 0);
         lv_obj_set_style_text_font(cur, UI_FONT, 0);
-        lv_obj_set_style_text_color(cur, lv_color_hex(UI_COLOR_TEXT), 0);
+        lv_obj_set_style_text_color(cur, lv_color_hex(UI_COLOR_ACCENT), 0);
         s_ui.set_cursor[i] = cur;
 
         /* Fixed left-aligned label; the live value lives in its own column
          * (set_value) so items with different label lengths still line up
          * regardless of the (non-monospaced) byte width of the UTF-8 text. */
-        lv_obj_t *txt = lv_label_create(page);
+        lv_obj_t *txt = lv_label_create(row);
         lv_label_set_text(txt, s_settings_table[i].label);
-        lv_obj_set_pos(txt, 18, y);
+        lv_obj_set_pos(txt, 18, 0);
         lv_obj_set_style_text_font(txt, UI_FONT, 0);
-        lv_obj_set_style_text_color(txt, lv_color_hex(UI_COLOR_TEXT), 0);
+        lv_obj_set_style_text_color(txt, lv_color_hex(UI_COLOR_TEXT_DIM), 0);
         s_ui.set_text[i] = txt;
 
-        lv_obj_t *val = lv_label_create(page);
+        lv_obj_t *val = lv_label_create(row);
         lv_label_set_long_mode(val, LV_LABEL_LONG_MODE_CLIP);
         lv_obj_set_size(val, 80, LV_SIZE_CONTENT);
-        lv_obj_set_pos(val, 232, y);
+        lv_obj_set_pos(val, 232, 0);
         lv_obj_set_style_text_font(val, UI_FONT, 0);
-        lv_obj_set_style_text_color(val, lv_color_hex(UI_COLOR_TEXT), 0);
+        lv_obj_set_style_text_color(val, lv_color_hex(UI_COLOR_TEXT_DIM), 0);
         lv_obj_set_style_text_align(val, LV_TEXT_ALIGN_RIGHT, 0);
         s_ui.set_value[i] = val;
     }
 
-    s_ui.hint = ui_theme_label(page, UI_STR_HINT_NAV_LR, 204,
-                         UI_COLOR_TEXT, LV_TEXT_ALIGN_CENTER);
+    s_ui.hint = ui_theme_label(page, UI_STR_HINT_NAV_LR, UI_LEGEND_Y,
+                         UI_COLOR_TEXT_DIM, LV_TEXT_ALIGN_CENTER);
 }

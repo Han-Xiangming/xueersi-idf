@@ -55,13 +55,13 @@
 #define UI_STR_SEL_EBOOK  "选择书籍"     /* was 选择阅读来源 */
 #define UI_STR_LOADING    "加载中..."
 
-/* --- Hints (spaced + expanded verbs for readability; no glyphs that may be
- *      missing from the CJK font subset) --- */
-#define UI_STR_HINT_NAV        "上/下 选择  A 进入  B 返回"
-#define UI_STR_HINT_NAV_LR     "上/下 选择  A 进入  左/右 设置  B 返回"
-#define UI_STR_HINT_PANEL      "左/右 选择  A 确认  B 关闭"
-/* Player seek-bar hints (左/右切歌, 上/下音量/选择, A播放/暂停/继续, Select循环). */
-#define UI_STR_HINT_SEEK_PLAY  "左/右 切歌  上/下 音量  A 暂停  Select 循环"
-#define UI_STR_HINT_SEEK_PAUSE "左/右 切歌  上/下 音量  A 继续  Select 循环"
-#define UI_STR_HINT_SEEK_IDLE  "左/右 切歌  上/下 选择  A 播放  Select 循环"
-#define UI_STR_HINT_EBOOK_OPEN "上/下 选择  A 打开  B 返回"
+/* --- Hints (spaced + expanded verbs for readability; direction keys use the
+ *      ← → ↑ ↓ glyphs added to the font subset in P2) --- */
+#define UI_STR_HINT_NAV        "↑↓ 选择  A 进入  B 返回"
+#define UI_STR_HINT_NAV_LR     "↑↓ 选择  A 进入  ←→ 设置  B 返回"
+#define UI_STR_HINT_PANEL      "←→ 选择  A 确认  B 关闭"
+/* Player seek-bar hints (←→切歌, ↑↓音量/选择, A播放/暂停/继续, Select循环). */
+#define UI_STR_HINT_SEEK_PLAY  "←→ 切歌  ↑↓ 音量  A 暂停  Select 循环"
+#define UI_STR_HINT_SEEK_PAUSE "←→ 切歌  ↑↓ 音量  A 继续  Select 循环"
+#define UI_STR_HINT_SEEK_IDLE  "←→ 切歌  ↑↓ 选择  A 播放  Select 循环"
+#define UI_STR_HINT_EBOOK_OPEN "↑↓ 选择  A 打开  B 返回"

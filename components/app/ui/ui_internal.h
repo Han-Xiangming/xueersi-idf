@@ -78,11 +78,10 @@ typedef struct {
     lv_obj_t *status;
     lv_obj_t *hint;
 
-    lv_obj_t *menu_page;
-    lv_obj_t *menu_cursor[UI_MENU_ROWS];
-    lv_obj_t *menu_text[UI_MENU_ROWS];
-    lv_obj_t *menu_status;
+    lv_obj_t *menu_page;     /* launcher page container (home screen) */
+    lv_obj_t *menu_status;   /* launcher position indicator ([n/4]) */
 
+    lv_obj_t *set_row[SETTING_COUNT];     /* focus fill (settings list) */
     lv_obj_t *set_cursor[SETTING_COUNT];
     lv_obj_t *set_text[SETTING_COUNT];
     lv_obj_t *set_value[SETTING_COUNT];
@@ -154,6 +153,7 @@ void ui_refresh_settings(void);
 void ui_settings_action(void);           /* A */
 void ui_settings_adjust(int step);       /* up/down */
 void ui_settings_lr(int dir);            /* left/right */
+bool ui_settings_esc(void);              /* B: true if handled inside the page */
 void ui_settings_reset_paint(void);
 
 /* ---- Page: music player ---- */
@@ -180,6 +180,13 @@ void ui_player_panel_toggle(void);
 /* Returns true when the panel is open and consumed the key. */
 bool ui_player_panel_key(uint32_t key);
 
+/* Mini player bar: a small persistent status strip shown on non-player pages
+ * while audio is playing. Lives on the screen (not on any page container) so it
+ * survives page rebuilds. ui_player_refresh_minibar() is called every tick from
+ * ui_refresh(); it owns the mutual exclusion with each page's own status row. */
+void ui_player_build_minibar(void);
+void ui_player_refresh_minibar(void);
+
 /* ---- Page: Bluetooth ---- */
 void ui_build_bt(lv_obj_t *page);
 void ui_refresh_bt(void);
@@ -187,6 +194,13 @@ void ui_bt_action(void);
 void ui_bt_adjust(int step);
 void ui_bt_select(void);                 /* Select: re-scan */
 void ui_bt_reset_paint(void);
+
+/* ---- Page: launcher (home screen, replaces the old text menu) ---- */
+void ui_build_launcher(void);
+void ui_refresh_launcher(void);
+void ui_launcher_nav(uint32_t key);     /* UP/DOWN/LEFT/RIGHT over the grid */
+ui_page_t ui_launcher_page(void);      /* page of the current selection */
+void ui_launcher_reset(void);
 
 /* ---- Page: ebook (list + reader) ---- */
 void ui_build_ebook_list(lv_obj_t *page);

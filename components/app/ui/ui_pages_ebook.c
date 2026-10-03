@@ -114,9 +114,9 @@ void ui_build_ebook_list(lv_obj_t *page)
      * them, same as the music player. */
     ui_list_create(&s_ui.eb_list, page, UI_LIST_ROWS, UI_LIST_FIRST_Y, UI_ROW_H_LIST);
 
-    s_ui.eb_status = ui_theme_label(page, UI_STR_SEL_EBOOK, 196, UI_COLOR_TEXT,
+    s_ui.eb_status = ui_theme_label(page, UI_STR_SEL_EBOOK, 196, UI_COLOR_TEXT_DIM,
                               LV_TEXT_ALIGN_CENTER);
-    s_ui.hint = ui_theme_label(page, UI_STR_HINT_NAV, 214, UI_COLOR_TEXT,
+    s_ui.hint = ui_theme_label(page, UI_STR_HINT_NAV, UI_LEGEND_Y, UI_COLOR_TEXT_DIM,
                          LV_TEXT_ALIGN_CENTER);
 }
 
@@ -148,24 +148,24 @@ void ui_build_ebook_read(lv_obj_t *page)
     lv_obj_t *bar = lv_label_create(page);
     lv_label_set_text(bar, "[----------------------------]");
     lv_label_set_long_mode(bar, LV_LABEL_LONG_MODE_CLIP);
-    lv_obj_set_pos(bar, 8, 214);
+    lv_obj_set_pos(bar, 8, UI_LEGEND_Y);
     lv_obj_set_style_text_font(bar, UI_FONT, 0);
-    lv_obj_set_style_text_color(bar, lv_color_hex(UI_COLOR_TEXT), 0);
+    lv_obj_set_style_text_color(bar, lv_color_hex(UI_COLOR_TEXT_DIM), 0);
     lv_obj_set_style_text_line_space(bar, -8, 0);
     s_ui.eb_bar = bar;
 
     lv_obj_t *pct = lv_label_create(page);
     lv_label_set_text(pct, "0%");
     lv_label_set_long_mode(pct, LV_LABEL_LONG_MODE_CLIP);
-    lv_obj_set_pos(pct, 272, 214);
+    lv_obj_set_pos(pct, 272, UI_LEGEND_Y);
     lv_obj_set_size(pct, 40, LV_SIZE_CONTENT);
     lv_obj_set_style_text_font(pct, UI_FONT, 0);
-    lv_obj_set_style_text_color(pct, lv_color_hex(UI_COLOR_TEXT), 0);
+    lv_obj_set_style_text_color(pct, lv_color_hex(UI_COLOR_TEXT_DIM), 0);
     lv_obj_set_style_text_align(pct, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_set_style_text_line_space(pct, -8, 0);
     s_ui.eb_pct = pct;
 
-    s_ui.hint = ui_theme_label(page, "", 214, UI_COLOR_TEXT,
+    s_ui.hint = ui_theme_label(page, "", UI_LEGEND_Y, UI_COLOR_TEXT,
                          LV_TEXT_ALIGN_CENTER);
 }
 void ui_refresh_ebook_list(void)

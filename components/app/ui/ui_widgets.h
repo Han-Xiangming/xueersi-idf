@@ -22,6 +22,7 @@
  * ebook and Bluetooth lists keep their own (very different) update rules.
  */
 typedef struct {
+    lv_obj_t *row_bg[UI_LIST_MAX_ROWS];   /* focus fill (transparent when not selected) */
     lv_obj_t *cursor[UI_LIST_MAX_ROWS];   /* ">" marker column */
     lv_obj_t *text[UI_LIST_MAX_ROWS];     /* row text (clipped / marquee) */
     int       rows;                       /* visible rows */
@@ -50,3 +51,29 @@ int ui_list_top(int sel, int count, int rows);
  */
 void ui_list_row(ui_list_t *list, int row, int idx, int count,
                  const char *text, bool selected, bool blank);
+
+/* ---- Launcher tiles --------------------------------------------------------
+ * A `ui_tiles_t` is a fixed array of card slots the launcher page positions on
+ * a grid. Each slot owns a background container (corner radius, surface fill,
+ * focus border) and a centered text label; the caller draws the icon into the
+ * container. Focus is single-selection: the selected tile gets the panel fill,
+ * an accent border, and the accent label colour — the same triple-encoding as
+ * the lists, so the home screen reads consistently with every other page. */
+typedef struct {
+    lv_obj_t *bg;        /* tile container (icon + label parent) */
+    lv_obj_t *label;     /* centered caption */
+} ui_tile_t;
+
+typedef struct {
+    int       count;
+    ui_tile_t tile[UI_TILE_COUNT];
+} ui_tiles_t;
+
+/* Create `count` tiles at the given pixel positions (each w×h). Icons are drawn
+ * by the caller into tile[].bg after this returns. */
+void ui_tiles_create(ui_tiles_t *t, lv_obj_t *parent, int count,
+                     const int x[UI_TILE_COUNT], const int y[UI_TILE_COUNT],
+                     int w, int h);
+
+/* Apply the single-selection focus state (sel index, or -1 for none). */
+void ui_tiles_set_focus(const ui_tiles_t *t, int count, int sel);

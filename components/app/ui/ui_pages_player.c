@@ -156,8 +156,8 @@ void ui_build_player(lv_obj_t *page)
     /* 6 shared list rows: the source picker and the track list reuse them. */
     ui_list_create(&s_ui.pl_list, page, UI_LIST_ROWS, UI_LIST_FIRST_Y, UI_ROW_H_LIST);
 
-    s_ui.pl_prog = ui_theme_label(page, UI_STR_SEL_MUSIC, 196, UI_COLOR_TEXT, LV_TEXT_ALIGN_CENTER);
-    s_ui.hint = ui_theme_label(page, UI_STR_HINT_NAV, 214, UI_COLOR_TEXT, LV_TEXT_ALIGN_CENTER);
+    s_ui.pl_prog = ui_theme_label(page, UI_STR_SEL_MUSIC, 196, UI_COLOR_TEXT_DIM, LV_TEXT_ALIGN_CENTER);
+    s_ui.hint = ui_theme_label(page, UI_STR_HINT_NAV, UI_LEGEND_Y, UI_COLOR_TEXT_DIM, LV_TEXT_ALIGN_CENTER);
 }
 
 /* ------------------------------------------------------------------ */
@@ -232,9 +232,9 @@ void ui_player_build_panel(void)
     lv_obj_remove_style_all(panel);
     lv_obj_set_pos(panel, 12, 64);
     lv_obj_set_size(panel, 296, 136);
-    lv_obj_set_style_bg_color(panel, lv_color_hex(0x101010), 0);
+    lv_obj_set_style_bg_color(panel, lv_color_hex(UI_COLOR_SURFACE), 0);
     lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(panel, lv_color_hex(UI_COLOR_TEXT), 0);
+    lv_obj_set_style_border_color(panel, lv_color_hex(UI_COLOR_LINE), 0);
     lv_obj_set_style_border_width(panel, 1, 0);
     lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(panel, LV_OBJ_FLAG_HIDDEN);
@@ -254,7 +254,7 @@ void ui_player_build_panel(void)
     lv_obj_set_pos(s_ui.pl_panel_state, 208, 8);
     lv_obj_set_size(s_ui.pl_panel_state, 78, LV_SIZE_CONTENT);
     lv_obj_set_style_text_font(s_ui.pl_panel_state, UI_FONT, 0);
-    lv_obj_set_style_text_color(s_ui.pl_panel_state, lv_color_hex(UI_COLOR_TEXT), 0);
+    lv_obj_set_style_text_color(s_ui.pl_panel_state, lv_color_hex(UI_COLOR_TEXT_DIM), 0);
     lv_obj_set_style_text_align(s_ui.pl_panel_state, LV_TEXT_ALIGN_RIGHT, 0);
 
     /* Evenly distribute the five controls: fixed-width slots left 4 px /
@@ -287,7 +287,7 @@ void ui_player_build_panel(void)
         lv_obj_set_size(btn, ui_label_width_px(s_panel_labels[i]),
                         LV_SIZE_CONTENT);
         lv_obj_set_style_text_font(btn, UI_FONT, 0);
-        lv_obj_set_style_text_color(btn, lv_color_hex(UI_COLOR_TEXT), 0);
+        lv_obj_set_style_text_color(btn, lv_color_hex(UI_COLOR_TEXT_DIM), 0);
         s_ui.pl_panel_btn[i] = btn;
     }
 
@@ -303,7 +303,7 @@ void ui_player_build_panel(void)
      * bottom. 30px = lv_font_cn_16 line height, keeps the whole row. */
     lv_obj_set_size(hint, 276, 30);
     lv_obj_set_style_text_font(hint, UI_FONT, 0);
-    lv_obj_set_style_text_color(hint, lv_color_hex(UI_COLOR_TEXT), 0);
+    lv_obj_set_style_text_color(hint, lv_color_hex(UI_COLOR_TEXT_DIM), 0);
     lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
 }
 
@@ -335,7 +335,7 @@ void ui_player_refresh_panel(void)
     for (int i = 0; i < PLAYER_PANEL_NBTN; i++) {
         ui_theme_text_set(s_ui.pl_panel_btn[i], ui_panel_btn_text(i));
         lv_obj_set_style_text_color(s_ui.pl_panel_btn[i],
-                                    lv_color_hex(i == s_panel_sel ? UI_COLOR_ACCENT : UI_COLOR_TEXT), 0);
+                                    lv_color_hex(i == s_panel_sel ? UI_COLOR_ACCENT : UI_COLOR_TEXT_DIM), 0);
     }
 }
 
@@ -761,4 +761,75 @@ bool ui_player_panel_key(uint32_t key)
         lv_obj_add_flag(s_ui.pl_panel, LV_OBJ_FLAG_HIDDEN);
     }
     return true;
+}
+
+/* ---- Mini player bar --------------------------------------------------------
+ * A one-line status strip on the screen, above the key-legend band. Visible only
+ * on non-player pages while audio is playing; on those pages it takes over the
+ * y=196 status row (the page's own status text steps aside). Updated every tick
+ * from ui_refresh(), so play/stop toggles show up without waiting for a repaint. */
+static lv_obj_t *s_mini_bar;
+static lv_obj_t *s_mini_text;
+static lv_obj_t *s_mini_vol;
+
+void ui_player_build_minibar(void)
+{
+    s_mini_bar = lv_obj_create(s_ui.screen);
+    lv_obj_remove_style_all(s_mini_bar);
+    lv_obj_set_pos(s_mini_bar, 0, UI_STATUS_ROW_Y);
+    lv_obj_set_size(s_mini_bar, UI_SCREEN_W, 20);
+    lv_obj_set_style_bg_opa(s_mini_bar, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(s_mini_bar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_mini_bar, LV_OBJ_FLAG_HIDDEN);
+
+    s_mini_text = lv_label_create(s_mini_bar);
+    lv_label_set_long_mode(s_mini_text, LV_LABEL_LONG_MODE_CLIP);
+    lv_obj_set_size(s_mini_text, 224, LV_SIZE_CONTENT);
+    lv_obj_set_pos(s_mini_text, 4, 2);
+    lv_obj_set_style_text_font(s_mini_text, UI_FONT, 0);
+    lv_obj_set_style_text_color(s_mini_text, ui_theme_color(UI_COLOR_TEXT_DIM), 0);
+
+    s_mini_vol = lv_label_create(s_mini_bar);
+    lv_label_set_long_mode(s_mini_vol, LV_LABEL_LONG_MODE_CLIP);
+    lv_obj_set_size(s_mini_vol, 88, LV_SIZE_CONTENT);
+    lv_obj_set_pos(s_mini_vol, 228, 2);
+    lv_obj_set_style_text_align(s_mini_vol, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_text_font(s_mini_vol, UI_FONT, 0);
+    lv_obj_set_style_text_color(s_mini_vol, ui_theme_color(UI_COLOR_TEXT_DIM), 0);
+}
+
+void ui_player_refresh_minibar(void)
+{
+    const bool active = (player_state() != PLAYER_IDLE) &&
+                         (ui_nav_current() != UI_PAGE_PLAYER);
+    if (!active) {
+        lv_obj_add_flag(s_mini_bar, LV_OBJ_FLAG_HIDDEN);
+        /* Restore the page's own status row (the bar borrowed its slot). */
+        if (ui_nav_current() == UI_PAGE_EBOOK_LIST && s_ui.eb_status) {
+            lv_obj_clear_flag(s_ui.eb_status, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (ui_nav_current() == UI_PAGE_BT && s_ui.bt_status) {
+            lv_obj_clear_flag(s_ui.bt_status, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
+
+    lv_obj_clear_flag(s_mini_bar, LV_OBJ_FLAG_HIDDEN);
+    /* Take over the status row on the two list-style pages. */
+    if (ui_nav_current() == UI_PAGE_EBOOK_LIST && s_ui.eb_status) {
+        lv_obj_add_flag(s_ui.eb_status, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ui_nav_current() == UI_PAGE_BT && s_ui.bt_status) {
+        lv_obj_add_flag(s_ui.bt_status, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    const char *sym = (player_state() == PLAYER_PLAYING) ? "> " : "|| ";
+    const char *name = player_current_name();
+    static char buf[160];
+    snprintf(buf, sizeof(buf), "%s%s", sym, (name && name[0]) ? name : "");
+    ui_theme_text_set(s_mini_text, buf);
+
+    static char vb[16];
+    snprintf(vb, sizeof(vb), "%d%%", hw_audio_get_volume());
+    ui_theme_text_set(s_mini_vol, vb);
 }

@@ -50,8 +50,8 @@ void ui_build_bt(lv_obj_t *page)
 
     ui_list_create(&s_ui.bt_list, page, UI_LIST_ROWS, UI_LIST_FIRST_Y, UI_ROW_H_LIST);
 
-    s_ui.bt_status = ui_theme_label(page, "扫描中...", 196, UI_COLOR_TEXT, LV_TEXT_ALIGN_CENTER);
-    s_ui.hint = ui_theme_label(page, "上/下选 A连接 Select扫描 B返回", 214, UI_COLOR_TEXT,
+    s_ui.bt_status = ui_theme_label(page, "扫描中...", 196, UI_COLOR_TEXT_DIM, LV_TEXT_ALIGN_CENTER);
+    s_ui.hint = ui_theme_label(page, "↑↓选 A连接 Select扫描 B返回", UI_LEGEND_Y, UI_COLOR_TEXT_DIM,
                          LV_TEXT_ALIGN_CENTER);
 
     bluetooth_audio_scan_start();   /* scan once on entry; SELECT re-scans */
@@ -138,7 +138,7 @@ void ui_refresh_bt(void)
             snprintf(st, sizeof(st), "扫描中... %d", count);
             st[27] = '\0';
             ui_theme_text_set(s_ui.bt_status, st);
-            ui_set_hint("上/下选 A连接 B返回");
+            ui_set_hint("↑↓选 A连接 B返回");
         }
         else {
             if (count) {
@@ -150,7 +150,7 @@ void ui_refresh_bt(void)
             else {
                 ui_theme_text_set(s_ui.bt_status, "无设备");
             }
-            ui_set_hint(count ? "上/下选 A连接 B返回" : "Select扫描 B返回");
+            ui_set_hint(count ? "↑↓选 A连接 B返回" : "Select扫描 B返回");
         }
 }
 

@@ -56,14 +56,6 @@ static const char *const s_page_names[UI_PAGE_COUNT] = {
     "电子书",
 };
 
-/* Main menu lists only these pages. Bluetooth was moved into Settings as a
- * sub-page (opened from the 蓝牙 settings item), so it is no longer a
- * top-level tab in the main menu. */
-static const ui_page_t s_menu_pages[] = {
-    UI_PAGE_PLAYER, UI_PAGE_EBOOK_LIST, UI_PAGE_SETTINGS,
-};
-#define UI_MENU_PAGE_COUNT ((int)(sizeof(s_menu_pages) / sizeof(s_menu_pages[0])))
-
 /* Status-bar now-playing marquee (active while a track is loaded). */
 
 
@@ -72,7 +64,6 @@ static const ui_page_t s_menu_pages[] = {
 
 
 ui_state_t s_ui;
-static int s_menu_sel;
 static uint32_t s_action_until_ms;
 static char s_action[32];
 
@@ -322,7 +313,7 @@ static void ui_build_page_content(lv_obj_t *page)
      * top-right corner (x >= UI_BATTERY_ZONE_X) is claimed by the persistent
      * battery gauge drawn above the page container, so the status text must
      * end before it. */
-    s_ui.status = ui_theme_label(page, "", UI_TITLE_Y, UI_COLOR_TEXT,
+    s_ui.status = ui_theme_label(page, "", UI_TITLE_Y, UI_COLOR_TEXT_DIM,
                                  LV_TEXT_ALIGN_RIGHT);
     lv_obj_set_width(s_ui.status, UI_STATUS_W);
 
@@ -355,95 +346,20 @@ static void ui_build_page_content(lv_obj_t *page)
 
     /* Generic value/bar page (used by the SD CARD page). */
     s_ui.value = ui_theme_label(page, "--", 50, UI_COLOR_ACCENT, LV_TEXT_ALIGN_CENTER);
-    s_ui.sub = ui_theme_label(page, "--", 88, UI_COLOR_TEXT, LV_TEXT_ALIGN_CENTER);
+    s_ui.sub = ui_theme_label(page, "--", 88, UI_COLOR_TEXT_DIM, LV_TEXT_ALIGN_CENTER);
     s_ui.bar = ui_theme_bar(page, 0);
-    s_ui.hint = ui_theme_label(page, "A重扫 B返回", 176, UI_COLOR_TEXT, LV_TEXT_ALIGN_CENTER);
-}
-
-/* Menu uses show/hide transitions instead of LVGL swipe animations. */
-
-static void ui_refresh_menu(void)
-{
-    for (int i = 0; i < UI_MENU_ROWS; i++) {
-        if (i >= UI_MENU_PAGE_COUNT) {
-            continue;
-        }
-        const int sel = (i == s_menu_sel);
-        lv_label_set_text(s_ui.menu_cursor[i], sel ? ">" : " ");
-        lv_obj_set_style_text_color(s_ui.menu_cursor[i], lv_color_hex(UI_COLOR_ACCENT), 0);
-        lv_obj_set_style_text_color(s_ui.menu_text[i],
-                                    lv_color_hex(sel ? UI_COLOR_ACCENT : UI_COLOR_TEXT), 0);
-    }
-
-    char buf[32];
-    snprintf(buf, sizeof(buf), "[%d/%d]", (int)(s_menu_sel + 1), (int)UI_MENU_PAGE_COUNT);
-    lv_label_set_text(s_ui.menu_status, buf);
-}
-
-static void ui_build_menu(void)
-{
-    lv_obj_t *mp = lv_obj_create(s_ui.screen);
-    lv_obj_remove_style_all(mp);
-    lv_obj_set_pos(mp, 0, 0);
-    lv_obj_set_size(mp, UI_SCREEN_W, UI_SCREEN_H);
-    lv_obj_set_style_bg_color(mp, lv_color_hex(UI_COLOR_BG), 0);
-    lv_obj_set_style_bg_opa(mp, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(mp, LV_OBJ_FLAG_SCROLLABLE);
-    s_ui.menu_page = mp;
-
-    /* Title bar: ASCII cat kaomoji in retro-green, left-aligned. */
-    lv_obj_t *title = lv_label_create(mp);
-    lv_label_set_text(title, "=^_^=");
-    lv_obj_set_pos(title, 4, 2);
-    lv_obj_set_style_text_font(title, UI_FONT, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(UI_COLOR_TITLE), 0);
-
-    /* Separator line spanning the full width, clear of the title. */
-    ui_theme_separator(mp, UI_SEP_Y);
-
-    /* Menu rows: cursor at x=8, text at x=18. */
-    for (int i = 0; i < UI_MENU_ROWS; i++) {
-        const int y = UI_MENU_FIRST_Y + i * UI_ROW_H_MENU;
-        lv_obj_t *cur = lv_label_create(mp);
-        lv_label_set_text(cur, " ");
-        lv_obj_set_pos(cur, 8, y);
-        lv_obj_set_style_text_font(cur, UI_FONT, 0);
-        lv_obj_set_style_text_color(cur, lv_color_hex(UI_COLOR_TEXT), 0);
-        s_ui.menu_cursor[i] = cur;
-
-        lv_obj_t *txt = lv_label_create(mp);
-        lv_label_set_long_mode(txt, LV_LABEL_LONG_MODE_CLIP);
-        lv_label_set_text(txt, i < UI_MENU_PAGE_COUNT ? s_page_names[s_menu_pages[i]] : "");
-        lv_obj_set_pos(txt, 18, y);
-        lv_obj_set_style_text_font(txt, UI_FONT, 0);
-        lv_obj_set_style_text_color(txt, lv_color_hex(UI_COLOR_TEXT), 0);
-        s_ui.menu_text[i] = txt;
-    }
-
-    /* Bottom status bar: "[n/3]" left, "A:OK B:BK" right, both gray. */
-    char mbuf[32];
-    snprintf(mbuf, sizeof(mbuf), "[1/%d]", (int)UI_MENU_PAGE_COUNT);
-    s_ui.menu_status = lv_label_create(mp);
-    lv_label_set_text(s_ui.menu_status, mbuf);
-    lv_obj_set_pos(s_ui.menu_status, 4, 206);
-    lv_obj_set_style_text_font(s_ui.menu_status, UI_FONT, 0);
-    lv_obj_set_style_text_color(s_ui.menu_status, lv_color_hex(UI_COLOR_TEXT), 0);
-
-    lv_obj_t *hint = lv_label_create(mp);
-    lv_label_set_text(hint, "A:OK B:BK");
-    lv_obj_set_pos(hint, 200, 206);
-    lv_obj_set_style_text_font(hint, UI_FONT, 0);
-    lv_obj_set_style_text_color(hint, lv_color_hex(UI_COLOR_TEXT), 0);
+    s_ui.hint = ui_theme_label(page, "A重扫 B返回", UI_LEGEND_Y, UI_COLOR_TEXT_DIM, LV_TEXT_ALIGN_CENTER);
 }
 
 void ui_show_menu(void)
 {
     ui_nav_home();
+    ui_launcher_reset();
     if (s_ui.page) {
         lv_obj_add_flag(s_ui.page, LV_OBJ_FLAG_HIDDEN);
     }
     lv_obj_clear_flag(s_ui.menu_page, LV_OBJ_FLAG_HIDDEN);
-    ui_refresh_menu();
+    ui_refresh_launcher();
 }
 
 /*
@@ -597,11 +513,11 @@ static bool ui_external_changed(void)
  * battery reads as an obvious red icon.
  *   <=15% red | <=35% orange | <=60% yellow | <=85% cyan | <=100% green */
 static const uint32_t s_bat_palette[5] = {
-    0xFF2020,  /* red    - critical (<=15%)  */
-    0xFF9000,  /* orange - low      (<=35%)  */
-    0xFFE000,  /* yellow - medium   (<=60%)  */
-    0x00E0FF,  /* cyan   - good      (<=85%)  */
-    0x20FF40,  /* green  - full      (<=100%) */
+    0xF85149,          /* red    - critical (<=15%)  */
+    UI_COLOR_WARN,     /* orange - low      (<=35%)  */
+    0xFFE000,          /* yellow - medium   (<=60%)  */
+    UI_COLOR_ACCENT,   /* cyan   - good      (<=85%) */
+    UI_COLOR_OK,       /* green  - full      (<=100%) */
 };
 
 static uint32_t bat_color_for_pct(uint8_t pct)
@@ -665,6 +581,10 @@ static void ui_refresh_battery(void)
 void ui_refresh(void)
 {
     ui_settings_flush();
+    /* Mini player bar updates every tick (incl. on the menu) so a play/stop
+     * transition shows up immediately; it owns its own show/hide and the
+     * mutual exclusion with the page status rows. */
+    ui_player_refresh_minibar();
     if (ui_nav_in_menu()) {
         /* Menu is event-driven, but keep the battery gauge and the playback
          * panel live on every tick. */
@@ -845,18 +765,15 @@ static void ui_key_event_cb(lv_event_t *e)
     }
 
     if (ui_nav_in_menu()) {
-        if (key == LV_KEY_UP) {
-            s_menu_sel = (s_menu_sel + UI_MENU_PAGE_COUNT - 1) % UI_MENU_PAGE_COUNT;
-            ui_refresh_menu();
-        }
-        else if (key == LV_KEY_DOWN) {
-            s_menu_sel = (s_menu_sel + 1) % UI_MENU_PAGE_COUNT;
-            ui_refresh_menu();
+        /* The launcher is a 3×2 icon grid; arrows walk it, ENTER opens the
+         * selected page. B (ESC) is a no-op while already on the home screen. */
+        if (key == LV_KEY_UP || key == LV_KEY_DOWN ||
+            key == LV_KEY_LEFT || key == LV_KEY_RIGHT) {
+            ui_launcher_nav(key);
         }
         else if (key == LV_KEY_ENTER) {
-            ui_go(s_menu_pages[s_menu_sel]);
+            ui_go(ui_launcher_page());
         }
-        /* B (ESC) is a no-op while already on the main menu. */
     }
     /* Inside a detail page. */
     else if (key == LV_KEY_ESC) {
@@ -876,8 +793,15 @@ static void ui_key_event_cb(lv_event_t *e)
                 ui_nav_back_or_menu();
             }
             break;
+        case UI_PAGE_SETTINGS:
+            /* Inside a group's item list, B steps back to the group list; on the
+             * group list itself, B pops to the launcher. */
+            if (!ui_settings_esc()) {
+                ui_nav_back_or_menu();
+            }
+            break;
         default:
-            /* Bluetooth, Settings and any future page. */
+            /* Bluetooth and any future page. */
             ui_nav_back_or_menu();
             break;
         }
@@ -926,8 +850,7 @@ void ui_create(lv_group_t *group)
     ui_settings_load();
 
     s_ui.group = group;
-    ui_nav_init();          /* boot on the main menu: empty page stack */
-    s_menu_sel = 0;
+    ui_nav_init();          /* boot on the home screen: empty page stack */
 
     s_ui.screen = lv_obj_create(lv_screen_active());
     lv_obj_remove_style_all(s_ui.screen);
@@ -942,8 +865,9 @@ void ui_create(lv_group_t *group)
     /* Use the embedded CJK font everywhere so Chinese text renders. */
     lv_obj_set_style_text_font(s_ui.screen, UI_FONT, 0);
 
-    ui_build_menu();
-    ui_refresh_menu();
+    ui_build_launcher();
+    ui_refresh_launcher();
+    ui_player_build_minibar();
 
     /* Persistent battery gauge in the top-right corner, above every page.
      * Layout: a 5-segment battery icon + "100%" text, anchored with absolute

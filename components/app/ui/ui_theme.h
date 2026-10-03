@@ -27,13 +27,19 @@
 #define UI_SP_4             16
 
 /* ---- Layout bands ----
- * Frozen from the previous pixel layout: title row, separator under it, and
- * the hint row near the bottom. Pages position themselves against these. */
+ * Three bands, and every page positions itself against them:
+ *   status bar   y 0 .. 33   (page title left, live status + battery right)
+ *   content      y 34 .. 215 (lists, reader body, page-specific status row)
+ *   key legend   y 216 .. 239 (what the keys do here, or a transient toast)
+ * Keeping the three bands in one place is what lets a restyle move the whole
+ * layout without hunting for magic numbers inside the pages. */
 #define UI_TITLE_X          6       /* 2 px left of the default margin */
 #define UI_TITLE_Y          2
 #define UI_SEP_Y            34
 #define UI_PAGE_MARGIN      8
-#define UI_HINT_Y           204
+#define UI_CONTENT_Y        36
+#define UI_STATUS_ROW_Y     196     /* page status row (player/book/BT) */
+#define UI_LEGEND_Y         218     /* key legend / toast, bottom band */
 
 /* ---- Text boxes ---- */
 #define UI_TEXT_W           (UI_SCREEN_W - 16)  /* 304: page margin each side */
@@ -48,17 +54,45 @@
 #define UI_LIST_FIRST_Y     38
 #define UI_ROW_H_LIST       26      /* 38, 64, 90, 116, 142, 168 */
 #define UI_SETTINGS_FIRST_Y 38
-#define UI_ROW_H_SETTING    20      /* 38, 58, 78, 98, 118, 138, 158, 178 */
-#define UI_MENU_ROWS        5
-#define UI_MENU_FIRST_Y     38
-#define UI_ROW_H_MENU       30      /* 38, 68, 98, 128, 158 */
+#define UI_ROW_H_SETTING    26      /* 38, 64, 90, 116, 142, 168, 194, 220 (matches list rows) */
 
-/* ---- Palette (BIOS/DOS style: dark base + cyan accent + gray text) ---- */
-#define UI_COLOR_BG         0x000000
-#define UI_COLOR_TEXT       0x808080
-#define UI_COLOR_ACCENT     0x00E0E0
-#define UI_COLOR_TITLE      0xFF8000
-#define UI_COLOR_PANEL_BG   0x101010
+/* ---- Launcher grid (3×2 tiles; only 4 populated for now) ----
+ * Tiles are 96×84 with 8px gaps; the 3 columns span the full 320px width
+ * (8 + 96 + 8 + 96 + 8 + 96 + 8 = 320). Row 0 sits just below the separator;
+ * row 1 leaves 2px to the bottom band. All icon/label offsets inside a tile are
+ * relative to the tile's top-left. */
+#define UI_TILE_W           96
+#define UI_TILE_H           84
+#define UI_TILE_GAP_X       8
+#define UI_TILE_GAP_Y       8
+#define UI_TILE_X(col)      (UI_PAGE_MARGIN + (col) * (UI_TILE_W + UI_TILE_GAP_X))
+#define UI_TILE_Y(row)      (UI_CONTENT_Y + 2 + (row) * (UI_TILE_H + UI_TILE_GAP_Y))
+#define UI_TILE_ICON        40      /* icon box edge inside a tile */
+#define UI_TILE_LABEL_Y     54      /* label offset from tile top */
+#define UI_TILE_COUNT       6       /* 3 columns × 2 rows */
+
+/* ---- Palette ----
+ * Cool dark theme. Two rules drove it:
+ *  1. Low-chroma backgrounds. The panel is SPI-driven with a 40-line partial
+ *     refresh, so large saturated areas cost real flush time — colour is spent
+ *     on small elements (focus bar, status, battery) instead.
+ *  2. One accent colour. Without a touchscreen the accent *is* the focus
+ *     indicator, so it must never be used decoratively. */
+#define UI_COLOR_BG         0x0B0E14   /* screen / page background        */
+/* Focused row fill. Deliberately a clear step above the background: on a dim
+ * handheld screen the fill — not the text colour — is what the eye finds
+ * first when scrolling. */
+#define UI_COLOR_PANEL      0x1E2632
+#define UI_COLOR_SURFACE    0x151A22   /* cards, floating panel fill      */
+#define UI_COLOR_LINE       0x2A323D   /* separators, borders             */
+#define UI_COLOR_TEXT       0xE6EDF3   /* primary text                    */
+#define UI_COLOR_TEXT_DIM   0x8B949E   /* secondary / unfocused text      */
+#define UI_COLOR_ACCENT     0x22D3EE   /* focus + emphasis (one meaning)  */
+/* The title bar reads as a title by position and by the separator under it,
+ * not by its own colour. */
+#define UI_COLOR_TITLE      UI_COLOR_TEXT
+#define UI_COLOR_WARN       0xFF9F43
+#define UI_COLOR_OK         0x3FB950
 
 /* ---- Type ----
  * One embedded CJK bitmap font (~1.2 MB, ASCII + ~22k ideographs + kana).

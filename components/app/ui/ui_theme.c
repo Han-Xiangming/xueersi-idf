@@ -49,7 +49,7 @@ lv_obj_t *ui_theme_separator(lv_obj_t *parent, int y)
     lv_obj_remove_style_all(sep);
     lv_obj_set_pos(sep, 0, y);
     lv_obj_set_size(sep, UI_SCREEN_W, 1);
-    lv_obj_set_style_bg_color(sep, ui_theme_color(UI_COLOR_TEXT), 0);
+    lv_obj_set_style_bg_color(sep, ui_theme_color(UI_COLOR_LINE), 0);
     lv_obj_set_style_bg_opa(sep, LV_OPA_COVER, 0);
     lv_obj_clear_flag(sep, LV_OBJ_FLAG_SCROLLABLE);
     return sep;
@@ -63,7 +63,7 @@ lv_obj_t *ui_theme_bar(lv_obj_t *parent, int value)
     lv_bar_set_range(bar, 0, 100);
     lv_bar_set_value(bar, value, LV_ANIM_OFF);
     lv_obj_set_style_radius(bar, 4, 0);
-    lv_obj_set_style_bg_color(bar, ui_theme_color(UI_COLOR_TEXT), 0);
+    lv_obj_set_style_bg_color(bar, ui_theme_color(UI_COLOR_LINE), 0);
     lv_obj_set_style_bg_color(bar, ui_theme_color(UI_COLOR_ACCENT), LV_PART_INDICATOR);
     lv_obj_set_style_radius(bar, 4, LV_PART_INDICATOR);
     return bar;
