@@ -197,7 +197,7 @@ static bool s_panel_open;
 static int  s_panel_sel;   /* 0..4, index into the five controls */
 
 static const char *const s_panel_labels[PLAYER_PANEL_NBTN] = {
-    UI_STR_PREV, UI_STR_PLAY, UI_STR_NEXT, UI_STR_STOP, UI_STR_LOOP,
+    "⏮", "⏸", "⏭", "⏹", UI_STR_LOOP,
 };
 /* The play/pause button label is state-dependent (player-page convention:
  * UI_STR_PAUSE while playing, UI_STR_RESUME while paused); the repeat button shows the
@@ -206,16 +206,17 @@ static const char *const s_panel_labels[PLAYER_PANEL_NBTN] = {
 static const char *ui_panel_btn_text(int i)
 {
     if (i == 1) {
+        /* Play/pause control: show the action it will perform. */
         switch (player_state()) {
-        case PLAYER_PLAYING: return UI_STR_PAUSE;
-        case PLAYER_PAUSED:  return UI_STR_RESUME;
-        default:             return UI_STR_PLAY;
+        case PLAYER_PLAYING: return "⏸";   /* tap to pause */
+        case PLAYER_PAUSED:  return "▶";   /* tap to resume */
+        default:             return "▶";   /* tap to play */
         }
     }
     if (i == 4) {
-        return ui_repeat_text();
+        return ui_repeat_text();   /* repeat mode: 列表/单曲/随机 */
     }
-    return s_panel_labels[i];
+    return s_panel_labels[i];      /* ⏮ / ⏭ / ⏹ */
 }
 
 /* Build the floating panel once at startup (sibling of the battery gauge on
@@ -328,7 +329,7 @@ void ui_player_refresh_panel(void)
 
     static char s_panel_state_buf[16];
     snprintf(s_panel_state_buf, sizeof(s_panel_state_buf), "%s%s",
-             st == PLAYER_PLAYING ? ">>" : st == PLAYER_PAUSED ? "||" : "--",
+             st == PLAYER_PLAYING ? "▶" : st == PLAYER_PAUSED ? "⏸" : "□",
              ui_repeat_text());
     ui_theme_text_set(s_ui.pl_panel_state, s_panel_state_buf);
 
@@ -543,11 +544,11 @@ void ui_refresh_player(void)
         if (s_mp3_loading && !player_scan_busy()) {
             s_mp3_loading = false;
         }
-        /* Top-right status: playback symbol + repeat mode, e.g. ">>单曲" /
-         * "||列表" / "--随机", so the current loop mode is always visible. */
+        /* Top-right status: playback symbol + repeat mode, e.g. "▶单曲" /
+         * "⏸列表" / "⏹随机", so the current loop mode is always visible. */
         char stbuf[16];
         snprintf(stbuf, sizeof(stbuf), "%s%s",
-                 st == PLAYER_PLAYING ? ">>" : st == PLAYER_PAUSED ? "||" : "--",
+                 st == PLAYER_PLAYING ? "▶" : st == PLAYER_PAUSED ? "⏸" : "⏹",
                  ui_repeat_text());
         ui_theme_text_set(s_ui.status, stbuf);
         if (st == PLAYER_IDLE) {

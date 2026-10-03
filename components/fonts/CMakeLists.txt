@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "lv_font_cn_16.c"
+    SRCS "lv_font_cn_16.c" "lv_font_pause.c"
     INCLUDE_DIRS "."
     REQUIRES lvgl
 )

@@ -100,6 +100,7 @@
  * NOTE: adding a second CJK face would cost ~2 MB of the 3.81 MB app
  * partition — build hierarchy with position/colour/space instead. */
 extern const lv_font_t lv_font_cn_16;
+extern const lv_font_t lv_font_pause;
 #define UI_FONT             (&lv_font_cn_16)
 
 /* ---- Primitives ---- */
