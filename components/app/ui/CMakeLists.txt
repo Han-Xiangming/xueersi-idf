@@ -23,4 +23,5 @@ idf_component_register(
              nvs_flash
              player
              sd
+             log_sink
 )

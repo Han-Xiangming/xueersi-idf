@@ -23,3 +23,14 @@ void log_sink_enqueue(const char *buf, size_t n);
 /* Flush buffered logs to disk immediately (best-effort). Call from
  * error/critical paths so important lines survive a reset. */
 void log_sink_flush(void);
+
+/* Runtime enable/disable of the SD mirror. When disabled, lines are dropped
+ * (not enqueued) and any open segment is closed, so the card stops being
+ * touched entirely — useful to spare SD wear in normal use. Safe to call from
+ * any task; the drain task reopens on enable. */
+void log_sink_set_enabled(bool on);
+bool log_sink_get_enabled(void);
+
+/* Delete every on-card log segment (best-effort). Closes the current file so
+ * it is not half-deleted; the next line opens a fresh segment. */
+void log_sink_clear(void);

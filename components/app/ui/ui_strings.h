@@ -18,6 +18,9 @@
 #define UI_STR_SET_RESCAN     "刷新播放列表" /* was 重建播放列表 (sounded destructive) */
 #define UI_STR_SET_RESET      "恢复出厂设置" /* was 重置NVS (internal jargon) */
 #define UI_STR_SET_CLEAR_PROG "清除阅读进度"
+#define UI_STR_SET_LOG_SAVE   "日志保存"
+#define UI_STR_SET_LOG_LEVEL  "日志级别"
+#define UI_STR_SET_LOG_CLEAR  "清空日志"
 
 /* --- Settings value / action feedback --- */
 #define UI_STR_NEVER      "永不"
@@ -28,6 +31,9 @@
 #define UI_STR_RESETTING  "重置中..."
 #define UI_STR_CLEAR_A    "按A清除"
 #define UI_STR_CLEARED    "已清除进度"
+#define UI_STR_LOG_ON     "开"
+#define UI_STR_LOG_OFF    "关"
+#define UI_STR_LOG_CLEARED "已清空日志"
 
 /* --- Player panel controls --- */
 #define UI_STR_PREV        "上一曲"

@@ -38,6 +38,9 @@ typedef enum {
     SETTING_RESCAN,
     SETTING_RESET,
     SETTING_CLEAR_PROG,
+    SETTING_LOG_SAVE,        /* 日志保存：SD 落盘开关 */
+    SETTING_LOG_LEVEL,       /* 日志级别：NONE..VERBOSE */
+    SETTING_LOG_CLEAR,       /* 清空日志：删除已落盘文件 */
     SETTING_COUNT,
 } setting_item_t;
 
@@ -50,6 +53,7 @@ typedef enum {
 #define SETTINGS_DIRTY_BT       (1u << 2)
 #define SETTINGS_DIRTY_BACKL    (1u << 3)
 #define SETTINGS_DIRTY_STBY     (1u << 4)
+#define SETTINGS_DIRTY_LOG      (1u << 5)
 
 /* ---- Marquee (scrolling names that are wider than the row) ---- */
 #define LIST_SCROLL_MS      220

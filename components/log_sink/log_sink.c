@@ -56,6 +56,7 @@ static FILE *s_fp;
 static size_t s_size;
 static bool s_active;
 static bool s_dirty;          /* unsynced writes since last fsync */
+static bool s_enabled = true; /* SD mirror master switch (settings UI) */
 static uint32_t s_seq;        /* current segment number */
 
 static void ensure_dir(void)
@@ -211,6 +212,16 @@ static void drain_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
+        if (!s_enabled) {
+            /* Mirror disabled from settings: don't touch the card at all.
+             * Lines still flow to UART (xm_console_vprintf) so the device
+             * stays diagnosable over serial; only the SD copy is suppressed. */
+            if (s_active) {
+                close_file();
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
         if (!s_active) {
             open_file();
             if (!s_active) {
@@ -270,8 +281,52 @@ void log_sink_flush(void)
  * buffer and returns immediately; overflow drops the line. */
 void log_sink_enqueue(const char *buf, size_t n)
 {
-    if (s_stream == NULL || n == 0) {
+    if (s_stream == NULL || n == 0 || !s_enabled) {
         return;
     }
     xStreamBufferSend(s_stream, buf, n, 0);
+}
+
+void log_sink_set_enabled(bool on)
+{
+    s_enabled = on;
+    /* Turning off: stop writing right away. Turning on: the drain task opens
+     * a fresh segment on its next pass (when the card is mounted). */
+    if (!on && s_active) {
+        close_file();
+    }
+}
+
+bool log_sink_get_enabled(void)
+{
+    return s_enabled;
+}
+
+/* Delete every on-card log segment. We close the open file first so unlink
+ * never lands on a half-written handle, then reset the sequence so the next
+ * open starts at app_0001.log again. The drain task reopens automatically
+ * once a new line arrives (and the mirror is still enabled). */
+void log_sink_clear(void)
+{
+    close_file();
+    DIR *d = opendir(LOG_DIR);
+    if (d == NULL) {
+        return;
+    }
+    struct dirent *e;
+    size_t pfx = strlen(LOG_NAME_PFX);
+    while ((e = readdir(d)) != NULL) {
+        size_t len = strlen(e->d_name);
+        if (len < pfx + 4 || strncmp(e->d_name, LOG_NAME_PFX, pfx) != 0) {
+            continue;
+        }
+        if (strcmp(e->d_name + len - 4, ".log") != 0) {
+            continue;
+        }
+        char path[LOG_NAME_MAX];
+        snprintf(path, sizeof(path), "%s/%s", LOG_DIR, e->d_name);
+        unlink(path);
+    }
+    closedir(d);
+    s_seq = 0;   /* restart the segment sequence at 1 */
 }
