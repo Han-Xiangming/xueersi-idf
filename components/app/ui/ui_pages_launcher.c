@@ -200,7 +200,8 @@ static void ui_launcher_indicator_place(void)
 /* Arrow-key navigation over the grid. Left/right walk the row-major slot order
  * and wrap around at the ends, so pressing left on the first slot (or right on
  * the last) carries onto the other row instead of sticking at the grid edge.
- * Up/down step between rows, preferring the slot nearest the current column. */
+ * Up/down step one row, preferring the slot nearest the current column and
+ * wrapping from the top row onto the bottom one (and back) at the edges. */
 void ui_launcher_nav(uint32_t key)
 {
     const int cur = s_launch_sel;
@@ -219,7 +220,21 @@ void ui_launcher_nav(uint32_t key)
 
     const int row = s_launch[cur].row;
     const int col = s_launch[cur].col;
-    const int tr  = (key == LV_KEY_UP) ? row - 1 : row + 1;
+
+    /* rows present in the grid, so up/down can wrap from the top row onto the
+     * bottom one (and back) instead of sticking at the edge. */
+    int min_row = row, max_row = row;
+    for (int i = 0; i < LAUNCH_COUNT; i++) {
+        if (s_launch[i].row < min_row) {
+            min_row = s_launch[i].row;
+        }
+        if (s_launch[i].row > max_row) {
+            max_row = s_launch[i].row;
+        }
+    }
+    const int tr = (key == LV_KEY_UP)
+                       ? (row == min_row ? max_row : row - 1)
+                       : (row == max_row ? min_row : row + 1);
 
     int best = cur, best_dist = 1000;
     for (int i = 0; i < LAUNCH_COUNT; i++) {
