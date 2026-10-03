@@ -2,7 +2,7 @@
  * Launcher (home screen). Replaces the old text list menu.
  *
  * A 3×2 grid of icon tiles; only the first four slots are populated for now
- * (music / ebook / settings / bluetooth — the 5th and 6th stay empty). The
+ * (music / ebook / bluetooth / settings — the 5th and 6th stay empty). The
  * grid is walked with the arrow keys: up/down change rows, left/right change
  * columns, and the nearest valid slot in the requested direction wins. Enter
  * opens the selected page.
@@ -41,8 +41,8 @@ typedef struct {
 static const launch_slot_t s_launch[] = {
     {0, 0, ICON_MUSIC, "音乐",   UI_PAGE_PLAYER},
     {0, 1, ICON_EBOOK, "电子书", UI_PAGE_EBOOK_LIST},
-    {0, 2, ICON_GEAR,  "设置",   UI_PAGE_SETTINGS},
-    {1, 0, ICON_BT,    "蓝牙",   UI_PAGE_BT},
+    {0, 2, ICON_BT,    "蓝牙",   UI_PAGE_BT},
+    {1, 0, ICON_GEAR,  "设置",   UI_PAGE_SETTINGS},
 };
 #define LAUNCH_COUNT ((int)(sizeof(s_launch) / sizeof(s_launch[0])))
 
