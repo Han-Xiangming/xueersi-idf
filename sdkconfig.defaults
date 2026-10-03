@@ -85,6 +85,12 @@ CONFIG_SPIRAM=y
 #
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+# Keep small "default" allocations (FreeRTOS mutexes, LVGL objects, BT queues)
+# able to spill into PSRAM when internal DRAM is full, instead of failing with
+# ESP_ERR_NO_MEM / fixed_queue_new assert. The 32 KB RESERVE_INTERNAL still
+# protects DMA/IRAM-critical allocations. WiFi buffers also go to PSRAM.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 
 #
 # SPIRAM cache workaround debugging

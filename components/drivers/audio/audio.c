@@ -910,24 +910,26 @@ void hw_audio_init(void)
     ESP_LOGI(TAG, "[AUDIO] I2S ready (i2s_std WRITER, %u Hz fixed)",
              (unsigned)s_rate);
 
-    /* Route starts at the speaker; nothing else may flip it (see hw_audio_set_route).
-     * A Bluetooth link coming up does NOT hijack a speaker session — but a link
-     * that drops must return immediately, regardless of which UI page is shown,
-     * so a speaker session resumes without waiting for the user to poll. */
+    /* Route starts at the speaker. The Bluetooth link callback (see
+     * hw_audio_on_bt_conn_state) flips it on connect/disconnect, so output
+     * follows the A2DP link regardless of which UI page is on screen — an
+     * auto-connect during local I2S playback switches to Bluetooth at once. */
     s_route = AUDIO_ROUTE_SPEAKER;
     bluetooth_audio_set_conn_state_cb(hw_audio_on_bt_conn_state);
 }
 
 
-/* Bluetooth link callback. On a drop (remote power-off / out of range / failed
- * dial-out) we return the route to the speaker at once. On connect we do NOT
- * auto-take the route — that stays an explicit user action in the BT page, so a
- * speaker session is never silently hijacked. */
+/* Bluetooth link callback. Route follows the A2DP link, independent of which UI
+ * page is shown:
+ *  - connect: take the route to Bluetooth at once, so an auto-connect during
+ *    local I2S playback promptly switches to A2DP instead of staying on the
+ *    speaker (phone-like "BT takes over output" behavior);
+ *  - disconnect (remote power-off / out of range / failed dial-out): return to
+ *    the speaker immediately so a local session resumes without waiting for the
+ *    user to poll the BT page. */
 static void hw_audio_on_bt_conn_state(bool connected)
 {
-    if (!connected) {
-        audio_apply_route(AUDIO_ROUTE_SPEAKER);
-    }
+    audio_apply_route(connected ? AUDIO_ROUTE_BT : AUDIO_ROUTE_SPEAKER);
 }
 
 void hw_audio_set_volume(uint8_t volume_pct)

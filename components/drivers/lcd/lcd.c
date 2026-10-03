@@ -3,6 +3,7 @@
  * See lcd.h.
  */
 #include <assert.h>
+#include <string.h>
 #include <sys/param.h>
 
 #include "board_config.h"
@@ -104,6 +105,18 @@ static portMUX_TYPE s_flush_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile int32_t s_flush_pending = 0;    /* row DMA transfers in flight */
 static volatile bool s_flush_ready_sent = false; /* lv_display_flush_ready() delivered */
 
+/* DMA bounce buffer for row colour transfers. esp_lcd_panel_io_tx_color()
+ * allocates a private TX buffer per call (a copy into non-cached internal DMA
+ * memory) whenever the source is not DMA-safe — e.g. the draw buffers, which
+ * live in cached PSRAM on ESP32-S3. Under memory pressure that allocation
+ * fails (ESP_ERR_NO_MEM -> "flush line ... failed"). We instead keep a small
+ * ring of DMA-capable, non-cached bounce buffers and copy each row into one
+ * before queueing, so the SPI layer never needs to allocate. The ring must be
+ * at least as deep as trans_queue_depth (10) so a slot is never reused while
+ * its transfer is still queued. */
+#define LCD_FLUSH_BOUNCE_COUNT   10
+static uint8_t *s_flush_bounce[LCD_FLUSH_BOUNCE_COUNT];
+
 /* ---- Auto screen-off (standby) ----
  * Idle timer: after s_standby_timeout_ms of no activity the backlight is
  * switched off and the panel is put into DISPOFF to save power. Any call to
@@ -125,22 +138,27 @@ static void st7789_delay_ms(uint32_t ms)
 
 static void st7789_clear_black(esp_lcd_panel_io_handle_t io_handle)
 {
-    static uint16_t line[LCD_H_RES * 8];
     const uint8_t caset[] = {
         0x00, 0x00,
         (LCD_H_RES - 1) >> 8, (LCD_H_RES - 1) & 0xFF,
     };
 
-    memset(line, 0, sizeof(line));
+    /* Black row lives in the DMA bounce ring, so the SPI layer needs no private
+     * copy. Send one row at a time and index into the ring so a slot is never
+     * reused while its transfer is still queued. */
+    for (int i = 0; i < LCD_FLUSH_BOUNCE_COUNT; i++) {
+        memset(s_flush_bounce[i], 0, LCD_H_RES * sizeof(uint16_t));
+    }
     ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, ST7789_CASET, caset, sizeof(caset)));
-    for (uint16_t y = 0; y < LCD_V_RES; y += 8) {
-        const uint16_t y2 = MIN((uint16_t)(y + 7), (uint16_t)(LCD_V_RES - 1));
+    for (uint16_t y = 0; y < LCD_V_RES; y++) {
         const uint8_t raset[] = {
             y >> 8, y & 0xFF,
-            y2 >> 8, y2 & 0xFF,
+            y >> 8, y & 0xFF,
         };
         ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, ST7789_RASET, raset, sizeof(raset)));
-        ESP_ERROR_CHECK(esp_lcd_panel_io_tx_color(io_handle, ST7789_RAMWR, line, (y2 - y + 1) * LCD_H_RES * sizeof(uint16_t)));
+        ESP_ERROR_CHECK(esp_lcd_panel_io_tx_color(io_handle, ST7789_RAMWR,
+                                                 s_flush_bounce[y % LCD_FLUSH_BOUNCE_COUNT],
+                                                 LCD_H_RES * sizeof(uint16_t)));
     }
 }
 
@@ -263,13 +281,13 @@ static void lvgl_flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t 
     portEXIT_CRITICAL(&s_flush_mux);
     int rows_queued = 0;
 
-    /* Send the dirty rectangle one row at a time instead of as a single big
-     * block. esp_lcd_panel_io_tx_color() allocates a private DMA "TX buffer"
-     * when the payload is large / not DMA-friendly, and a full-screen flush
-     * (320*240*2 = 153600 bytes) can fail that allocation (ESP_ERR_NO_MEM ->
-     * abort). Per-row transfers cap the payload at width*2 bytes (<= 640 for
-     * this panel), so the internal buffer is always tiny and the allocation
-     * succeeds even under PSRAM fragmentation. */
+    /* Send the dirty rectangle one row at a time. Each row is copied into a
+     * DMA-capable, non-cached bounce buffer (s_flush_bounce) before being
+     * queued, so esp_lcd_panel_io_tx_color() never has to allocate its own
+     * private TX buffer (which fails with ESP_ERR_NO_MEM under memory
+     * pressure). The bounce ring is indexed by submission order and is at least
+     * as deep as the SPI queue (trans_queue_depth), so a slot is never reused
+     * while its DMA transfer is still in flight. */
     for (int y = area->y1; y <= area->y2; ++y) {
         const uint16_t x_start = area->x1 + LCD_X_GAP;
         const uint16_t x_end = area->x2 + LCD_X_GAP;
@@ -295,7 +313,9 @@ static void lvgl_flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t 
             lcd_flush_abort(display, rows, rows_queued);
             return;
         }
-        err = esp_lcd_panel_io_tx_color(io_handle, ST7789_RAMWR, line, line_bytes);
+        uint8_t *bb = s_flush_bounce[rows_queued % LCD_FLUSH_BOUNCE_COUNT];
+        memcpy(bb, line, line_bytes);
+        err = esp_lcd_panel_io_tx_color(io_handle, ST7789_RAMWR, bb, line_bytes);
         if (err != ESP_OK) {
             /* Never abort on a transient transfer error: just unlock the
              * display so LVGL can retry next frame instead of deadlocking or
@@ -330,6 +350,16 @@ void hw_lcd_init(void)
         .max_transfer_sz = LCD_H_RES * LCD_DRAW_BUF_LINES * sizeof(uint16_t),
     };
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
+
+    /* Allocate the row-transfer bounce ring from the SPI bus's DMA-capable
+     * (non-cached, internal) pool. Small and allocated once, so it never
+     * contends with the per-frame priv-buffer churn that was failing. */
+    for (int i = 0; i < LCD_FLUSH_BOUNCE_COUNT; i++) {
+        s_flush_bounce[i] = spi_bus_dma_memory_alloc(LCD_HOST,
+                                                     LCD_H_RES * sizeof(uint16_t),
+                                                     0);
+        assert(s_flush_bounce[i]);
+    }
 
     ESP_LOGI(TAG, "Install panel IO");
     esp_lcd_panel_io_handle_t io_handle = NULL;
