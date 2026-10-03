@@ -33,7 +33,6 @@ typedef enum {
     SETTING_VOLUME = 0,
     SETTING_MASTER_GAIN,
     SETTING_BACKLIGHT,
-    SETTING_BTOUT,
     SETTING_STANDBY,
     SETTING_RESCAN,
     SETTING_RESET,
@@ -50,7 +49,6 @@ typedef enum {
 #define UI_SETTINGS_SAVE_DELAY_MS   800
 #define SETTINGS_DIRTY_VOLUME   (1u << 0)
 #define SETTINGS_DIRTY_GAIN     (1u << 1)
-#define SETTINGS_DIRTY_BT       (1u << 2)
 #define SETTINGS_DIRTY_BACKL    (1u << 3)
 #define SETTINGS_DIRTY_STBY     (1u << 4)
 #define SETTINGS_DIRTY_LOG      (1u << 5)

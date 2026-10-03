@@ -1,5 +1,5 @@
 /*
- * Settings page: volume / gain / backlight / BT / standby / actions
+ * Settings page: volume / gain / backlight / standby / actions
  *
  * Split out of ui.c (P0 structural refactor). Behaviour and pixel layout
  * are unchanged: page-local state lives here, screen-wide state and the
@@ -14,7 +14,6 @@
 
 #include "audio.h"
 #include "battery.h"
-#include "bluetooth_audio.h"
 #include "board_config.h"
 #include "buttons.h"
 #include "ebook.h"
@@ -55,7 +54,6 @@ static uint32_t s_cache_queried_ver;
 static const char *ui_set_vol_text(void);
 static const char *ui_set_gain_text(void);
 static const char *ui_set_bl_text(void);
-static const char *ui_set_bt_text(void);
 static const char *ui_set_sleep_text(void);
 static const char *ui_set_rescan_text(void);
 static const char *ui_set_reset_text(void);
@@ -66,12 +64,10 @@ static const char *ui_set_logclear_text(void);
 static void ui_set_vol_lr(int dir);
 static void ui_set_gain_lr(int dir);
 static void ui_set_bl_lr(int dir);
-static void ui_set_bt_lr(int dir);
 static void ui_set_sleep_lr(int dir);
 static void ui_set_rescan_enter(void);
 static void ui_set_clear_enter(void);
 static void ui_set_reset_enter(void);
-static void ui_set_bt_enter(void);
 static void ui_set_logsave_lr(int dir);
 static void ui_set_loglvl_lr(int dir);
 static void ui_set_logclear_enter(void);
@@ -97,13 +93,13 @@ static const char *s_group_names[SET_GRP_COUNT] = {
 /* Group -> member items (indices into s_settings_table). Column width 4;
  * s_group_cnt says how many of each row are live. */
 static const setting_item_t s_group_items[SET_GRP_COUNT][4] = {
-    [SET_GRP_AUDIO]   = {SETTING_VOLUME, SETTING_MASTER_GAIN, SETTING_BTOUT},
+    [SET_GRP_AUDIO]   = {SETTING_VOLUME, SETTING_MASTER_GAIN},
     [SET_GRP_DISPLAY] = {SETTING_BACKLIGHT, SETTING_STANDBY},
     [SET_GRP_SYSTEM]  = {SETTING_RESCAN, SETTING_RESET, SETTING_CLEAR_PROG},
     [SET_GRP_LOG]     = {SETTING_LOG_SAVE, SETTING_LOG_LEVEL, SETTING_LOG_CLEAR},
 };
 static const int s_group_cnt[SET_GRP_COUNT] = {
-    [SET_GRP_AUDIO] = 3, [SET_GRP_DISPLAY] = 2, [SET_GRP_SYSTEM] = 3,
+    [SET_GRP_AUDIO] = 2, [SET_GRP_DISPLAY] = 2, [SET_GRP_SYSTEM] = 3,
     [SET_GRP_LOG] = 3,
 };
 
@@ -121,7 +117,6 @@ static const setting_entry_t s_settings_table[SETTING_COUNT] = {
     [SETTING_VOLUME]      = {UI_STR_SET_VOL,    ui_set_vol_text,   ui_set_vol_lr,   NULL,              SET_GRP_AUDIO},
     [SETTING_MASTER_GAIN] = {UI_STR_SET_GAIN,  ui_set_gain_text,  ui_set_gain_lr,  NULL,              SET_GRP_AUDIO},
     [SETTING_BACKLIGHT]   = {UI_STR_SET_BACKLIGHT,    ui_set_bl_text,    ui_set_bl_lr,    NULL,              SET_GRP_DISPLAY},
-    [SETTING_BTOUT]       = {"蓝牙",    ui_set_bt_text,    ui_set_bt_lr,    ui_set_bt_enter,  SET_GRP_AUDIO},
     [SETTING_STANDBY]     = {UI_STR_SET_STANDBY,    ui_set_sleep_text, ui_set_sleep_lr, NULL,              SET_GRP_DISPLAY},
     [SETTING_RESCAN]      = {UI_STR_SET_RESCAN, ui_set_rescan_text, NULL,       ui_set_rescan_enter, SET_GRP_SYSTEM},
     [SETTING_RESET]       = {UI_STR_SET_RESET, ui_set_reset_text, NULL,             ui_set_reset_enter, SET_GRP_SYSTEM},
@@ -134,10 +129,6 @@ static const setting_entry_t s_settings_table[SETTING_COUNT] = {
 /* Backlight brightness (0..100 %), driven via PWM on PIN_NUM_LCD_BL.
  * Persisted to NVS; restored at boot. */
 static uint8_t s_backlight = 60;
-
-/* Bluetooth output master switch (settings page ON/OFF). Persisted to NVS;
- * restored at boot. Drives bluetooth_audio_set_enabled() — the audio routing gate. */
-static bool s_bt_on;
 
 /* Auto screen-off: idle timeout in seconds. 0 = never (disable standby).
  * Selectable on the settings page via an index into s_standby_opts. */
@@ -188,7 +179,6 @@ static int s_set_group = 0;   /* which group the ITEMS view is showing */
 #define UI_NVS_VOLUME  "volume"
 #define UI_NVS_VOLBT   "vol_bt"
 #define UI_NVS_GAIN    "gain_db"
-#define UI_NVS_BT      "bt_on"
 #define UI_NVS_BACKL   "backlight"
 #define UI_NVS_STBY    "standby_s"
 #define UI_NVS_LOG_EN  "log_en"
@@ -218,11 +208,6 @@ void ui_settings_load(void)
         hw_audio_set_master_gain_db((float)v / 10.0f);
     } else {
         hw_audio_set_master_gain_db(0.0f); /* default master gain 0 dB */
-    }
-    int32_t bt = 0;
-    if (nvs_get_i32(h, UI_NVS_BT, &bt) == ESP_OK) {
-        s_bt_on = (bt != 0);
-        bluetooth_audio_set_enabled(s_bt_on);
     }
     int32_t bl = -1;
     if (nvs_get_i32(h, UI_NVS_BACKL, &bl) == ESP_OK && bl >= 0 && bl <= 100) {
@@ -270,16 +255,6 @@ static void ui_settings_save_gain(void)
         float db = hw_audio_get_master_gain_db();
         nvs_set_i32(h, UI_NVS_GAIN,
                     (int32_t)(db * 10.0f + (db >= 0.0f ? 0.5f : -0.5f)));
-        nvs_commit(h);
-        nvs_close(h);
-    }
-}
-
-static void ui_settings_save_bt(void)
-{
-    nvs_handle_t h;
-    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_i32(h, UI_NVS_BT, s_bt_on ? 1 : 0);
         nvs_commit(h);
         nvs_close(h);
     }
@@ -341,9 +316,6 @@ void ui_settings_flush(void)
     }
     if (s_save_pending & SETTINGS_DIRTY_GAIN) {
         ui_settings_save_gain();
-    }
-    if (s_save_pending & SETTINGS_DIRTY_BT) {
-        ui_settings_save_bt();
     }
     if (s_save_pending & SETTINGS_DIRTY_BACKL) {
         ui_settings_save_backlight();
@@ -461,7 +433,7 @@ void ui_settings_action(void)
         return;
     }
     /* ITEMS view: dispatch to the selected item's on_enter (action items like
-     * 重建列表 / 恢复出厂; the 蓝牙 item opens the BT screen). Inert items do nothing. */
+     * 重建列表 / 恢复出厂). Inert items do nothing. */
     const setting_entry_t *e =
         &s_settings_table[s_group_items[s_set_group][s_setting_sel]];
     if (e->on_enter) {
@@ -540,22 +512,6 @@ static const char *ui_set_bl_text(void)
     return buf;
 }
 
-static const char *ui_set_bt_text(void)
-{
-    static char buf[24];
-    /* Live status: fully off, on (not linked), or linked. The persisted
-     * master switch is s_bt_on; the linked state is read live so the row
-     * reflects reality after a connect. */
-    if (!s_bt_on) {
-        snprintf(buf, sizeof(buf), "关");
-    } else if (bluetooth_audio_is_connected()) {
-        snprintf(buf, sizeof(buf), "已连接");
-    } else {
-        snprintf(buf, sizeof(buf), "开");
-    }
-    return buf;
-}
-
 static const char *ui_set_sleep_text(void)
 {
     static char buf[24];
@@ -613,20 +569,6 @@ static void ui_set_bl_lr(int dir)
     ui_settings_mark_dirty(SETTINGS_DIRTY_BACKL);
 }
 
-static void ui_set_bt_lr(int dir)
-{
-    /* Left = off, right = on. Toggling applies the routing gate and is
-     * persisted to NVS on the next flush. Switching OFF also powers the
-     * Bluetooth controller fully down (if it was up) to save power. */
-    s_bt_on = (dir > 0);
-    bluetooth_audio_set_enabled(s_bt_on);
-    if (!s_bt_on) {
-        bluetooth_audio_disable();
-    }
-    ui_settings_mark_dirty(SETTINGS_DIRTY_BT);
-    set_action(s_bt_on ? "蓝牙开" : "蓝牙关");
-}
-
 static void ui_set_sleep_lr(int dir)
 {
     int opt = (int)s_standby_opt + dir;
@@ -637,19 +579,6 @@ static void ui_set_sleep_lr(int dir)
 }
 
 /* A-press (enter) callbacks. */
-
-static void ui_set_bt_enter(void)
-{
-    /* Managing a sink needs the radio, so entering it implies BT ON — set the
-     * master switch and power the controller up lazily. This keeps the
-     * SETTING_BTOUT row (关/开/已连接) consistent with the live state. */
-    if (!s_bt_on) {
-        s_bt_on = true;
-        bluetooth_audio_set_enabled(true);
-        ui_settings_mark_dirty(SETTINGS_DIRTY_BT);
-    }
-    ui_go(UI_PAGE_BT);          /* Settings -> Bluetooth: remember parent */
-}
 
 static void ui_set_rescan_enter(void)
 {
