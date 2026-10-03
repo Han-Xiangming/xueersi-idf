@@ -71,12 +71,13 @@
  * the watchdog stops playback instead of faking an endless "playing" state. */
 #define PLAYER_STALL_MS          12000
 /* Pause-spin safety net. A real pause sets s_state==PLAYER_PAUSED, which the
- * stall watchdog (player_watch_task) deliberately SKIPS, so a lost resume
- * notify leaves the decode loop spinning in its pause wait forever, silently
- * feeding the WDT -> the "frozen log, never recovers" failure (see the comment
- * at the pause spin). This timeout force-resumes after the pause has been
- * stuck far longer than any legitimate hold, so the device can never wedge
- * silently; the log makes a lost-resume visible instead of invisible. */
+ * stall watchdog (player_watch_task) deliberately SKIPS, so the decode loop
+ * parks in its pause wait (feeding the WDT) until the user resumes. That wait
+ * is legitimately unbounded — the user may pause and leave the device idle
+ * until the screen blanks — so this timeout must NOT cancel a real pause; it
+ * exists only to recover the INCONSISTENT state where the pause flag is stuck
+ * while s_state still claims PLAYING (the documented "frozen log, never
+ * recovers" failure). A genuine pause is left alone. */
 #define PAUSE_STUCK_MS           30000
 /* Decode task priority: MUST stay ABOVE LVGL_TASK_PRIORITY (7, see ui.h).
  *
@@ -1407,20 +1408,27 @@ static void decode_loop(void)
                         esp_task_wdt_reset();
 #endif
                         if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2000)) == pdFALSE) {
-                            paused_for += 2000;
-                            if (paused_for >= PAUSE_STUCK_MS) {
-                                /* A pause should only persist while the user is
-                                 * actually holding it. Waiting this long with no
-                                 * resume and no stop/track-switch means the resume
-                                 * notify was lost (the documented "frozen log,
-                                 * never recovers" failure). Force-resume so the
-                                 * device can never wedge silently, and log it so
-                                 * the lost-resume is visible instead of invisible.
-                                 * Mirrors the player_toggle() resume path. */
+                            if (paused_for < PAUSE_STUCK_MS) {
+                                paused_for += 2000;   /* saturate, never wrap */
+                            }
+                            /* A GENUINE user pause (s_state == PLAYER_PAUSED) is
+                             * not a failure: the user may leave the track paused
+                             * for as long as they like — notably while the screen
+                             * blanks on the idle timer — and resume arrives
+                             * simply by player_toggle() clearing s_pause_req,
+                             * which this loop re-checks every 2 s, so a lost
+                             * notify can never wedge it (each iteration also
+                             * feeds the WDT). Only the INCONSISTENT case is a
+                             * fault worth recovering: the pause flag stuck while
+                             * the state still claims PLAYING, i.e. the "frozen
+                             * log, never recovers" failure. Force-resume only
+                             * that, so a real pause is never cancelled. */
+                            if (paused_for >= PAUSE_STUCK_MS &&
+                                s_state != PLAYER_PAUSED) {
                                 ESP_LOGE(TAG,
-                                         "[WATCHDOG] pause flag stuck %ums; "
-                                         "force-resuming playback",
-                                         (unsigned)paused_for);
+                                         "[WATCHDOG] pause flag stuck (state=%d) "
+                                         "%ums; force-resuming playback",
+                                         (int)s_state, (unsigned)paused_for);
                                 s_pause_req = false;
                                 s_state = PLAYER_PLAYING;
                                 hw_audio_set_player_active(true);
