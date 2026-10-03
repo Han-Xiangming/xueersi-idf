@@ -749,16 +749,19 @@ bool ui_player_panel_key(uint32_t key)
     }
     if (key == LV_KEY_LEFT) {
         s_panel_sel = (s_panel_sel + PLAYER_PANEL_NBTN - 1) % PLAYER_PANEL_NBTN;
+        ui_mark_dirty();          /* force the highlight repaint below */
     }
     else if (key == LV_KEY_RIGHT) {
         s_panel_sel = (s_panel_sel + 1) % PLAYER_PANEL_NBTN;
+        ui_mark_dirty();
     }
     else if (key == LV_KEY_ENTER) {
-        ui_panel_activate();
+        ui_panel_activate();      /* marks dirty itself */
     }
     else if (key == LV_KEY_ESC) {
         s_panel_open = false;
         lv_obj_add_flag(s_ui.pl_panel, LV_OBJ_FLAG_HIDDEN);
+        ui_mark_dirty();
     }
     return true;
 }
