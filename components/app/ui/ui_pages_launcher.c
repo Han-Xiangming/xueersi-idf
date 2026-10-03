@@ -164,40 +164,41 @@ void ui_refresh_launcher(void)
     ui_theme_text_set(s_ui.menu_status, buf);
 }
 
-/* Arrow-key navigation over the grid. Up/down/left/right move one step; the
- * nearest valid slot in that direction (matching column for vertical moves,
- * matching row for horizontal) becomes the new selection. */
+/* Arrow-key navigation over the grid. Left/right walk the row-major slot order
+ * and wrap around at the ends, so pressing left on the first slot (or right on
+ * the last) carries onto the other row instead of sticking at the grid edge.
+ * Up/down step between rows, preferring the slot nearest the current column. */
 void ui_launcher_nav(uint32_t key)
 {
     const int cur = s_launch_sel;
+
+    if (key == LV_KEY_LEFT || key == LV_KEY_RIGHT) {
+        /* s_launch is stored in row-major order, so stepping the index moves
+         * horizontally and rolls over to the next/previous row at the ends. */
+        const int step = (key == LV_KEY_RIGHT) ? 1 : LAUNCH_COUNT - 1;
+        s_launch_sel = (cur + step) % LAUNCH_COUNT;
+        ui_refresh_launcher();
+        return;
+    }
+    if (key != LV_KEY_UP && key != LV_KEY_DOWN) {
+        return;
+    }
+
     const int row = s_launch[cur].row;
     const int col = s_launch[cur].col;
-    int tr = row, tc = col;
-
-    if (key == LV_KEY_UP)         tr = row - 1;
-    else if (key == LV_KEY_DOWN)   tr = row + 1;
-    else if (key == LV_KEY_LEFT)   tc = col - 1;
-    else if (key == LV_KEY_RIGHT)  tc = col + 1;
-    else return;
+    const int tr  = (key == LV_KEY_UP) ? row - 1 : row + 1;
 
     int best = cur, best_dist = 1000;
     for (int i = 0; i < LAUNCH_COUNT; i++) {
         if (i == cur) {
             continue;
         }
-        const int dr = abs(s_launch[i].row - tr);
-        const int dc = abs(s_launch[i].col - tc);
-        if (key == LV_KEY_UP || key == LV_KEY_DOWN) {
-            if (s_launch[i].row != tr) continue;
-            if (dc > abs(s_launch[i].col - col)) continue;   /* prefer same column */
+        if (s_launch[i].row != tr) {
+            continue;
         }
-        else {
-            if (s_launch[i].col != tc) continue;
-            if (dr > abs(s_launch[i].row - row)) continue;   /* prefer same row */
-        }
-        const int dist = dr + dc;
-        if (dist < best_dist) {
-            best_dist = dist;
+        const int dc = abs(s_launch[i].col - col);   /* prefer same column */
+        if (dc < best_dist) {
+            best_dist = dc;
             best = i;
         }
     }
