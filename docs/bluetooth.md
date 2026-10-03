@@ -59,7 +59,7 @@ bluetooth_audio_set_sample_rate(hz)    A2DP/SBC 恒 44.1kHz，其它采样率内
   - 用户在蓝牙页**连接成功后**显式触发 `hw_audio_set_route(AUDIO_ROUTE_BT)`，PCM 才改喂蓝牙（音量、全频段，无喇叭侧的 HPF/限幅）。
   - **连接成功不会自动抢路由**——否则正在放音的喇叭会话会被静默劫持；必须由用户操作。
   - **链路掉线会自动回喇叭**（`hw_audio_on_bt_conn_state`），无论当前在哪个 UI 页，保证喇叭会话立刻恢复。
-  - 设置页的蓝牙总开关只改 `s_enabled` / 拆栈，**不切路由**（见 `docs/audio.md` §1）。
+  - 蓝牙页的蓝牙总开关只改 `s_enabled` / 拆栈，**不切路由**（见 `docs/audio.md` §1）。
 - 数据回调 `a2d_data_cb`：栈按 44.1kHz 拉取；欠载时补静音保证流不断；teardown 期间返回 0 让 Bluedroid 自行静音填充。
 
 ## 5. AVRCP 远端控制（TG 角色）
@@ -81,7 +81,7 @@ audio.c：   hw_audio_write_pcm() 内按路由分发 → 蓝牙走 bluetooth_aud
             喇叭走 I2S 环形；采样率变更同时通知 bluetooth_audio_set_sample_rate()
 main.c：    bluetooth_audio_init() 启动时调用；AVRCP 回调注册（媒体键 → player，
             音量 → hw_audio_set_avrc_volume）
-ui.c：      蓝牙页刷新设备列表/配对状态/连接名；设置页 BT 总开关 → set_enabled/disable
+ui.c：      蓝牙页刷新设备列表/配对状态/连接名；蓝牙页 BT 总开关 → set_enabled/disable
 ```
 
 ## 7. 已知限制
