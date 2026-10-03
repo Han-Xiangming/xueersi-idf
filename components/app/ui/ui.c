@@ -581,10 +581,6 @@ static void ui_refresh_battery(void)
 void ui_refresh(void)
 {
     ui_settings_flush();
-    /* Mini player bar updates every tick (incl. on the menu) so a play/stop
-     * transition shows up immediately; it owns its own show/hide and the
-     * mutual exclusion with the page status rows. */
-    ui_player_refresh_minibar();
     if (ui_nav_in_menu()) {
         /* Menu is event-driven, but keep the battery gauge and the playback
          * panel live on every tick. */
@@ -867,7 +863,6 @@ void ui_create(lv_group_t *group)
 
     ui_build_launcher();
     ui_refresh_launcher();
-    ui_player_build_minibar();
 
     /* Persistent battery gauge in the top-right corner, above every page.
      * Layout: a 5-segment battery icon + "100%" text, anchored with absolute

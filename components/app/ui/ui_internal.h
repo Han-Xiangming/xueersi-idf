@@ -180,12 +180,6 @@ void ui_player_panel_toggle(void);
 /* Returns true when the panel is open and consumed the key. */
 bool ui_player_panel_key(uint32_t key);
 
-/* Mini player bar: a small persistent status strip shown on non-player pages
- * while audio is playing. Lives on the screen (not on any page container) so it
- * survives page rebuilds. ui_player_refresh_minibar() is called every tick from
- * ui_refresh(); it owns the mutual exclusion with each page's own status row. */
-void ui_player_build_minibar(void);
-void ui_player_refresh_minibar(void);
 
 /* ---- Page: Bluetooth ---- */
 void ui_build_bt(lv_obj_t *page);
