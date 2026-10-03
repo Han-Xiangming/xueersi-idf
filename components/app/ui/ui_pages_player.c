@@ -329,7 +329,7 @@ void ui_player_refresh_panel(void)
 
     static char s_panel_state_buf[16];
     snprintf(s_panel_state_buf, sizeof(s_panel_state_buf), "%s%s",
-             st == PLAYER_PLAYING ? "▶" : st == PLAYER_PAUSED ? "⏸" : "□",
+             st == PLAYER_PLAYING ? "▶" : st == PLAYER_PAUSED ? "⏸" : "⏹",
              ui_repeat_text());
     ui_theme_text_set(s_ui.pl_panel_state, s_panel_state_buf);
 
