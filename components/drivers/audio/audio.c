@@ -238,9 +238,9 @@ static void audio_set_hpf_coeff(uint32_t rate)
              (unsigned)rate, SPEAKER_HPF_FC_HZ, (int)s_hpf_lambda);
 }
 
-static uint8_t s_vol_speaker = 80;       /* per-route volume, percent */
-static uint8_t s_vol_bt      = 80;
-static uint8_t s_volume = 80;            /* active route volume (UI view) */
+static uint8_t s_vol_speaker = 30;       /* per-route volume, percent */
+static uint8_t s_vol_bt      = 30;
+static uint8_t s_volume = 30;            /* active route volume (UI view) */
 static int32_t s_vol_gain;               /* target Q15 linear gain */
 static int32_t s_vol_gain_sm;            /* smoothed gain actually applied */
 

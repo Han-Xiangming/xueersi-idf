@@ -194,7 +194,7 @@ void ui_settings_load(void)
     if (nvs_get_i32(h, UI_NVS_VOLUME, &v) == ESP_OK && v >= 0 && v <= 100) {
         hw_audio_set_speaker_volume((uint8_t)v);
     } else {
-        hw_audio_set_speaker_volume(80);   /* default speaker volume 80% */
+        hw_audio_set_speaker_volume(30);   /* default speaker volume 30% */
     }
     v = -1;
     if (nvs_get_i32(h, UI_NVS_VOLBT, &v) == ESP_OK && v >= 0 && v <= 100) {
