@@ -366,6 +366,17 @@ void ui_refresh_settings(void)
         s_cache_queried_ver = scan_ver;
     }
 
+    /* Title bar reflects the two-level navigation: "设置" on the group list,
+     * "设置 > 子菜单" once a group's items are open. */
+    if (s_set_view == SET_VIEW_ITEMS) {
+        static char s_title_buf[48];
+        snprintf(s_title_buf, sizeof(s_title_buf), "设置 > %s",
+                 s_group_names[s_set_group]);
+        ui_theme_text_set(s_ui.title, s_title_buf);
+    } else {
+        ui_theme_text_set(s_ui.title, "设置");
+    }
+
     /* Both views reuse the same 8 row widgets; only the row contents differ. */
     if (s_set_view == SET_VIEW_GROUPS) {
         const int n = SET_GRP_COUNT;
