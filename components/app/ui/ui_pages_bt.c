@@ -32,36 +32,88 @@
 #include "ui_theme.h"
 #include "ui_widgets.h"
 
-/* Bluetooth sink picker: same 6-row list layout as the MP3 page. */
-static int s_bt_sel;
+/* NVS namespace/key for the Bluetooth master switch (reuses the "bt_on" key
+ * the settings page used to own, so a previously-saved preference carries
+ * over). */
+#define UI_NVS_NS  "ui_cfg"
+#define UI_NVS_BT  "bt_on"
+
+/* Bluetooth sink picker: same 6-row list layout as the MP3 page, but with a
+ * pinned master-switch row at the top (index 0). Device rows follow at
+ * index 1..N, so a device's real list index is (s_bt_sel - 1). */
+static int  s_bt_sel;
+/* Bluetooth master switch: radio up/down. Persisted; off by default so the
+ * device stays silent at boot (the stack is brought up lazily on page entry
+ * when this is true). */
+static bool s_bt_on;
 /* Snapshot of the BT device list so the UI does not re-format device names
  * (incl. the MAC-address fallback) on every 16 ms tick. Refreshed only when
  * bluetooth_audio_device_version() advances. */
 static uint32_t s_bt_list_ver;
 static int      s_bt_list_cnt;
 static char     s_bt_list_name[BT_MAX_DEVICES][BT_DEV_NAME_LEN];
-static int s_paint_bt_sel   = -1;
 void ui_build_bt(lv_obj_t *page)
 {
-    /* The Bluetooth stack is lazily brought up here (deferred from boot).
-     * Idempotent. */
-    bluetooth_audio_enable();
     s_bt_sel = 0;
+
+    /* Restore the persisted master switch. Off by default (silent at boot);
+     * the radio is only powered up below if the switch is on. */
+    s_bt_on = false;
+    nvs_handle_t h;
+    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        int32_t v = 0;
+        if (nvs_get_i32(h, UI_NVS_BT, &v) == ESP_OK) {
+            s_bt_on = (v != 0);
+        }
+        nvs_close(h);
+    }
+
+    if (s_bt_on) {
+        /* Lazily bring the stack up (idempotent) and scan once on entry;
+         * SELECT re-scans. */
+        bluetooth_audio_enable();
+        bluetooth_audio_scan_start();
+    } else {
+        /* Ensure the radio is down if it was left up by a previous session. */
+        bluetooth_audio_disable();
+    }
 
     ui_list_create(&s_ui.bt_list, page, UI_LIST_ROWS, UI_LIST_FIRST_Y, UI_ROW_H_LIST);
 
-    s_ui.bt_status = ui_theme_label(page, "扫描中...", 196, UI_COLOR_TEXT_DIM, LV_TEXT_ALIGN_CENTER);
-    s_ui.hint = ui_theme_label(page, "↑↓选 A连接 Select扫描 B返回", UI_LEGEND_Y, UI_COLOR_TEXT_DIM,
-                         LV_TEXT_ALIGN_CENTER);
-
-    bluetooth_audio_scan_start();   /* scan once on entry; SELECT re-scans */
+    s_ui.bt_status = ui_theme_label(page, s_bt_on ? "扫描中..." : "蓝牙已关闭",
+                                    196, UI_COLOR_TEXT_DIM, LV_TEXT_ALIGN_CENTER);
+    s_ui.hint = ui_theme_label(page,
+                     s_bt_on ? "↑↓选 A开关/连接 Select扫描 B返回"
+                             : "A开关 B返回",
+                     UI_LEGEND_Y, UI_COLOR_TEXT_DIM, LV_TEXT_ALIGN_CENTER);
 }
 
 void ui_refresh_bt(void)
 {
+        /* Row 0 is the pinned master switch; below it live the device rows. */
+        {
+            static char sw[32];
+            snprintf(sw, sizeof(sw), "蓝牙     %s", s_bt_on ? "开" : "关");
+            ui_list_row(&s_ui.bt_list, 0, 0, 1, sw, (s_bt_sel == 0), false);
+        }
+
+        if (!s_bt_on) {
+            /* Radio off: hide the device list and say so. */
+            for (int i = 1; i < UI_LIST_ROWS; i++) {
+                ui_list_row(&s_ui.bt_list, i, -1, 0, "", false, true);
+            }
+            ui_theme_text_set(s_ui.bt_status, "蓝牙已关闭");
+            ui_set_hint("A开关 B返回");
+            return;
+        }
+
         int count = bluetooth_audio_device_count();
-        if (s_bt_sel >= count) {
-            s_bt_sel = count > 0 ? count - 1 : 0;
+        int total = 1 + count;
+        if (s_bt_sel > total - 1) {
+            s_bt_sel = total - 1;
+        }
+        if (s_bt_sel < 0) {
+            s_bt_sel = 0;
         }
 
         /* Refresh the cached device list only when bluetooth_audio says it changed
@@ -79,11 +131,13 @@ void ui_refresh_bt(void)
             }
         }
 
-        int top = ui_list_top(s_bt_sel, count, UI_LIST_ROWS);
-        const bool sel_changed = (s_bt_sel != s_paint_bt_sel);
-        for (int i = 0; i < UI_LIST_ROWS; i++) {
-            int idx = top + i;
-            const int sel = (idx == s_bt_sel);
+        /* Devices occupy list rows 1..(UI_LIST_ROWS-1); the switch stays pinned at
+         * row 0. The device selection index is (s_bt_sel - 1). */
+        int dev_sel = s_bt_sel - 1;
+        int dev_top = ui_list_top(dev_sel, count, UI_LIST_ROWS - 1);
+        for (int i = 1; i < UI_LIST_ROWS; i++) {
+            int idx = dev_top + (i - 1);
+            const int sel = (dev_sel == idx);
             if (idx < count) {
                 const char *nm = (idx < s_bt_list_cnt && idx < BT_MAX_DEVICES)
                                  ? s_bt_list_name[idx]
@@ -91,11 +145,8 @@ void ui_refresh_bt(void)
                 ui_list_row(&s_ui.bt_list, i, idx, count, nm, sel, false);
             }
             else {
-                ui_list_row(&s_ui.bt_list, i, idx, count, "", false, true);
+                ui_list_row(&s_ui.bt_list, i, -1, 0, "", false, true);
             }
-        }
-        if (sel_changed) {
-            s_paint_bt_sel = s_bt_sel;
         }
 
         if (bluetooth_audio_is_connected()) {
@@ -138,7 +189,7 @@ void ui_refresh_bt(void)
             snprintf(st, sizeof(st), "扫描中... %d", count);
             st[27] = '\0';
             ui_theme_text_set(s_ui.bt_status, st);
-            ui_set_hint("↑↓选 A连接 B返回");
+            ui_set_hint("↑↓选 A开关/连接 Select扫描 B返回");
         }
         else {
             if (count) {
@@ -150,12 +201,43 @@ void ui_refresh_bt(void)
             else {
                 ui_theme_text_set(s_ui.bt_status, "无设备");
             }
-            ui_set_hint(count ? "↑↓选 A连接 B返回" : "Select扫描 B返回");
+            ui_set_hint(count ? "↑↓选 A开关/连接 Select扫描 B返回" : "Select扫描 B返回");
         }
+}
+
+/* Toggle the Bluetooth master switch. ON powers the radio up and scans; OFF
+ * disconnects (bluetooth_audio_disable() tears the link down safely) and powers
+ * the controller off. Persisted so the choice survives reboot. */
+static void ui_bt_toggle_master(void)
+{
+    s_bt_on = !s_bt_on;
+    if (s_bt_on) {
+        bluetooth_audio_enable();
+        bluetooth_audio_scan_start();
+        set_action("蓝牙开");
+    } else {
+        bluetooth_audio_disable();
+        set_action("蓝牙关");
+        s_bt_sel = 0;   /* keep the highlight on the switch row */
+    }
+    nvs_handle_t h;
+    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, UI_NVS_BT, s_bt_on ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ui_refresh();
 }
 
 void ui_bt_action(void)
 {
+        if (s_bt_sel == 0) {
+            /* Master switch row: flip the radio on/off. */
+            ui_bt_toggle_master();
+            return;
+        }
+        /* Device row: real device index is (s_bt_sel - 1). */
+        int dev_idx = s_bt_sel - 1;
         if (bluetooth_audio_is_connected()) {
             set_action("断开中");
             bluetooth_audio_disconnect();
@@ -165,7 +247,7 @@ void ui_bt_action(void)
         }
         else if (bluetooth_audio_device_count() > 0) {
             set_action("连接中");
-            if (!bluetooth_audio_connect_index(s_bt_sel)) {
+            if (!bluetooth_audio_connect_index(dev_idx)) {
                 set_action("连接失败");
             }
         }
@@ -176,20 +258,25 @@ void ui_bt_action(void)
 
 void ui_bt_adjust(int step)
 {
-        int count = bluetooth_audio_device_count();
-        if (count > 0) {
-            s_bt_sel = (s_bt_sel - step + count) % count;
+        if (!s_bt_on) {
+            return;     /* only the switch row exists */
         }
+        int count = bluetooth_audio_device_count();
+        int total = 1 + count;
+        s_bt_sel = (s_bt_sel - step + total) % total;
 }
 
-/* Select: start a fresh sink scan. */
+/* Select: start a fresh sink scan (only meaningful when the radio is on). */
 void ui_bt_select(void)
 {
+    if (!s_bt_on) {
+        return;
+    }
     bluetooth_audio_scan_start();
     set_action("扫描中");
 }
 
 void ui_bt_reset_paint(void)
 {
-    s_paint_bt_sel = -1;
+    /* The BT list is rebuilt on entry; nothing else to reset here. */
 }
