@@ -169,6 +169,13 @@ static uint32_t s_dev_version;
 static TimerHandle_t s_conn_timer;
 static bool          s_conn_auto;      /* user still wants this link up */
 static uint8_t       s_conn_retries;
+/* True only between our own esp_a2d_source_connect() dial-out and the matching
+ * CONNECTED event. Any A2DP CONNECTED that arrives WITHOUT this flag is an
+ * unsolicited / inbound link (e.g. a sink auto-reconnecting to its last
+ * source, or a remote page) — we reject it so the user must explicitly pick a
+ * device from the scan list, and so an unsolicited link can never hijack the
+ * audio route or appear "connected" without being in the list. */
+static volatile bool s_user_dialing;
 
 /* Extract a human-readable device name from inquiry properties (direct BDNAME
  * or from the EIR blob). Returns false if the peer sent no name. */
@@ -304,6 +311,25 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
     switch (event) {
     case ESP_A2D_CONNECTION_STATE_EVT:
         if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+            /* Snapshot the peer from the event itself: s_peer_bda is only
+             * filled by our dial-out path, so an inbound / auto connection
+             * would otherwise carry a stale address into the disconnect below. */
+            esp_bd_addr_t rem;
+            memcpy(rem, param->conn_stat.remote_bda, sizeof(esp_bd_addr_t));
+
+            /* Reject any link we did not explicitly dial out (a sink that
+             * auto-reconnects to its last source, or a remote page). The user
+             * must pick a device from the scan list; an unsolicited link would
+             * otherwise hijack the audio route and never appear in the list. */
+            if (!s_user_dialing) {
+                ESP_LOGW(TAG, "rejecting unsolicited A2DP connect %02x:%02x:%02x:"
+                         "%02x:%02x:%02x", rem[0], rem[1], rem[2],
+                         rem[3], rem[4], rem[5]);
+                esp_a2d_source_disconnect(rem);
+                break;
+            }
+            s_user_dialing = false;
+
             s_connected = true;
             s_ever_connected = true;         /* a link was up at least once */
             s_pair_state = BT_PAIR_OK;
@@ -312,6 +338,8 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             /* Re-arm the PCM feed: a previous disconnect (or an auto-retry
              * failure) may have frozen it; the link is live now. */
             s_tx_stopped = false;
+            memcpy(s_peer_bda, rem, sizeof(esp_bd_addr_t));  /* in case it differs */
+            s_enabled = true;                /* a live link means BT output is on */
             if (s_disabling) {
                 /* bluetooth_audio_disable() raced with the connect completing:
                  * drop the fresh link so the disconnect-complete event can
@@ -326,6 +354,7 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             }
         }
         else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+            s_user_dialing = false;
             if (!s_connected && s_pair_state != BT_PAIR_IDLE && !s_ever_connected) {
                 /* The attempt never reached CONNECTED, i.e. it failed. If
                  * auto-retry is armed and we have attempts left, schedule
@@ -711,6 +740,7 @@ static void bluetooth_audio_teardown(void *param1, uint32_t param2)
     s_conn_auto   = false;
     s_conn_retries = 0;
     s_ever_connected = false;
+    s_user_dialing = false;
     if (s_conn_timer != NULL) {
         xTimerStop(s_conn_timer, 0);
     }
@@ -847,6 +877,7 @@ const char *bluetooth_audio_device_name(int index)
 static bool bt_conn_start(void)
 {
     s_pair_state = BT_PAIR_CONNECTING;
+    s_user_dialing = true;              /* mark this link as user-initiated */
     esp_err_t err = esp_a2d_source_connect(s_peer_bda);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "connect failed: %s", esp_err_to_name(err));

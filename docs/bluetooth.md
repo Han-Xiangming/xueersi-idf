@@ -55,11 +55,10 @@ bluetooth_audio_set_sample_rate(hz)    A2DP/SBC 恒 44.1kHz，其它采样率内
                                 （否则远端会变速变调）；流开始前丢弃上一会话残留 PCM
 ```
 
-- 路由由 `audio.c` 的单一状态 `s_route` 决定，**与蓝牙链路状态解耦**：`hw_audio_write_pcm()` 只在开头读一次路由，绝不探测是否已连接。
-  - 用户在蓝牙页**连接成功后**显式触发 `hw_audio_set_route(AUDIO_ROUTE_BT)`，PCM 才改喂蓝牙（音量、全频段，无喇叭侧的 HPF/限幅）。
-  - **连接成功不会自动抢路由**——否则正在放音的喇叭会话会被静默劫持；必须由用户操作。
+- 路由由 `audio.c` 的单一状态 `s_route` 决定：**连接成功会通过 `s_conn_state_cb`（`audio.c` 的 `hw_audio_on_bt_conn_state`）自动切到 `AUDIO_ROUTE_BT`**（手机式"蓝牙接管输出"体验），PCM 随即改喂蓝牙（音量、全频段，无喇叭侧的 HPF/限幅）；`hw_audio_write_pcm()` 只在开头读一次路由，绝不探测是否已连接。
   - **链路掉线会自动回喇叭**（`hw_audio_on_bt_conn_state`），无论当前在哪个 UI 页，保证喇叭会话立刻恢复。
-  - 蓝牙页的蓝牙总开关只改 `s_enabled` / 拆栈，**不切路由**（见 `docs/audio.md` §1）。
+  - **不会自动重连已配对设备**：进入蓝牙页只扫描并展示设备列表，必须由用户在列表里选择一个设备才会 `esp_a2d_source_connect()` 拨号；任何非本机主动拨号建立的连接（对端自动重连 / 主动连入）都会在 `a2d_cb` 的 `CONNECTED` 里被拒绝，避免静默劫持路由或绕过列表。
+  - 蓝牙页的蓝牙总开关只改 `s_enabled` / 拆栈，**不切路由**（连接（用户操作）才触发路由切换，见 `docs/audio.md` §1）。
 - 数据回调 `a2d_data_cb`：栈按 44.1kHz 拉取；欠载时补静音保证流不断；teardown 期间返回 0 让 Bluedroid 自行静音填充。
 
 ## 5. AVRCP 远端控制（TG 角色）
