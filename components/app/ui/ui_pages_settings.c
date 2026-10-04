@@ -78,8 +78,8 @@ static void ui_set_logclear_enter(void);
 typedef enum {
     SET_GRP_AUDIO = 0,
     SET_GRP_DISPLAY,
-    SET_GRP_SYSTEM,
     SET_GRP_LOG,
+    SET_GRP_SYSTEM,
     SET_GRP_COUNT,
 } settings_group_t;
 
