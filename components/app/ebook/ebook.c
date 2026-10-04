@@ -204,6 +204,13 @@ static book_src_t s_book;
 static uint64_t s_book_fp;
 
 static char s_page_buf[EBOOK_PAGE_BUF] EXT_RAM_BSS_ATTR;
+/* Scratch page used by the UI-task helpers that need to know whether a page
+ * renders to anything (page_start_at(), rebuild_history()) without touching
+ * s_page_buf, which holds the page on screen. Owned by the count task:
+ * s_count_page — same job, but that task must not share a buffer with the UI
+ * task. Both exist so every walker can apply the same blank-page rule. */
+static char s_probe_page[EBOOK_PAGE_BUF] EXT_RAM_BSS_ATTR;
+static char s_count_page[EBOOK_PAGE_BUF] EXT_RAM_BSS_ATTR;
 static char s_scan_buf[2][EBOOK_LIST_MAX][EBOOK_PATH_MAX] EXT_RAM_BSS_ATTR;
 
 /* Page-start table (see EBOOK_START_TABLE_CAP). Written by the count task,
@@ -552,6 +559,35 @@ static size_t layout_page(reader_t *r, size_t start, char *out, size_t cap)
     return o;
 }
 
+/* Lay out `*start` and step over pages that render to nothing first.
+ *
+ * A book whose tail is nothing but blank lines lays one last page out right
+ * before EOF, and it carries no text: navigating onto it showed an empty page,
+ * and counting it made the total higher than the last page the reader can
+ * reach. Every walker — the count task, ebook_page_flip(), page_start_at() and
+ * rebuild_history() — therefore steps past such pages so that pagination (and
+ * the "X/N" readout) stays identical everywhere.
+ *
+ * `*start` is updated to the page that was laid out and receives its text in
+ * `out` (non-NULL), `*next` receives the offset after it. Returns false when
+ * no page with text was left before EOF (`out` is then empty). */
+static bool layout_next_text(reader_t *r, char *out, size_t cap,
+                             size_t *start, size_t *next)
+{
+    for (;;) {
+        const size_t n = layout_page(r, *start, out, cap);
+        if (out[0] != '\0') {
+            *next = n;
+            return true;
+        }
+        if (n == *start) {
+            *next = n;                   /* EOF, or an SD read: nothing left */
+            return false;
+        }
+        *start = n;
+    }
+}
+
 /* --- page-start history ring (backward navigation) --- */
 
 static void hist_push(size_t off)
@@ -653,26 +689,32 @@ static void rebuild_history(void)
     }
 
     /* Fallback (no table yet, or allocation failed): walk the canonical
-     * sequence from 0, then the session part from s_session_start. */
+     * sequence from 0, then the session part from s_session_start. Blank pages
+     * are stepped over here too (layout_next_text), so this rebuild and the
+     * count task agree on what counts as a page. */
     {
         size_t off = 0;
         while (off < s_cur_start) {
-            hist_push(off);
-            const size_t prev = off;
-            off = layout_page(&s_reader, off, NULL, 0);
-            if (off == prev) {
-                break;              /* read error: no forward progress */
+            size_t here = off;
+            size_t next = off;
+            if (!layout_next_text(&s_reader, s_probe_page, EBOOK_PAGE_BUF,
+                                  &here, &next) || here >= s_cur_start) {
+                break;                   /* read error / passed our page */
             }
+            hist_push(here);
+            off = next;
         }
         if (off != s_cur_start && s_cur_start > s_session_start) {
             size_t off2 = s_session_start;
             while (off2 < s_cur_start) {
-                hist_push(off2);
-                const size_t prev = off2;
-                off2 = layout_page(&s_reader, off2, NULL, 0);
-                if (off2 == prev) {
-                    break;          /* read error: no forward progress */
+                size_t here = off2;
+                size_t next = off2;
+                if (!layout_next_text(&s_reader, s_probe_page, EBOOK_PAGE_BUF,
+                                      &here, &next) || here >= s_cur_start) {
+                    break;
                 }
+                hist_push(here);
+                off2 = next;
             }
         }
     }
@@ -833,23 +875,30 @@ static void ebook_count_task(void *arg)
         uint32_t pages = 0;
         size_t off = 0;
         for (;;) {
-            const size_t start = off;      /* byte offset of page `pages` */
             if (off >= src.size) {
                 break;                     /* normal end of walk */
             }
-            off = layout_page(&r, off, NULL, 0);
-            if (off == start) {
-                /* No forward progress: a mid-file SD read error, or the file
-                 * shrank after open (src.size is the open-time size). Treat
-                 * it as EOF instead of spinning here forever at 100% CPU. */
-                ESP_LOGW(TAG, "count aborted at offset %u (SD read error)",
-                         (unsigned)start);
+            /* Same blank-page rule as the reader (see layout_next_text): a page
+             * that renders to nothing is not a page the UI can display, so it
+             * must not raise the total above the last reachable page. */
+            size_t start = off;
+            size_t next = off;
+            if (!layout_next_text(&r, s_count_page, EBOOK_PAGE_BUF,
+                                  &start, &next)) {
+                if (next == start && next < src.size) {
+                    /* No forward progress: a mid-file SD read error, or the
+                     * file shrank after open (src.size is the open-time size).
+                     * Treat it as EOF instead of spinning here at 100% CPU. */
+                    ESP_LOGW(TAG, "count aborted at offset %u (SD read error)",
+                             (unsigned)start);
+                }
                 break;
             }
             if (s_start_table != NULL && pages < EBOOK_START_TABLE_CAP) {
                 s_start_table[pages] = (uint32_t)start;
             }
             pages++;
+            off = next;
         }
         fclose(r.fp);
         ESP_LOGI(TAG, "count done: %u page(s)", (unsigned)pages);
@@ -959,13 +1008,88 @@ static size_t page_start_at(size_t target)
     size_t prev = start;
     int guard = 0;
     while (next < target && guard++ < 1000) {
+        size_t here = next;
         prev = next;
-        next = layout_page(&s_reader, next, NULL, 0);
-        if (next == prev) {
-            break;                       /* safety: no forward progress */
+        /* Skip blank pages, as every other walker does (layout_next_text) —
+         * landing on one would start a session that the reader itself can
+         * never occupy. */
+        if (!layout_next_text(&s_reader, s_probe_page, EBOOK_PAGE_BUF,
+                              &here, &next)) {
+            break;
         }
+        prev = here;
     }
     return prev;
+}
+
+/* --- canonical page lookup (count task's page-start table) ---
+ *
+ * Index (0-based) of the canonical page containing byte `off`, or -1 when the
+ * table is empty or does not reach that far. *start_out (optional) receives
+ * that page's byte offset. The table is published immutable once the count
+ * walk finishes and is only invalidated by open/close, which run on the same
+ * task as every caller here, so entries may be read without the lock. */
+static int32_t page_index_at(size_t off, uint32_t *start_out)
+{
+    uint32_t n;
+    portENTER_CRITICAL(&s_mux);
+    n = s_table_valid ? s_table_count : 0;
+    portEXIT_CRITICAL(&s_mux);
+    if (n == 0 || s_start_table == NULL || s_start_table[0] > off) {
+        return -1;
+    }
+    const uint32_t *t = s_start_table;
+    uint32_t lo = 0, hi = n - 1, k = 0;
+    while (lo <= hi) {                   /* k = last index with t[k] <= off */
+        const uint32_t mid = (lo + hi) / 2;
+        if (t[mid] <= (uint32_t)off) {
+            k = mid;
+            lo = mid + 1;
+        } else if (mid == 0) {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    if (start_out != NULL) {
+        *start_out = t[k];
+    }
+    return (int32_t)k;
+}
+
+/* Page number (1-based) of the canonical page containing `off`, from the count
+ * task's page-start table. 0 when the table is not ready yet or does not cover
+ * `off`. Pagination is deterministic, so for a session whose pages start on
+ * canonical boundaries the answer is exact. */
+static int page_from_table(size_t off)
+{
+    const int32_t k = page_index_at(off, NULL);
+    return (k < 0) ? 0 : (int)(k + 1);
+}
+
+/* Keep a jump / percentage-restore landing on a real page boundary.
+ *
+ * page_start_at() only guarantees a line start, and a session that begins there
+ * lays every following page out from a shifted origin: such a session reaches
+ * EOF one page before the background total does — the reader then says
+ * "最后一页" while showing N-1/N. When the count task's table already covers
+ * the anchor, start from that canonical page instead, so the session and the
+ * total are the same sequence and the page number is exact for the rest of the
+ * book (including the last page).
+ *
+ * Returns false when the table cannot answer yet (shortly after opening a large
+ * book); the caller then keeps page_start_at() and its estimated number, which
+ * page_calibrate() replaces once the table lands. */
+static bool snap_to_canonical(size_t anchor, size_t *start, int *page)
+{
+    uint32_t cs = 0;
+    const int32_t k = page_index_at(anchor, &cs);
+    if (k < 0) {
+        return false;
+    }
+    *start = (size_t)cs;
+    *page = (int)(k + 1);
+    return true;
 }
 
 /* Arm a debounced save of the current position. Copies everything the save
@@ -1111,54 +1235,52 @@ static ebook_resume_t restore_position(const eb_slot_t *s, size_t size,
 
     /* Level 3: the text is gone, the percentage is the last usable anchor. */
     if (s->pct > 0 && s->pct < 100) {
-        *start = page_start_at((size_t)((uint64_t)size * s->pct / 100));
+        const size_t anchor = (size_t)((uint64_t)size * s->pct / 100);
+        size_t cs = anchor;
+        int page = 0;
+        /* Same canonical-boundary rule as a jump (see snap_to_canonical): a
+         * session restored to a plain line start ends up one page short of the
+         * background total by the time it reaches the last page. */
+        if (!snap_to_canonical(anchor, &cs, &page)) {
+            cs = page_start_at(anchor);
+        }
+        *start = cs;
         return EBOOK_RESUME_PERCENT;
     }
     return EBOOK_RESUME_NONE;
 }
 
-/* Page number (1-based) of the canonical page starting at `off`, from the
- * count task's page-start table. Returns 0 when the table is not ready yet or
- * does not cover `off`. Pagination is deterministic, so for a session that
- * never jumped the answer is exact; after a jump it is within one page. */
-static int page_from_table(size_t off)
-{
-    uint32_t n;
-    portENTER_CRITICAL(&s_mux);
-    n = s_table_valid ? s_table_count : 0;
-    portEXIT_CRITICAL(&s_mux);
-    if (n == 0 || s_start_table == NULL || s_start_table[0] > off) {
-        return 0;
-    }
-    const uint32_t *t = s_start_table;
-    uint32_t lo = 0, hi = n - 1, k = 0;
-    while (lo <= hi) {                   /* k = last index with t[k] <= off */
-        const uint32_t mid = (lo + hi) / 2;
-        if (t[mid] <= (uint32_t)off) {
-            k = mid;
-            lo = mid + 1;
-        } else if (mid == 0) {
-            break;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    return (int)k + 1;
-}
-
 /* Replace the estimated page number with the exact one as soon as the count
- * task's table covers the current page. Called lazily from ebook_page() and
- * ebook_page_flip(), so it always runs on the UI task. */
+ * task's table covers the current page, and put a session that started off a
+ * canonical boundary back onto one (see snap_to_canonical). Called lazily from
+ * ebook_page() and ebook_page_flip(), so it always runs on the UI task. */
 static void page_calibrate(void)
 {
     if (!s_page_calib) {
         return;
     }
-    const int p = page_from_table(s_cur_start);
-    if (p > 0) {
-        s_page = p;
-        s_page_calib = false;
+    uint32_t cs = 0;
+    const int32_t k = page_index_at(s_cur_start, &cs);
+    if (k < 0) {
+        return;
     }
+    s_page = (int)(k + 1);
+    s_page_calib = false;
+
+    if (cs == (uint32_t)s_cur_start) {
+        return;
+    }
+    /* The jump landed before the table existed, so the pages since then were
+     * laid out from a shifted origin and the running number would end one short
+     * of the total. Resume the canonical sequence from here instead: read the
+     * current page once more from the canonical start, and let rebuild_history()
+     * take its table path for anything behind it. */
+    s_cur_start = (size_t)cs;
+    s_session_start = s_cur_start;
+    s_next_start = layout_page(&s_reader, s_cur_start, s_page_buf,
+                               sizeof(s_page_buf));
+    s_hist_count = 0;                    /* starts belong to the old sequence */
+    s_hist_head = 0;
 }
 
 /* --- public API --- */
@@ -1518,19 +1640,26 @@ void ebook_page_flip(int dir)
             return;                      /* last page */
         }
         const size_t prev_start = s_cur_start;
-        const size_t prev_next = s_next_start;
         hist_push(prev_start);
-        s_cur_start = s_next_start;
-        s_next_start = layout_page(&s_reader, s_cur_start,
-                                   s_page_buf, sizeof(s_page_buf));
-        s_page++;
-        if (s_page_buf[0] == '\0' && s_next_start >= s_book.size) {
-            /* Blank page at EOF (file ends with a dangling newline): undo. */
+        size_t off = s_next_start;
+        size_t next = s_next_start;
+        if (layout_next_text(&s_reader, s_page_buf, sizeof(s_page_buf),
+                             &off, &next)) {
+            s_cur_start = off;
+            s_next_start = next;
+            s_page++;
+        }
+        else {
+            /* Only blank pages were left ahead of EOF (the book ends in blank
+             * lines). Stay on the page we came from and treat it as the last
+             * one — see ebook_at_end() — instead of showing an empty screen. */
             size_t prev;
             hist_pop(&prev);
             s_cur_start = prev_start;
-            s_next_start = prev_next;
-            s_page--;
+            s_next_start = s_book.size;
+            /* s_page_buf holds the blank attempt: put the real page back. */
+            layout_page(&s_reader, s_cur_start, s_page_buf,
+                        sizeof(s_page_buf));
         }
     }
     else {
@@ -1608,36 +1737,50 @@ bool ebook_jump_percent(int pct)
     }
     const size_t target =
         (size_t)((uint64_t)s_book.size * (uint32_t)pct / 100);
-    const size_t start = page_start_at(target);
 
-    /* The jump target becomes the origin of the current page sequence: the
-     * pages after a jump are laid out from here and are not canonical (see
-     * s_session_start / rebuild_history). */
+    /* Land on a canonical page start when the count task's table covers this
+     * part of the book (see snap_to_canonical). Falling back to page_start_at()
+     * — a plain line start — starts a non-canonical session, whose pages drift
+     * one step away from the background total by the last page. */
+    size_t start;
+    int page;
+    if (snap_to_canonical(target, &start, &page)) {
+        s_page_calib = false;
+    } else {
+        /* The number comes from the table when it covers this offset, else it
+         * is estimated from the percentage and flagged for calibration; the
+         * byte progress bar stays the authoritative indicator. */
+        start = page_start_at(target);
+        page = page_from_table(start);
+        s_page_calib = (page == 0);
+        if (page == 0) {
+            page = (s_page_count > 0)
+                       ? (int)((uint64_t)pct * s_page_count / 100)
+                       : 1;
+            if (page < 1) {
+                page = 1;
+            }
+        }
+    }
+    s_page = page;
+
+    /* The jump target becomes the origin of the current page sequence. When it
+     * is a canonical start (the normal case above) the pages that follow are
+     * canonical too, so backward history takes its fast table path in
+     * rebuild_history(). */
     s_session_start = start;
     s_cur_start = start;
     s_next_start = layout_page(&s_reader, start, s_page_buf,
                                sizeof(s_page_buf));
     s_hist_count = 0;
     s_hist_head = 0;
-    /* The page number comes from the count task's table when it covers this
-     * offset; otherwise estimate it from the percentage and flag it for
-     * calibration. The byte progress bar stays the authoritative indicator. */
-    s_page = page_from_table(start);
-    s_page_calib = (s_page == 0);
-    if (s_page == 0) {
-        s_page = (s_page_count > 0)
-                     ? (int)((uint64_t)pct * s_page_count / 100)
-                     : 1;
-        if (s_page < 1) {
-            s_page = 1;
-        }
-    }
     s_resume_kind = EBOOK_RESUME_NONE;   /* a jump is not a restore */
     s_resume_pct = 0;
     if (s_book.path[0] != '\0') {
         progress_arm();                  /* remember the jumped-to position */
     }
-    ESP_LOGI(TAG, "jump to %d%% -> offset %u", pct, (unsigned)start);
+    ESP_LOGI(TAG, "jump to %d%% -> offset %u page=%d%s", pct, (unsigned)start,
+             page, s_page_calib ? " (estimated)" : " (canonical)");
     return true;
 }
 
