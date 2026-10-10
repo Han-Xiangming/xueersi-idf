@@ -78,16 +78,27 @@ static uint16_t s_load_comp_mv = 50;
  * does not creep down under load. Forced samples still refresh. */
 static bool     s_freeze_while_playing = true;
 
-/* Map a pack voltage to 0..100 % via a piecewise open-circuit (rested) Li-ion
- * table. A single-cell Li-ion curve is strongly non-linear: it sits on a long
- * ~3.7 V plateau, so a linear 3.30→4.20 V map would report ~50 % near 3.75 V
+/* Map a pack voltage to 0..100 % via a piecewise Li-ion table. A single-cell
+ * Li-ion curve is strongly non-linear: it sits on a long ~3.7 V plateau, so a linear 3.30→4.20 V map would report ~50 % near 3.75 V
  * (actually ~70 %) and make the gauge jitter. The table below is entered as
  * (voltage_V, percent) breakpoints, sorted ascending; values between breakpoints
  * are linearly interpolated, and clamped to 0/100 outside the ends.
  *
- * Calibrated for a typical 4.20 V-charged single Li-ion cell at rest (no load).
- * Under audio-playback load the live voltage sags a few tens of mV, so treat the
- * result as a coarse gauge, not an exact fuel figure. */
+ * Calibration note: this table is read against the pack voltage measured
+ * while the machine is RUNNING (ESP32 + LCD + SD always draw current), so the
+ * upper anchor is deliberately NOT the charger's 4.20 V cut-off. A freshly
+ * charged cell relaxes to roughly 4.07..4.15 V once the charger is removed,
+ * which is exactly what the ADC sees in normal use — anchoring 100 % at 4.20 V
+ * made a full pack report only 93..97 %. Do not "correct" the top anchor back
+ * to 4.20 V: that point is only reachable while USB is attached.
+ *
+ * Calibrated empirically: a full pack measured 4.074 V (was 93 %) and 4.146 V
+ * (was 97 %) with USB detached - both now land at 97..100 %. Everything from
+ * 3.30 V through 3.93 V (the rest of the discharge range) is untouched.
+ *
+ * Trade-off: while charging the gauge reaches 100 % at ~85..90 % true SoC.
+ * Under audio-playback load the live voltage sags a few tens of mV, so treat
+ * the result as a coarse gauge, not an exact fuel figure. */
 typedef struct {
     float v;   /* pack voltage, volts */
     uint8_t p; /* corresponding state-of-charge, % */
@@ -104,10 +115,10 @@ static const bat_lut_t s_bat_lut[] = {
     {3.85f,  70},
     {3.93f,  80},
     {4.02f,  90},
-    {4.20f, 100},   /* full charge */
+    {4.10f, 100},   /* full: loaded reading right after the charger is removed */
 };
 
-/* Map a pack voltage to 0..100 % via the open-circuit table above. */
+/* Map a pack voltage to 0..100 % via the table above. */
 static uint8_t voltage_to_percent(float vbat)
 {
     const size_t n = sizeof(s_bat_lut) / sizeof(s_bat_lut[0]);

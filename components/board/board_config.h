@@ -75,6 +75,13 @@
 /* V_bat = V_adc * BAT_DIV_FACTOR. (100+100)/100 = 2.0 */
 #define BAT_DIV_FACTOR          ((float)(BAT_DIV_R_TOP_KOHM + BAT_DIV_R_BOT_KOHM) / BAT_DIV_R_BOT_KOHM)
 
-/* Li-ion cell voltage points used for the percent mapping (single cell). */
-#define BAT_V_FULL              4.20f   /* 100% */
+/* Reference cell-voltage points for the percent mapping (single cell).
+ *
+ * NOTE: the authoritative curve lives in battery.c (s_bat_lut). BAT_V_FULL is
+ * NOT the charger's cut-off voltage: it is the full-pack reading the ADC sees
+ * while the machine runs on battery (USB detached). A fresh cell relaxes to
+ * about 4.07..4.15 V once the charger is removed, so anchoring at 4.20 V makes
+ * a genuinely full pack display only 93..97 %. Keep the two in sync if you
+ * retune one of them. */
+#define BAT_V_FULL              4.10f   /* 100% (loaded, off the charger) */
 #define BAT_V_EMPTY            3.30f   /* 0%   (cut-off) */
