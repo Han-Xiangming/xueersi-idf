@@ -54,6 +54,18 @@ static const char *TAG = "ebook";
  * to the slow synchronous relayout. */
 #define EBOOK_START_TABLE_CAP (64 * 1024)
 
+/* Page-map cache (the "popular" fix for the X/N desync): persist the canonical
+ * page-start table next to the book as a sidecar so a re-open of an already
+ * paginated book is instant and shows an exact X/N from the first page. This is
+ * the same pattern KOReader / EPUB.js use for their locations map. The cache is
+ * validated by the book's content fingerprint + size, so a renamed/moved book
+ * keeps its cache while a changed book is ignored and re-counted. */
+#define EBOOK_PAG_MAGIC  0x50414731U     /* "PAG1" */
+#define EBOOK_PAG_VER    1
+/* Sidecar header = 8 x uint32_t (no padding): magic, ver, fp_lo, fp_hi,
+ * size_lo, size_hi, page_count, table_count; followed by table_count offsets. */
+static void ebook_pag_save(void);   /* forward decl: used by ebook_count_task */
+
 /* --- reading progress (on-card file) ------------------------------------
  * One file next to the books, so the progress moves with the card and
  * survives firmware updates.
@@ -903,6 +915,7 @@ static void ebook_count_task(void *arg)
         fclose(r.fp);
         ESP_LOGI(TAG, "count done: %u page(s)", (unsigned)pages);
 
+        bool published = false;
         portENTER_CRITICAL(&s_mux);
         if (gen == s_open_gen && s_is_open) {
             s_page_count = pages;
@@ -916,10 +929,157 @@ static void ebook_count_task(void *arg)
                 s_table_count = (pages < EBOOK_START_TABLE_CAP)
                                     ? pages : EBOOK_START_TABLE_CAP;
                 s_table_valid = true;
+                published = true;
             }
         }
         portEXIT_CRITICAL(&s_mux);
+        /* Persist the freshly built page map so the next open is instant and
+         * already shows an exact X/N. Guarded by `published` so a stale walk
+         * for a book that was closed/reopened mid-count never clobbers a valid
+         * cache. */
+        if (published) {
+            ebook_pag_save();
+        }
     }
+}
+
+/* --- page-map cache (sidecar next to the book) --- */
+
+/* Sidecar path for `book_path`: the book path with a ".pag" suffix. Returns
+ * false (and leaves `out` empty) when it does not fit. */
+static bool pag_path(const char *book_path, char *out, size_t outsz)
+{
+    int n = snprintf(out, outsz, "%s.pag", book_path);
+    return (n > 0 && (size_t)n < outsz);
+}
+
+/* Load a previously cached page-start table for `book_path` and validate it
+ * against the book's content fingerprint + size. On success fills
+ * s_start_table and returns the entry count (also via *out_pages the total
+ * page count); the caller publishes validity under the mutex. Returns 0 on any
+ * mismatch or I/O error, in which case the caller falls back to the count task. */
+static uint32_t ebook_pag_load(const char *book_path, uint64_t fp, uint64_t size,
+                               uint32_t *out_pages)
+{
+    *out_pages = 0;
+    if (s_start_table == NULL) {
+        return 0;
+    }
+    char path[EBOOK_PATH_MAX + 8];
+    if (!pag_path(book_path, path, sizeof(path))) {
+        return 0;
+    }
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        return 0;
+    }
+    uint32_t hdr[8];
+    if (fread(hdr, sizeof(uint32_t), 8, f) != 8) {
+        fclose(f);
+        return 0;
+    }
+    if (hdr[0] != EBOOK_PAG_MAGIC || hdr[1] != EBOOK_PAG_VER ||
+        ((uint64_t)hdr[3] << 32 | hdr[2]) != fp ||
+        ((uint64_t)hdr[5] << 32 | hdr[4]) != size || hdr[7] == 0) {
+        fclose(f);
+        return 0;
+    }
+    uint32_t cnt = (hdr[7] < EBOOK_START_TABLE_CAP) ? hdr[7] : EBOOK_START_TABLE_CAP;
+    if (fread(s_start_table, sizeof(uint32_t), cnt, f) != cnt) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    *out_pages = hdr[6];
+    ESP_LOGI(TAG, "page-map cache hit '%s': %u page(s)", book_path, hdr[6]);
+    return cnt;
+}
+
+/* Persist the current canonical page-start table to a sidecar next to the
+ * book. Best-effort: a read-only card only costs a warning. Called from the
+ * count task once the table is published, and from ebook_close() as a fallback.
+ * The caller guarantees the table is valid and belongs to the current book. */
+static void ebook_pag_save(void)
+{
+    char path[EBOOK_PATH_MAX + 8];
+    uint64_t fp, size;
+    uint32_t pages, tbl;
+    bool ok;
+    portENTER_CRITICAL(&s_mux);
+    ok = s_table_valid && s_is_open && s_start_table != NULL;
+    if (ok) {
+        pag_path(s_book.path, path, sizeof(path));
+        fp = s_book_fp;
+        size = s_book.size;
+        pages = s_page_count;
+        tbl = s_table_count;
+    }
+    portEXIT_CRITICAL(&s_mux);
+    if (!ok || path[0] == '\0') {
+        return;
+    }
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) {
+        ESP_LOGW(TAG, "page-map cache write failed '%s'", path);
+        return;
+    }
+    uint32_t hdr[8];
+    hdr[0] = EBOOK_PAG_MAGIC;
+    hdr[1] = EBOOK_PAG_VER;
+    hdr[2] = (uint32_t)fp;
+    hdr[3] = (uint32_t)(fp >> 32);
+    hdr[4] = (uint32_t)size;
+    hdr[5] = (uint32_t)(size >> 32);
+    hdr[6] = pages;
+    hdr[7] = tbl;
+    if (fwrite(hdr, sizeof(uint32_t), 8, f) != 8 ||
+        fwrite(s_start_table, sizeof(uint32_t), tbl, f) != tbl) {
+        ESP_LOGW(TAG, "page-map cache write truncated '%s'", path);
+        fclose(f);
+        return;
+    }
+    fclose(f);
+    ESP_LOGI(TAG, "page-map cache saved '%s': %u page(s)", path, pages);
+}
+
+/* Recursively remove every "<name>.pag" sidecar under `dir` (the persisted
+ * page-map caches). They are pure derived data, so clearing them alongside
+ * reading progress is correct — each is rebuilt on the next open. Mirrors the
+ * traversal in scan_dir() (stat to tell file from directory, depth-bounded to
+ * survive a pathological cycle). */
+static void pag_cache_clear(const char *dir, int depth)
+{
+    if (depth > 16) {
+        return;
+    }
+    DIR *d = opendir(dir);
+    if (d == NULL) {
+        return;
+    }
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        const char *fn = e->d_name;
+        if (fn[0] == '.') {              /* skip ".", "..", hidden */
+            continue;
+        }
+        char child[EBOOK_PATH_MAX];
+        snprintf(child, sizeof(child), "%s/%s", dir, fn);
+        struct stat st;
+        if (stat(child, &st) != 0) {
+            continue;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            pag_cache_clear(child, depth + 1);
+        } else if (S_ISREG(st.st_mode)) {
+            int len = (int)strlen(fn);
+            if (len > 4 && strcasecmp(fn + len - 4, ".pag") == 0) {
+                if (remove(child) == 0) {
+                    ESP_LOGI(TAG, "removed page-map cache '%s'", child);
+                }
+            }
+        }
+    }
+    closedir(d);
 }
 
 /* --- reading progress (on-card file) --- */
@@ -1398,6 +1558,12 @@ void ebook_close(void)
         progress_save();
         fclose(s_reader.fp);
         s_reader.fp = NULL;
+        /* Persist the page map (best-effort) as a fallback for the case where
+         * the count task had not finished publishing when this book was closed;
+         * if it had, this just re-writes an identical cache. Must run before the
+         * mutex reset below, while s_is_open / s_table_valid still describe the
+         * current book. */
+        ebook_pag_save();
     }
     s_save_pending = false;
     s_flip_since_save = 0;
@@ -1477,16 +1643,34 @@ bool ebook_open(int idx)
                  src.path);
     }
 
+    /* Try to restore the canonical page-start table from a sidecar cache so a
+     * re-open of an already-paginated book is instant and shows an exact X/N
+     * from the first page (see ebook_pag_load). Falls back to the count task
+     * when there is no matching cache. */
+    uint32_t cached_tbl = 0, cached_pages = 0;
+    if (src.size > 0 && book_fp != 0) {
+        cached_tbl = ebook_pag_load(src.path, book_fp, src.size, &cached_pages);
+    }
+
     portENTER_CRITICAL(&s_mux);
     s_book = src;
     s_book_fp = book_fp;
     s_is_open = true;
     s_open_gen++;                        /* start the count fresh for this book */
-    /* The page-start table belongs to the previous book: invalidate it until
-     * the new count walk publishes its own (its entries are written outside
-     * the mutex, so readers must never see them while stale). */
-    s_table_valid = false;
-    s_table_count = 0;
+    if (cached_tbl > 0) {
+        /* Page map restored from cache: the canonical table is already valid,
+         * so skip the background count entirely (instant open + exact X/N). */
+        s_table_valid = true;
+        s_table_count = cached_tbl;
+        s_page_count = cached_pages;
+        s_count_ver++;                      /* advertise "count ready" */
+    } else {
+        /* The page-start table belongs to the previous book: invalidate it
+         * until the new count walk publishes its own (its entries are written
+         * outside the mutex, so readers must never see them while stale). */
+        s_table_valid = false;
+        s_table_count = 0;
+    }
     portEXIT_CRITICAL(&s_mux);
 
     /* Restore the saved position. The v2 slot is keyed by a content fingerprint
@@ -1562,18 +1746,32 @@ bool ebook_open(int idx)
      * backward history is rebuilt from here (see s_session_start). */
     s_session_start = start;
     s_cur_start = start;
-    /* The page number is no longer persisted: after a jump it was only an
-     * estimate, and storing it made the "X/N" readout drift. Take it from the
-     * count task's page-start table instead, or flag it for calibration as
-     * soon as that table lands (page_calibrate()). */
-    s_page = page_from_table(start);
-    s_page_calib = (s_page == 0);
-    if (s_page == 0) {
-        s_page = 1;
+    /* A restored offset was saved by whatever session wrote it and need not
+     * be a canonical page start (e.g. a position saved before the
+     * snap-to-canonical fix). A non-canonical origin merges pages at the end
+     * of the book, so the last page then reads N-1/N — the 1019/1020 bug.
+     * Snap to the canonical page containing the offset when the table can
+     * answer (a cache hit makes it valid right here); otherwise flag the
+     * number for page_calibrate(), which re-aligns the session once the count
+     * task publishes the table. */
+    int page;
+    size_t cs;
+    if (snap_to_canonical(start, &cs, &page)) {
+        start = cs;
+        s_page = page;
+        s_page_calib = false;
+    }
+    else {
+        s_page = page_from_table(start);
+        s_page_calib = (s_page == 0);
+        if (s_page == 0) {
+            s_page = 1;
+        }
     }
     s_next_start = layout_page(&s_reader, start, s_page_buf,
                                sizeof(s_page_buf));
-    if (s_count_task != NULL) {
+    if (cached_tbl == 0 && s_count_task != NULL) {
+        /* Only re-count when no valid cache was restored for this book. */
         xTaskNotifyGive(s_count_task);
     }
     ESP_LOGI(TAG, "open '%s' size=%u fp=%08X%08X resume=%u%% kind=%d page=%d",
@@ -1718,10 +1916,52 @@ bool ebook_progress_flush(void)
  * can swap positions. Wiping both files removes all residual progress. The
  * persistence layer (components/ebook_progress) owns the card file, the cache
  * and the NVS mirror, so it handles the wipe atomically. Safe to call at any
- * time (serialized with the save path); the caller should be on the UI task. */
+ * time (serialized with the save path); the caller should be on the UI task.
+ *
+ * The catch: the book the user is currently reading still has its position in
+ * memory and a pending/debounced save. If we only wiped the card, the next
+ * save (close, flip, or the background task) would recreate a v2 slot and the
+ * NVS mirror with the OLD offset — so the book would reappear with its old
+ * progress next open, looking like "clear" did nothing. To make the wipe stick
+ * we (1) invalidate the snapshot first so any in-flight save is dropped, (2) wipe
+ * storage, then (3) reset the open book to the start and persist offset 0. */
 void ebook_progress_clear_all(void)
 {
+    /* Invalidate the pending/last snapshot so any in-flight or debounced save
+     * (background task, close, flip) is dropped instead of recreating a v2 slot
+     * / NVS mirror with the old offset after the wipe. progress_save() guards on
+     * s_snap.fp, so a cleared fp means "do nothing". */
+    s_snap.fp = 0;
+    s_save_pending = false;
+    s_save_after = 0;
+
     ebook_prog_clear_all();
+    /* Drop the derived page-map caches too: they are rebuilt on the next open,
+     * so clearing them keeps "清除进度" fully clean (no stale caches pointing at
+     * now-forgotten books). */
+    pag_cache_clear(EBOOK_ROOT, 0);
+
+    portENTER_CRITICAL(&s_mux);
+    if (s_is_open && s_book.path[0] != '\0') {
+        /* Jump the open book back to the start so "clear" also means "start
+         * over" for the book on screen — and so a save records offset 0 rather
+         * than the old position. */
+        s_cur_start = 0;
+        s_session_start = 0;
+        s_resume_kind = EBOOK_RESUME_NONE;
+        s_resume_pct = 0;
+        s_page = 1;
+        s_page_calib = false;
+        s_hist_count = 0;
+        s_hist_head = 0;
+    }
+    portEXIT_CRITICAL(&s_mux);
+
+    if (s_is_open && s_book.path[0] != '\0') {
+        s_next_start = layout_page(&s_reader, 0, s_page_buf, sizeof(s_page_buf));
+        progress_arm();                  /* snapshot offset 0 for the open book */
+        progress_save();                 /* persist the cleared (start) position */
+    }
 }
 
 bool ebook_jump_percent(int pct)
