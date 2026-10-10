@@ -93,6 +93,19 @@ static bool key_is_single_shot(uint32_t key)
     return key == LV_KEY_MEDIA_PANEL || key == LV_KEY_ENTER;
 }
 
+/* Physical hold state, refreshed by hw_buttons_read on every poll. Independent
+ * of LVGL's single-shot / auto-repeat handling: single-shot keys (A/ENTER,
+ * MENU) are reported as RELEASED while held, so the UI never sees them as a
+ * held or repeated key — this flag lets a page poll the real hold state and
+ * implement long-press on them. Read from the same LVGL task that runs
+ * hw_buttons_read, so no lock is needed. */
+static uint32_t s_held_key = 0;
+
+bool hw_button_is_held(uint32_t key)
+{
+    return key != 0 && s_held_key == key;
+}
+
 void hw_buttons_read(lv_indev_t *indev, lv_indev_data_t *data)
 {
     (void)indev;
@@ -126,6 +139,7 @@ void hw_buttons_read(lv_indev_t *indev, lv_indev_data_t *data)
 
     if (stable_index >= 0) {
         const uint32_t key = s_buttons[stable_index].key;
+        s_held_key = key;   /* track the physically-held key for long-press */
         if (key_is_single_shot(key)) {
             if (stable_index != single_shot_hold_index) {
                 single_shot_hold_index = stable_index;   /* first settling poll: press */
@@ -145,6 +159,7 @@ void hw_buttons_read(lv_indev_t *indev, lv_indev_data_t *data)
         data->key = last_key;
     }
     else {
+        s_held_key = 0;     /* no key physically held */
         single_shot_hold_index = -1;
         data->state = LV_INDEV_STATE_RELEASED;
         data->key = last_key;

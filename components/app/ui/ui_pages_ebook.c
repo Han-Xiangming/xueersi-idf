@@ -32,7 +32,19 @@
 #include "ui_theme.h"
 #include "ui_widgets.h"
 
+/* Reader long-press: holding A past EBOOK_LONG_PRESS_MS starts flipping pages
+ * continuously, then every EBOOK_REPEAT_MS while held (mirrors the nav-key
+ * auto-repeat feel). The first page is turned on the initial press. */
+#define EBOOK_LONG_PRESS_MS   400
+#define EBOOK_REPEAT_MS       110
+
 static ui_marquee_t s_eb_mq;
+/* Long-press auto-flip for the reader's A key. Declared here (ahead of
+ * ui_build_ebook_read, which arms the timer) so the timer and its callback are
+ * visible at first use; the callback body is defined further below. */
+static lv_timer_t *s_eb_auto;
+static uint32_t s_eb_a_down_ms;   /* tick when the current A press began */
+static void eb_auto_flip_cb(lv_timer_t *t);
 /* Ebook book-list page: same 6-row layout as the MP3 page. */
 static int s_eb_sel;
 static char s_eb_open_name[MP3_NAME_LEN];
@@ -167,6 +179,13 @@ void ui_build_ebook_read(lv_obj_t *page)
 
     s_ui.hint = ui_theme_label(page, "", UI_LEGEND_Y, UI_COLOR_TEXT,
                          LV_TEXT_ALIGN_CENTER);
+
+    /* Lazily create the long-press auto-flip timer (once); it stays paused
+     * until A is held on the reader. */
+    if (s_eb_auto == NULL) {
+        s_eb_auto = lv_timer_create(eb_auto_flip_cb, EBOOK_REPEAT_MS, NULL);
+        lv_timer_pause(s_eb_auto);
+    }
 }
 void ui_refresh_ebook_list(void)
 {
@@ -346,6 +365,37 @@ void ui_ebook_list_action(void)
         }
 }
 
+/* Long-press auto-flip timer for the reader's A key. Created once (lazily in
+ * ui_build_ebook_read) and paused/resumed; the callback polls the physical
+ * hold state because A is a single-shot key LVGL never repeats. The timer runs
+ * at a fixed EBOOK_REPEAT_MS cadence; the long-press threshold is enforced by
+ * s_eb_a_down_ms (avoids depending on lv_timer_reset, which would otherwise
+ * fire immediately after resume because the timer's last_run is stale). */
+static void eb_auto_flip_cb(lv_timer_t *t)
+{
+    (void)t;
+    /* Stop if we left the reader, the jump overlay took over, A was released,
+     * or we reached the last page. */
+    if (ui_nav_current() != UI_PAGE_EBOOK_READ || s_eb_jump ||
+        !hw_button_is_held(LV_KEY_ENTER)) {
+        lv_timer_pause(s_eb_auto);
+        return;
+    }
+    /* Wait out the long-press threshold before flipping continuously. */
+    if (lv_tick_elaps(s_eb_a_down_ms) < EBOOK_LONG_PRESS_MS) {
+        return;
+    }
+    if (ebook_at_end()) {
+        set_action("最后一页");
+        lv_timer_pause(s_eb_auto);
+        return;
+    }
+    ebook_page_flip(1);
+    set_action("下一页");
+    ui_mark_dirty();
+    ui_refresh();
+}
+
 void ui_ebook_read_action(void)
 {
         if (s_eb_jump) {
@@ -364,6 +414,13 @@ void ui_ebook_read_action(void)
         else {
             ebook_page_flip(1);
             set_action("下一页");
+            /* Arm long-press continuous flip: the first page is already turned
+             * above; the timer waits EBOOK_LONG_PRESS_MS, then flips repeatedly
+             * while A stays held. A short tap releases before it ever fires. */
+            if (s_eb_auto != NULL) {
+                s_eb_a_down_ms = lv_tick_get();
+                lv_timer_resume(s_eb_auto);
+            }
         }
 }
 
@@ -432,6 +489,9 @@ void ui_ebook_select(void)
 bool ui_ebook_esc(void)
 {
     if (ui_nav_current() == UI_PAGE_EBOOK_READ) {
+        if (s_eb_auto != NULL) {
+            lv_timer_pause(s_eb_auto);   /* stop any running auto-flip */
+        }
         if (s_eb_jump) {
             s_eb_jump = false;         /* cancel, stay on the page */
             ui_mark_dirty();

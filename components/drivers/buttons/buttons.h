@@ -29,3 +29,8 @@ void hw_buttons_init(void);
 
 /* LVGL keypad input-device read callback. */
 void hw_buttons_read(lv_indev_t *indev, lv_indev_data_t *data);
+
+/* True while the given key is physically held (post-debounce). Lets the UI
+ * implement long-press on single-shot keys (A/ENTER, MENU) that LVGL never
+ * reports as held or repeated. */
+bool hw_button_is_held(uint32_t key);
