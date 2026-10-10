@@ -33,10 +33,15 @@
 #include "ui_widgets.h"
 
 /* Reader long-press: holding A past EBOOK_LONG_PRESS_MS starts flipping pages
- * continuously, then every EBOOK_REPEAT_MS while held (mirrors the nav-key
- * auto-repeat feel). The first page is turned on the initial press. */
+ * continuously; the repeat interval then accelerates the longer A is held
+ * (EBOOK_REPEAT_MS -> EBOOK_REPEAT_MIN_MS, one EBOOK_ACCEL_STEP_MS shrink every
+ * EBOOK_ACCEL_EVERY_MS), like a text-scroll accelerate. The first page is
+ * turned on the initial press. */
 #define EBOOK_LONG_PRESS_MS   400
-#define EBOOK_REPEAT_MS       110
+#define EBOOK_REPEAT_MS       110   /* initial repeat interval after the threshold */
+#define EBOOK_REPEAT_MIN_MS   40    /* fastest interval at full speed */
+#define EBOOK_ACCEL_STEP_MS   14    /* interval shrink per accel level */
+#define EBOOK_ACCEL_EVERY_MS  600   /* shorten the interval this often while held */
 
 static ui_marquee_t s_eb_mq;
 /* Long-press auto-flip for the reader's A key. Declared here (ahead of
@@ -382,7 +387,8 @@ static void eb_auto_flip_cb(lv_timer_t *t)
         return;
     }
     /* Wait out the long-press threshold before flipping continuously. */
-    if (lv_tick_elaps(s_eb_a_down_ms) < EBOOK_LONG_PRESS_MS) {
+    uint32_t held = lv_tick_elaps(s_eb_a_down_ms);
+    if (held < EBOOK_LONG_PRESS_MS) {
         return;
     }
     if (ebook_at_end()) {
@@ -394,6 +400,17 @@ static void eb_auto_flip_cb(lv_timer_t *t)
     set_action("下一页");
     ui_mark_dirty();
     ui_refresh();
+    /* Accelerate: the longer A stays held, the shorter the repeat interval
+     * (down to EBOOK_REPEAT_MIN_MS). */
+    int level = (int)(held - EBOOK_LONG_PRESS_MS) / EBOOK_ACCEL_EVERY_MS;
+    uint32_t period = EBOOK_REPEAT_MS;
+    if (level > 0) {
+        int shrink = level * EBOOK_ACCEL_STEP_MS;
+        period = (shrink >= (int)(EBOOK_REPEAT_MS - EBOOK_REPEAT_MIN_MS))
+                 ? EBOOK_REPEAT_MIN_MS
+                 : EBOOK_REPEAT_MS - (uint32_t)shrink;
+    }
+    lv_timer_set_period(s_eb_auto, period);
 }
 
 void ui_ebook_read_action(void)
