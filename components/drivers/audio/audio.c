@@ -134,9 +134,9 @@ static int16_t s_seam_silence[256 * 2];
  * it scales CPU ~linearly. On ESP32 (no FPU; fixed-point MACs) q5 processes one
  * 1152-sample stereo frame in ~22 ms — more than the 24 ms of audio it emits,
  * so the decode task becomes the bottleneck, the 279 ms DMA ring drains, and
- * "I2S write gap" underrun warnings appear. q2 (filt_len 16) is ~4x cheaper,
+ * "I2S write gap" underrun warnings appear. q1 (filt_len 16) is ~5x cheaper,
  * still a true windowed-sinc (vastly better than the old linear interpolator),
- * and leaves huge real-time slack; q1 (filt_len 8) is even faster if needed. */
+ * and leaves huge real-time slack for decode + DSP on core 0. */
 #define RESAMP_QUALITY     1      /* 0..10; ESP32 sweet spot (fast + sinc quality) */
 static SpeexResamplerState *s_resamp = NULL;  /* NULL => bypass */
 static bool                s_resamp_active;   /* true: src_rate != s_rate */

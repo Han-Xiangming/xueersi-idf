@@ -54,7 +54,7 @@ FATFS 目录遍历在 SDSPI 上耗时数十 ms，故列表由**独立扫描任�
 - 暂停/停止不阻塞：`hw_audio_write_pcm()` 在 `s_player_active=false` 时直接返回放弃剩余数据。
 - 解码健壮性：除「无同步字 / 解码错误过多（512 次）」外，新增**零进度护栏**——连续 16 帧「解码成功但既没消耗字节也没产出样本」的畸形帧判定为损坏并跳过该曲，专门防 libhelix 在特定帧上原地自旋（CPU 跑满、把停顿看门狗饿死、无任何日志的「静默冻结」）。解码任务同时订阅 ESP 任务看门狗（5s 卡死即带 backtrace 重启）作为最后兜底。
 - 播放进度（字节偏移百分比）对 VBR MP3 不准确，UI 不展示（`player.h` 注释明示）。
-- 采样率随首帧变化：`hw_audio_set_sample_rate()` 由解码任务同步调用。但 **I2S 通道不再重建**：通道在 init 时以 44100 建好并一路保持 RUNNING，非 44100 的音源由 `audio.c` 内的 SpeexDSP 定点重采样器（`quality=2`）软转（见 `docs/audio.md` §2）。重建通道会重置 DMA 描述符 credit 队列且不会 refill，是历史上"切歌后整条 I2S 静默卡死"的根因。
+- 采样率随首帧变化：`hw_audio_set_sample_rate()` 由解码任务同步调用。但 **I2S 通道不再重建**：通道在 init 时以 44100 建好并一路保持 RUNNING，非 44100 的音源由 `audio.c` 内的 SpeexDSP 定点重采样器（`quality=1`）软转（见 `docs/audio.md` §2）。重建通道会重置 DMA 描述符 credit 队列且不会 refill，是历史上"切歌后整条 I2S 静默卡死"的根因。
 
 ## 4. 循环模式与曲目切换
 
