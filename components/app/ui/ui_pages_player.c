@@ -258,6 +258,17 @@ void ui_player_build_panel(void)
     lv_obj_set_style_text_color(s_ui.pl_panel_state, lv_color_hex(UI_COLOR_TEXT_DIM), 0);
     lv_obj_set_style_text_align(s_ui.pl_panel_state, LV_TEXT_ALIGN_RIGHT, 0);
 
+    /* Volume readout (left-aligned, below the track-name / state row). Kept in
+     * its own line so the ↑↓ volume keys always have a visible value to move
+     * while the panel is open, whatever the playback state. */
+    s_ui.pl_panel_vol = lv_label_create(panel);
+    lv_label_set_text(s_ui.pl_panel_vol, "");
+    lv_label_set_long_mode(s_ui.pl_panel_vol, LV_LABEL_LONG_MODE_CLIP);
+    lv_obj_set_pos(s_ui.pl_panel_vol, 10, 40);
+    lv_obj_set_size(s_ui.pl_panel_vol, 276, LV_SIZE_CONTENT);
+    lv_obj_set_style_text_font(s_ui.pl_panel_vol, UI_FONT, 0);
+    lv_obj_set_style_text_color(s_ui.pl_panel_vol, lv_color_hex(UI_COLOR_TEXT_DIM), 0);
+
     /* Evenly distribute the five controls: fixed-width slots left 4 px /
      * 20 px alternating gaps (3-char vs 2-char labels); laying the row out
      * from the exact label widths with a uniform gap and centered margins
@@ -332,6 +343,11 @@ void ui_player_refresh_panel(void)
              st == PLAYER_PLAYING ? "▶" : st == PLAYER_PAUSED ? "⏸" : "⏹",
              ui_repeat_text());
     ui_theme_text_set(s_ui.pl_panel_state, s_panel_state_buf);
+
+    static char s_panel_vol_buf[16];
+    snprintf(s_panel_vol_buf, sizeof(s_panel_vol_buf), "音量 %u%%",
+             (unsigned)hw_audio_get_volume());
+    ui_theme_text_set(s_ui.pl_panel_vol, s_panel_vol_buf);
 
     for (int i = 0; i < PLAYER_PANEL_NBTN; i++) {
         ui_theme_text_set(s_ui.pl_panel_btn[i], ui_panel_btn_text(i));
@@ -758,6 +774,17 @@ bool ui_player_panel_key(uint32_t key)
     }
     else if (key == LV_KEY_ENTER) {
         ui_panel_activate();      /* marks dirty itself */
+    }
+    else if (key == LV_KEY_UP || key == LV_KEY_DOWN) {
+        /* Volume up/down (dedicated to ↑↓ on the panel, whatever the playback
+         * state — the global output volume, mirroring the player page). */
+        ui_volume_step(key == LV_KEY_UP ? 1 : -1);
+        ui_settings_mark_dirty(SETTINGS_DIRTY_VOLUME);
+        char buf[24];
+        snprintf(buf, sizeof(buf), "音量 %u%%",
+                 (unsigned)hw_audio_get_volume());
+        set_action(buf);
+        ui_mark_dirty();
     }
     else if (key == LV_KEY_ESC) {
         s_panel_open = false;

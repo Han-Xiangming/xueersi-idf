@@ -65,7 +65,7 @@
  *      ← → ↑ ↓ glyphs added to the font subset in P2) --- */
 #define UI_STR_HINT_NAV        "↑↓ 选择  A 进入  B 返回"
 #define UI_STR_HINT_NAV_LR     "↑↓ 选择  A 进入  ←→ 设置  B 返回"
-#define UI_STR_HINT_PANEL      "←→ 选择  A 确认  B 关闭"
+#define UI_STR_HINT_PANEL      "←→选 ↑↓音量 A确认 B关闭"
 /* Player seek-bar hints (←→切歌, ↑↓音量/选择, A播放/暂停/继续, Select循环). */
 #define UI_STR_HINT_SEEK_PLAY  "←→ 切歌  ↑↓ 音量  A 暂停  Select 循环"
 #define UI_STR_HINT_SEEK_PAUSE "←→ 切歌  ↑↓ 音量  A 继续  Select 循环"

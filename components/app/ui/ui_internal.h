@@ -111,6 +111,7 @@ typedef struct {
     lv_obj_t *pl_panel;   /* floating playback control panel (MENU key) */
     lv_obj_t *pl_panel_name;
     lv_obj_t *pl_panel_state;
+    lv_obj_t *pl_panel_vol;     /* "音量 XX%" readout on the panel */
     lv_obj_t *pl_panel_btn[5];  /* 上一曲 / 播放暂停 / 下一曲 / 停止 / 循环 */
 
     lv_group_t *group;
