@@ -545,9 +545,8 @@ static const char *ui_set_reset_text(void)
 
 static void ui_set_vol_lr(int dir)
 {
-    /* 1% steps within 0..10, else 5% — matches the backlight control. */
-    ui_volume_step(dir);
-    ui_settings_mark_dirty(SETTINGS_DIRTY_VOLUME);
+    /* Step + persist + toast all handled by the shared volume entry point. */
+    ui_volume_change(dir);
 }
 
 static void ui_set_gain_lr(int dir)

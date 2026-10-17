@@ -952,6 +952,39 @@ uint8_t hw_audio_get_volume(void)
     return s_volume;
 }
 
+/* Fixed-dB volume step on the ACTIVE route. The percent↔gain map is dB-linear
+ * (see audio_update_vol_gain: dB = (v/100 - 1) * VOL_MAX_ATTEN_DB), so stepping
+ * by a constant dB is a constant perceived-loudness change everywhere on the
+ * knob — no position-dependent "fine near silence / coarse above" patch needed.
+ * Convert percent→dB, apply the step, clamp to the 0..100 % (= 0..-40 dB) ends,
+ * then round back to the nearest integer percent. */
+void hw_audio_volume_step_db(float step_db)
+{
+    int v = (int)s_volume;
+    if (v < 0) {
+        v = 0;
+    }
+    else if (v > 100) {
+        v = 100;
+    }
+    float dB = ((float)v / 100.0f - 1.0f) * (float)VOL_MAX_ATTEN_DB;
+    dB += step_db;
+    if (dB > 0.0f) {
+        dB = 0.0f;
+    }
+    if (dB < -(float)VOL_MAX_ATTEN_DB) {
+        dB = -(float)VOL_MAX_ATTEN_DB;
+    }
+    int pct = (int)((dB / (float)VOL_MAX_ATTEN_DB + 1.0f) * 100.0f + 0.5f);
+    if (pct < 0) {
+        pct = 0;
+    }
+    else if (pct > 100) {
+        pct = 100;
+    }
+    hw_audio_set_volume((uint8_t)pct);
+}
+
 bool hw_audio_is_playing(void)
 {
     return s_player_active && (s_i2s_chan != NULL) && !s_parked && s_route == AUDIO_ROUTE_SPEAKER;

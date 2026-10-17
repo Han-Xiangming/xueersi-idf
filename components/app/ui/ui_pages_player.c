@@ -653,13 +653,8 @@ void ui_player_adjust(int step)
         if (player_state() == PLAYER_PLAYING ||
             player_state() == PLAYER_PAUSED) {
             /* While a track plays, up/down adjusts the output volume
-             * (1% steps within 0..10, else 5% — same as the backlight). */
-            ui_volume_step(step);
-            ui_settings_mark_dirty(SETTINGS_DIRTY_VOLUME);
-            char buf[24];
-            snprintf(buf, sizeof(buf), "音量 %u%%",
-                     (unsigned)hw_audio_get_volume());
-            set_action(buf);
+             * (step + persist + toast all handled by ui_volume_change). */
+            ui_volume_change(step);
         }
         else if (s_mp3_count > 0) {
             s_mp3_sel = (s_mp3_sel - step + s_mp3_count) % s_mp3_count;
@@ -778,12 +773,7 @@ bool ui_player_panel_key(uint32_t key)
     else if (key == LV_KEY_UP || key == LV_KEY_DOWN) {
         /* Volume up/down (dedicated to ↑↓ on the panel, whatever the playback
          * state — the global output volume, mirroring the player page). */
-        ui_volume_step(key == LV_KEY_UP ? 1 : -1);
-        ui_settings_mark_dirty(SETTINGS_DIRTY_VOLUME);
-        char buf[24];
-        snprintf(buf, sizeof(buf), "音量 %u%%",
-                 (unsigned)hw_audio_get_volume());
-        set_action(buf);
+        ui_volume_change(key == LV_KEY_UP ? 1 : -1);
         ui_mark_dirty();
     }
     else if (key == LV_KEY_ESC) {

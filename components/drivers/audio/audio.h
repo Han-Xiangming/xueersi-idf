@@ -51,6 +51,13 @@ audio_route_t hw_audio_get_route(void);
 void hw_audio_set_volume(uint8_t volume_pct);
 uint8_t hw_audio_get_volume(void);
 
+/* Step the ACTIVE route's volume by a fixed amount in dB (+ louder / - quieter),
+ * resolved through the SAME perceptual taper as set_volume (linear dB over the
+ * 0..100 % range). Because the taper is dB-linear, a fixed dB step is a constant
+ * audible change anywhere on the knob — the unified step+curve model. Clamped
+ * to the 0..100 % ends; the percent view is rounded to the nearest integer. */
+void hw_audio_volume_step_db(float step_db);
+
 /* Route-specific volumes (0..100 %), for NVS persistence / restore. */
 void hw_audio_set_speaker_volume(uint8_t volume_pct);
 uint8_t hw_audio_get_speaker_volume(void);

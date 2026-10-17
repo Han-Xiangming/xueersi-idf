@@ -252,14 +252,31 @@ void set_action(const char *msg)
 /* ui_theme_text_set() (set a label only when the text really changed) lives
  * in ui_theme.c. */
 
-/* Step the master volume by `dir` (+1/-1): 1% steps while at/below 10%,
- * 5% steps above 10% — same scheme as the backlight control. */
+/* Step the master volume by `dir` (+1/-1) in a FIXED amount of dB (the driver
+ * resolves it through its dB-linear perceptual taper, so every press is an equal
+ * audible change). 2 dB ≈ a clearly audible step and, on the current 0..100 % /
+ * 0..-40 dB curve, equals a 5 % percent step. Near silence the knob gets a finer
+ * 1 dB step so quiet levels can be dialled in precisely. */
+#define UI_VOL_STEP_DB      2.0f
+#define UI_VOL_STEP_FINE_DB 1.0f
+#define UI_VOL_FINE_MAX     20   /* <= this %, use the fine step */
 void ui_volume_step(int dir)
 {
-    int v = (int)hw_audio_get_volume();
-    int step = (v <= 10) ? 1 : 5;
-    v += dir * step;
-    hw_audio_set_volume((uint8_t)MAX(0, MIN(v, 100)));
+    const int v = (int)hw_audio_get_volume();
+    const float step = (v <= UI_VOL_FINE_MAX) ? UI_VOL_STEP_FINE_DB : UI_VOL_STEP_DB;
+    hw_audio_volume_step_db(dir > 0 ? step : -step);
+}
+
+/* One call for every volume entry point: step + debounced persist + toast.
+ * Centralising this keeps the step size, the NVS dirty-mark and the on-screen
+ * feedback identical on the player page, the settings row and the ebook panel. */
+void ui_volume_change(int dir)
+{
+    ui_volume_step(dir);
+    ui_settings_mark_dirty(SETTINGS_DIRTY_VOLUME);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "音量 %u%%", (unsigned)hw_audio_get_volume());
+    set_action(buf);
 }
 
 /* Label / page / bar constructors live in ui_theme.c. */

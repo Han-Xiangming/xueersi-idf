@@ -145,6 +145,10 @@ bool ui_marquee_step(ui_marquee_t *mq, char *out, size_t out_size,
                      int max_w, const char *name);
 /* Master volume step (shared by the player page and the settings row). */
 void ui_volume_step(int dir);
+/* Unified volume change used by EVERY entry point (player ↑↓, settings ←→,
+ * ebook panel ↑↓): step + debounced persist + toast. Keeps the step size, the
+ * NVS dirty-mark and the "音量 XX%" feedback in one place. */
+void ui_volume_change(int dir);
 /* Persist a changed setting (debounced). */
 void ui_settings_mark_dirty(uint32_t which);
 
