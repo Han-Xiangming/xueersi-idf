@@ -40,6 +40,7 @@ typedef enum {
     SETTING_LOG_SAVE,        /* 日志保存：SD 落盘开关 */
     SETTING_LOG_LEVEL,       /* 日志级别：NONE..VERBOSE */
     SETTING_LOG_CLEAR,       /* 清空日志：删除已落盘文件 */
+    SETTING_AUTOPAUSE_ROUTE, /* 路由变更暂停：播放中切扬声器/蓝牙自动暂停 */
     SETTING_COUNT,
 } setting_item_t;
 
@@ -49,6 +50,7 @@ typedef enum {
 #define UI_SETTINGS_SAVE_DELAY_MS   800
 #define SETTINGS_DIRTY_VOLUME   (1u << 0)
 #define SETTINGS_DIRTY_GAIN     (1u << 1)
+#define SETTINGS_DIRTY_AUTOPAUSE (1u << 2)
 #define SETTINGS_DIRTY_BACKL    (1u << 3)
 #define SETTINGS_DIRTY_STBY     (1u << 4)
 #define SETTINGS_DIRTY_LOG      (1u << 5)

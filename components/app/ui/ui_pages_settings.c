@@ -61,6 +61,7 @@ static const char *ui_set_clear_text(void);
 static const char *ui_set_logsave_text(void);
 static const char *ui_set_loglvl_text(void);
 static const char *ui_set_logclear_text(void);
+static const char *ui_set_autopause_text(void);
 static void ui_set_vol_lr(int dir);
 static void ui_set_gain_lr(int dir);
 static void ui_set_bl_lr(int dir);
@@ -71,6 +72,7 @@ static void ui_set_reset_enter(void);
 static void ui_set_logsave_lr(int dir);
 static void ui_set_loglvl_lr(int dir);
 static void ui_set_logclear_enter(void);
+static void ui_set_autopause_lr(int dir);
 
 /* Settings are grouped (P2): the flat list is split into Audio / Display /
  * System. The launcher-stle two-level view (group list -> group items) reuses
@@ -93,13 +95,13 @@ static const char *s_group_names[SET_GRP_COUNT] = {
 /* Group -> member items (indices into s_settings_table). Column width 4;
  * s_group_cnt says how many of each row are live. */
 static const setting_item_t s_group_items[SET_GRP_COUNT][4] = {
-    [SET_GRP_AUDIO]   = {SETTING_VOLUME, SETTING_MASTER_GAIN},
+    [SET_GRP_AUDIO]   = {SETTING_VOLUME, SETTING_MASTER_GAIN, SETTING_AUTOPAUSE_ROUTE},
     [SET_GRP_DISPLAY] = {SETTING_BACKLIGHT, SETTING_STANDBY},
     [SET_GRP_SYSTEM]  = {SETTING_RESCAN, SETTING_RESET, SETTING_CLEAR_PROG},
     [SET_GRP_LOG]     = {SETTING_LOG_SAVE, SETTING_LOG_LEVEL, SETTING_LOG_CLEAR},
 };
 static const int s_group_cnt[SET_GRP_COUNT] = {
-    [SET_GRP_AUDIO] = 2, [SET_GRP_DISPLAY] = 2, [SET_GRP_SYSTEM] = 3,
+    [SET_GRP_AUDIO] = 3, [SET_GRP_DISPLAY] = 2, [SET_GRP_SYSTEM] = 3,
     [SET_GRP_LOG] = 3,
 };
 
@@ -124,6 +126,7 @@ static const setting_entry_t s_settings_table[SETTING_COUNT] = {
     [SETTING_LOG_SAVE]    = {UI_STR_SET_LOG_SAVE,  ui_set_logsave_text, ui_set_logsave_lr, NULL,              SET_GRP_LOG},
     [SETTING_LOG_LEVEL]   = {UI_STR_SET_LOG_LEVEL, ui_set_loglvl_text,  ui_set_loglvl_lr,  NULL,              SET_GRP_LOG},
     [SETTING_LOG_CLEAR]   = {UI_STR_SET_LOG_CLEAR, ui_set_logclear_text, NULL,       ui_set_logclear_enter, SET_GRP_LOG},
+    [SETTING_AUTOPAUSE_ROUTE] = {UI_STR_SET_AUTOPAUSE, ui_set_autopause_text, ui_set_autopause_lr, NULL, SET_GRP_AUDIO},
 };
 
 /* Backlight brightness (0..100 %), driven via PWM on PIN_NUM_LCD_BL.
@@ -161,6 +164,11 @@ static const char *s_log_lvl_names[LOG_LVL_COUNT] = {
 static bool s_log_on = true;          /* SD mirror on by default */
 static int  s_log_lvl_idx = 3;        /* ESP_LOG_INFO */
 
+/* Auto-pause on output-route change (speaker <-> bluetooth). Off by default:
+ * a route switch keeps playing on the new output. Persisted to NVS; the
+ * runtime flag lives in the player (player_set_autopause_on_route_change). */
+static bool s_autopause_route = false;
+
 /* Selected row, and the paint guard that remembers what is currently drawn
  * (-1 forces a repaint right after the page is rebuilt). */
 static int s_setting_sel = 0;
@@ -183,6 +191,7 @@ static int s_set_group = 0;   /* which group the ITEMS view is showing */
 #define UI_NVS_STBY    "standby_s"
 #define UI_NVS_LOG_EN  "log_en"
 #define UI_NVS_LOG_LVL "log_lvl"
+#define UI_NVS_AUTOPAUSE "autopause_route"
 
 void ui_settings_load(void)
 {
@@ -233,6 +242,11 @@ void ui_settings_load(void)
         s_log_lvl_idx = (int)log_lvl;
     }
     esp_log_level_set("*", s_log_lvls[s_log_lvl_idx]);
+    int32_t autopause = -1;
+    if (nvs_get_i32(h, UI_NVS_AUTOPAUSE, &autopause) == ESP_OK) {
+        s_autopause_route = (autopause != 0);
+    }
+    player_set_autopause_on_route_change(s_autopause_route);
     nvs_close(h);
 }
 
@@ -291,6 +305,16 @@ static void ui_settings_save_log(void)
     }
 }
 
+static void ui_settings_save_autopause(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, UI_NVS_AUTOPAUSE, s_autopause_route ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
 /* Debounced persistence: a setting change only marks a dirty bit and arms a
  * timer; ui_settings_flush() (called every refresh) commits once the user
  * stops tweaking, folding long-press repeats into a single NVS write. */
@@ -335,6 +359,9 @@ void ui_settings_flush(void)
     }
     if (s_save_pending & SETTINGS_DIRTY_LOG) {
         ui_settings_save_log();
+    }
+    if (s_save_pending & SETTINGS_DIRTY_AUTOPAUSE) {
+        ui_settings_save_autopause();
     }
     s_save_pending = 0;
 }
@@ -668,6 +695,26 @@ static void ui_set_logclear_enter(void)
     log_sink_clear();
     set_action(UI_STR_LOG_CLEARED);
     ui_refresh();
+}
+
+/* ----- 路由变更暂停（音频组） ----- */
+
+static const char *ui_set_autopause_text(void)
+{
+    static char buf[24];
+    snprintf(buf, sizeof(buf), "%s",
+             s_autopause_route ? UI_STR_LOG_ON : UI_STR_LOG_OFF);
+    return buf;
+}
+
+static void ui_set_autopause_lr(int dir)
+{
+    /* Left = off, right = on. Pushed to the player at once so a route change
+     * in the same session already honours it; persisted on the next flush. */
+    s_autopause_route = (dir > 0);
+    player_set_autopause_on_route_change(s_autopause_route);
+    ui_settings_mark_dirty(SETTINGS_DIRTY_AUTOPAUSE);
+    set_action(s_autopause_route ? "路由变更暂停开" : "路由变更暂停关");
 }
 
 void ui_build_settings(lv_obj_t *page)

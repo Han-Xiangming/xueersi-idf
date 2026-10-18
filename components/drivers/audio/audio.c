@@ -175,6 +175,10 @@ static volatile bool s_player_active;    /* MP3 player owns the I2S bus */
  * destination and never probes the Bluetooth link itself. */
 static audio_route_t s_route = AUDIO_ROUTE_SPEAKER;
 
+/* Route-change listener (see hw_audio_set_route_change_cb). Invoked from
+ * audio_apply_route() after the new route is fully in effect. */
+static audio_route_change_cb_t s_route_change_cb;
+
 /* Consecutive failed PCM ring writes (bounds the WARN/ERROR rate). */
 static uint32_t s_wr_errs;
 /* Consecutive timed-out i2s_channel_write()s (bounds the ERROR rate). Surfaces
@@ -378,6 +382,13 @@ static void audio_apply_route(audio_route_t route)
     s_last_write_us = 0;
     ESP_LOGI(TAG, "audio route -> %s (vol %u%%)",
              audio_route_is_bt() ? "bluetooth" : "speaker", (unsigned)s_volume);
+    /* Notify AFTER the route is fully applied. This runs on the switching
+     * task (UI task, or the Bluetooth stack's link callback), so the listener
+     * must stay cheap and must not call hw_audio_set_route() back (re-entrancy
+     * is NOT guarded). */
+    if (s_route_change_cb) {
+        s_route_change_cb(s_route);
+    }
 }
 
 void hw_audio_set_route(audio_route_t route)
@@ -388,6 +399,11 @@ void hw_audio_set_route(audio_route_t route)
 audio_route_t hw_audio_get_route(void)
 {
     return s_route;
+}
+
+void hw_audio_set_route_change_cb(audio_route_change_cb_t cb)
+{
+    s_route_change_cb = cb;
 }
 
 static void audio_update_vol_gain(void)

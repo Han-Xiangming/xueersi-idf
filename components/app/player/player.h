@@ -228,6 +228,13 @@ void player_toggle(void);
 /* Stop playback and release the I2S bus. */
 void player_stop(void);
 
+/* Auto-pause on output-route change (speaker <-> bluetooth): when enabled and
+ * a track is PLAYING, a route switch (Bluetooth link coming up/dropping, or
+ * the user flipping the route on the BLUETOOTH page) pauses playback instead
+ * of continuing on the new output — the user resumes explicitly. Off by
+ * default; persisted by the UI settings page. */
+void player_set_autopause_on_route_change(bool on);
+
 /* --- Repeat mode -------------------------------------------------------
  * How the player behaves when a track reaches its natural end. Default is
  * list loop (advance to the next entry, wrapping at the end); single-track

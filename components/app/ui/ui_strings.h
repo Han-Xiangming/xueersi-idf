@@ -21,6 +21,7 @@
 #define UI_STR_SET_LOG_SAVE   "日志保存"
 #define UI_STR_SET_LOG_LEVEL  "日志级别"
 #define UI_STR_SET_LOG_CLEAR  "清空日志"
+#define UI_STR_SET_AUTOPAUSE  "路由变更暂停"
 
 /* --- Settings value / action feedback --- */
 #define UI_STR_NEVER      "永不"

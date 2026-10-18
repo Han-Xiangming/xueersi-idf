@@ -133,6 +133,10 @@ static bool s_ever_played;  /* a track has been opened at least once, so a
 static volatile bool s_stop_req;
 static volatile bool s_pause_req;
 static volatile bool s_new_req;
+/* Auto-pause on output-route change (speaker <-> bluetooth), set from the
+ * settings page (player_set_autopause_on_route_change). Read by the
+ * route-change callback below. */
+static volatile bool s_autopause_route_change;
 static char s_new_path[PLAYER_PATH_LEN];
 static char s_new_name[MP3_NAME_LEN];
 static uint32_t s_dbg_frames;          /* decode-frame counter for debug logs */
@@ -1655,10 +1659,35 @@ static void player_watch_task(void *arg)
     }
 }
 
+/* Route-change listener (speaker <-> bluetooth). With the auto-pause setting
+ * on, a route switch while a track is PLAYING pauses playback: the user keeps
+ * the position and resumes explicitly on the new output. Runs on whichever
+ * task flipped the route (UI task, or the Bluetooth stack's link callback) —
+ * player_toggle() only touches volatile flags + one task notify, so it is
+ * safe from any context. */
+static void player_on_route_change(audio_route_t route)
+{
+    if (!s_autopause_route_change) {
+        return;
+    }
+    if (s_state != PLAYER_PLAYING) {
+        return;   /* idle / already paused: nothing to pause */
+    }
+    ESP_LOGI(TAG, "route change while playing (->%s): auto-pause",
+             route == AUDIO_ROUTE_BT ? "bt" : "speaker");
+    player_toggle();
+}
+
+void player_set_autopause_on_route_change(bool on)
+{
+    s_autopause_route_change = on;
+}
+
 void player_init(void)
 {
     s_state = PLAYER_IDLE;
     s_name[0] = '\0';
+    hw_audio_set_route_change_cb(player_on_route_change);
     /* Debug tracing is compiled in (LOG_LOCAL_LEVEL) but off by default;
      * the settings page LOG option enables it at runtime. */
     if (xTaskCreatePinnedToCore(player_task, "mp3_player", 16 * 1024, NULL,

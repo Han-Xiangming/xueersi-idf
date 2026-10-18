@@ -44,6 +44,17 @@ void hw_audio_set_route(audio_route_t route);
 /* Current active output route. */
 audio_route_t hw_audio_get_route(void);
 
+/* Listener for output-route changes (speaker <-> bluetooth). Invoked from
+ * audio_apply_route() only when the route ACTUALLY changes — a redundant
+ * hw_audio_set_route() to the current route is a no-op and does not notify —
+ * on whichever task performed the switch (UI task, or the Bluetooth stack's
+ * link callback). Used by the player for "pause on route change". The
+ * listener must NOT call hw_audio_set_route() (no re-entrancy); calling back
+ * into the rest of the audio API (e.g. hw_audio_set_player_active) is fine.
+ * Pass NULL to disable. */
+typedef void (*audio_route_change_cb_t)(audio_route_t new_route);
+void hw_audio_set_route_change_cb(audio_route_change_cb_t cb);
+
 /* Volume (0..100 %) of the ACTIVE route: while a Bluetooth sink is linked
  * and BT output is on, the BT volume is adjusted; otherwise the speaker
  * volume. The two routes keep independent settings (see the route-specific
