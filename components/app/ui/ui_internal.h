@@ -149,6 +149,12 @@ void ui_volume_step(int dir);
  * ebook panel ↑↓): step + debounced persist + toast. Keeps the step size, the
  * NVS dirty-mark and the "音量 XX%" feedback in one place. */
 void ui_volume_change(int dir);
+/* Unified backlight change used by the settings row and the ebook reader ↑↓:
+ * one gamma-level step + settings-copy sync + debounced persist + toast. */
+void ui_backlight_change(int dir);
+/* Sync the settings page's backlight copy after a driver-side change (marks
+ * the NVS value dirty). Used by ui_backlight_change(). */
+void ui_settings_set_backlight_percent(uint8_t pct);
 /* Persist a changed setting (debounced). */
 void ui_settings_mark_dirty(uint32_t which);
 

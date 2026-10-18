@@ -297,6 +297,16 @@ static void ui_settings_save_log(void)
 static uint32_t s_save_pending;
 static uint32_t s_save_at_ms;
 
+/* Keep the settings page's backlight copy in sync when the brightness is
+ * stepped from elsewhere (the ebook reader's ↑↓): without this the row would
+ * show a stale value and step from the wrong base. Marks the value dirty so
+ * the debounced flush persists it. */
+void ui_settings_set_backlight_percent(uint8_t pct)
+{
+    s_backlight = pct;
+    ui_settings_mark_dirty(SETTINGS_DIRTY_BACKL);
+}
+
 void ui_settings_mark_dirty(uint32_t which)
 {
     s_save_pending |= which;
@@ -560,12 +570,9 @@ static void ui_set_gain_lr(int dir)
 
 static void ui_set_bl_lr(int dir)
 {
-    /* Step by one gamma level per press (HW_LCD_BACKLIGHT_STEPS levels total).
-     * Each press is guaranteed to change the brightness, and equal presses
-     * feel uniform to the eye. Holding the key auto-repeats this callback,
-     * giving natural acceleration. The returned percentage is what we persist. */
-    s_backlight = hw_lcd_step_backlight((int8_t)dir);
-    ui_settings_mark_dirty(SETTINGS_DIRTY_BACKL);
+    /* Step + persist + toast all handled by the shared backlight entry point
+     * (same one the ebook reader's ↑↓ uses, so both stay in lockstep). */
+    ui_backlight_change(dir);
 }
 
 static void ui_set_sleep_lr(int dir)

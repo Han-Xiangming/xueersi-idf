@@ -279,6 +279,20 @@ void ui_volume_change(int dir)
     set_action(buf);
 }
 
+/* One call for every backlight entry point: step (one gamma level per press,
+ * so equal presses feel uniform to the eye) + settings-copy sync + debounced
+ * persist + toast. Centralising this keeps the settings row and the ebook
+ * reader's ↑↓ handler in lockstep — otherwise the settings page would show a
+ * stale value and step from the wrong base after a reader-side change. */
+void ui_backlight_change(int dir)
+{
+    const uint8_t pct = hw_lcd_step_backlight((int8_t)(dir > 0 ? 1 : -1));
+    ui_settings_set_backlight_percent(pct);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "背光 %u%%", (unsigned)pct);
+    set_action(buf);
+}
+
 /* Label / page / bar constructors live in ui_theme.c. */
 
 void ui_set_hint(const char *normal)
@@ -701,6 +715,7 @@ static void ui_adjust(int step)
     case UI_PAGE_PLAYER:     ui_player_adjust(step);   break;
     case UI_PAGE_BT:         ui_bt_adjust(step);       break;
     case UI_PAGE_EBOOK_LIST: ui_ebook_adjust(step);    break;
+    case UI_PAGE_EBOOK_READ: ui_ebook_adjust(step);    break;
     default: break;
     }
     /* No synchronous ui_refresh(): the 60Hz main loop repaints from

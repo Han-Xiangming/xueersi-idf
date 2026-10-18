@@ -443,6 +443,18 @@ void ui_ebook_read_action(void)
 
 void ui_ebook_adjust(int step)
 {
+        /* Reader page: ↑/↓ have no navigation meaning there, so they step the
+         * backlight instead (step + persist + toast via the shared entry point,
+         * identical to the settings page's 背光 row). The list views below keep
+         * the original selection behaviour. */
+        if (ui_nav_current() == UI_PAGE_EBOOK_READ) {
+                /* The jump overlay owns ←/→/A/B only, but swallow ↑/↓ there
+                 * anyway so a brightness toast never overwrites its hint line. */
+                if (!s_eb_jump) {
+                        ui_backlight_change(step);
+                }
+                return;
+        }
         if (s_ebv == EBV_SOURCE) {
             if (s_eb_src_count > 0) {
                 s_eb_src_sel = (s_eb_src_sel - step + s_eb_src_count) % s_eb_src_count;
