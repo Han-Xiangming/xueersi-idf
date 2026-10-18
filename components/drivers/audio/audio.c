@@ -66,6 +66,17 @@ static const char *TAG = "hw_audio";
  * playback by ~300 ms with no completion signal). */
 #define I2S_DMA_DRAIN_MS    350
 
+/* PCM ring between the DSP (decode task) and the DMA writer task: 16 KB
+ * (~93 ms at 44.1 kHz stereo). Sizing rationale: measured 4 KB SD reads cost
+ * ~25-30 ms (3-5x the theoretical 10 MHz time) and stretch past 50 ms while a
+ * background playlist scan hammers the same SPI2 bus, so this ring is the only
+ * buffer in front of the ~279 ms DMA ring — total producer-stall budget is
+ * ~372 ms, enough to absorb one SD read retry backoff (250 ms) on top of a
+ * slow read. Enlarging it costs pipeline latency one-for-one (track-end
+ * drain, pause / stop tail); 32 KB (~186 ms) is a one-line bump if 16 KB ever
+ * proves short. */
+#define PCM_RING_BYTES       (16 * 1024)
+
 /* A dedicated DMA writer task owns the actual I2S write, so there is no manual
  * write timeout / IO mutex here: hw_audio_write_pcm() blocks on the ring buffer
  * (xRingbufferSend) and the writer task feeds the i2s_std DMA independently. */
@@ -859,7 +870,7 @@ static esp_err_t audio_create_channel(void)
         s_i2s_chan = NULL;
         return rc;
     }
-    s_pcm_rb = xRingbufferCreate(8 * 1024, RINGBUF_TYPE_BYTEBUF);
+    s_pcm_rb = xRingbufferCreate(PCM_RING_BYTES, RINGBUF_TYPE_BYTEBUF);
     if (s_pcm_rb == NULL) {
         ESP_LOGE(TAG, "[AUDIO] PCM ringbuf alloc failed");
         i2s_del_channel(s_i2s_chan);
@@ -1497,21 +1508,23 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
         return AUDIO_WRITE_STALLED;
     }
     /* Push the DSP-produced PCM into the ring in sub-ring chunks. A single
-     * decoded (and resampled) frame can be LARGER than the whole PCM ring: e.g.
-     * a 48 kHz track resampled to the fixed 44.1 kHz I2S rate is ~8.5 KB, but the
-     * ring is only 8 KB. A byte-buffer ringbuf fails the send outright when the
-     * item exceeds its capacity, so a whole-frame xRingbufferSend() would NEVER
-     * succeed and the decoder would spin forever returning AUDIO_WRITE_STALLED
-     * (log prints the first frame, then silence — "press play and it hangs",
-     * exactly the reported cold-boot-first-play freeze). Chunking each frame into
-     * items smaller than the ring lets the DMA writer task drain between chunks,
-     * so any frame size streams. */
+     * decoded (and resampled) frame can be LARGER than the whole PCM ring:
+     * the worst case (8 kHz mono -> upmix + resample to 44.1 kHz) reaches
+     * ~30 KB (see RESAMP_MAX_FRAMES), and even a 48 kHz stereo frame is
+     * ~8.5 KB against the 16 KB ring. A byte-buffer ringbuf fails the send
+     * outright when the item exceeds its capacity, so a whole-frame
+     * xRingbufferSend() would NEVER succeed and the decoder would spin
+     * forever returning AUDIO_WRITE_STALLED (log prints the first frame,
+     * then silence — "press play and it hangs", exactly the reported
+     * cold-boot-first-play freeze). Chunking each frame into items smaller
+     * than the ring lets the DMA writer task drain between chunks, so any
+     * frame size streams. */
     size_t off = 0;
     audio_write_result_t res = AUDIO_WRITE_OK;
     while (off < bytes) {
         size_t chunk = bytes - off;
         if (chunk > 1024) {
-            chunk = 1024;   /* well under the 8 KB ring; small DMA writes */
+            chunk = 1024;   /* well under the 16 KB ring; small DMA writes */
         }
         if (xRingbufferSend(s_pcm_rb, (uint8_t *)dsp_buf + off, chunk,
                             pdMS_TO_TICKS(100)) != pdTRUE) {

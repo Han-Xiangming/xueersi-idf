@@ -70,7 +70,7 @@ FATFS 目录遍历在 SDSPI 上耗时数十 ms，故列表由**独立扫描任�
 main.c:       player_init()（创建任务）；AVRCP PLAY/PAUSE/STOP → player_toggle/stop
 ui.c:         播放器页构建/轮询时读 player_scan_count/name/version；按键 → player_play/toggle/stop
 audio.c:      hw_audio_set_sample_rate() 随 MP3 采样率热重配（不停通道，走 SpeexDSP 软重采样）；
-              PCM 经 DSP 后入 8KB ringbuf，由独立 i2s_wr 任务（优先级 6，绑 Core 1）写 I2S DMA；
+              PCM 经 DSP 后入 16KB ringbuf，由独立 i2s_wr 任务（优先级 6，绑 Core 1）写 I2S DMA；
               路由 s_route 决定走喇叭还是 A2DP（见 audio.md）
 bluetooth_audio.c:   路由为 AUDIO_ROUTE_BT 时，PCM 经音量后走 A2DP 而非 I2S（见 audio.md）
 ```

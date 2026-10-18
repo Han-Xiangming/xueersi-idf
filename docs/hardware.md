@@ -72,7 +72,7 @@ esp_log_level_set("BT_L2CAP", WARN)     降噪（BT 拥塞回调日志泛滥，�
   → nvs_flash_init
   → hw_buttons_init()        GPIO + 消抖
   → hw_lcd_init()            SPI/panel/ST7789 初始化
-  → hw_audio_init()          I2S + MAX98357（8KB ring + i2s_wr 写任务）
+  → hw_audio_init()          I2S + MAX98357（16KB ring + i2s_wr 写任务）
   → bluetooth_audio_init()          环形缓冲（不碰蓝牙控制器）
   → 注册 AVRCP 回调（cmd / volume）
   → hw_sd_try_mount()        SD 挂载（可失败）
