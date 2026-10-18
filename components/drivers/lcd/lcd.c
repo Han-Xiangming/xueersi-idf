@@ -363,6 +363,14 @@ void hw_lcd_init(void)
 
     ESP_LOGI(TAG, "Install panel IO");
     esp_lcd_panel_io_handle_t io_handle = NULL;
+    /* 队列深度 3（原 10）：SPI2 与 SDSPI 共用（见 board_config.h），SDSPI 每笔
+     * 事务都是前台 polling 获取总线，必须等本队列排空（spi_bus_lock 的 BG 位
+     * 清零）才能插入。连续刷屏时 LVGL 任务持续补货、深队列从不排空，一次
+     * 4 KB SD 读（~11 笔事务）被整体推迟到整个 flush 流结束；解码停摆超过
+     * ring+DMA(~325 ms) 裕量即欠载静音，听感为播放"变慢"。深度 3 把 LCD 的
+     * 独占窗口压到 ~0.3 ms（3 行 x ~85 us @60 MHz），SD 可逐笔插入。副作用
+     * 是好的：LVGL 更频繁阻塞在队列满处，反而把 Core 1 让给 i2s_wr(prio 6)。
+     * bounce ring 仍为 10 >= 深度，lvgl_flush_cb 的索引逻辑不变。 */
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = PIN_NUM_LCD_DC,
         .cs_gpio_num = PIN_NUM_LCD_CS,
@@ -370,7 +378,7 @@ void hw_lcd_init(void)
         .lcd_cmd_bits = LCD_CMD_BITS,
         .lcd_param_bits = LCD_PARAM_BITS,
         .spi_mode = 0,
-        .trans_queue_depth = 10,
+        .trans_queue_depth = 3,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST,
                                              &io_config,
