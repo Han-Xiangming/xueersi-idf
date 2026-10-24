@@ -81,8 +81,9 @@ static bt_avrc_sync_vol_cb_t s_sync_vol_cb;
  * disconnect-complete event so a stuck link cannot leave the stack half
  * disabled forever. */
 #define BT_TD_RECHECK_MS       (50)         /* polling interval */
-#define BT_TD_MAX_RECHECK      (20)         /* 1 s of polling for the link */
-#define BT_TD_SAFETY_MS        (4000)       /* force teardown fallback */
+#define BT_TD_MAX_RECHECK      (60)         /* 3 s of polling for the link */
+#define BT_TD_RETRY_MS         (500)        /* re-arm delay while the link is stuck */
+#define BT_TD_SAFETY_MS        (4000)       /* deferred-teardown safety net */
 
 /* A2DP/SBC always streams at 44.1 kHz; other input rates are resampled. */
 #define BT_STREAM_RATE         44100
@@ -782,9 +783,10 @@ static void bluetooth_audio_teardown(void *param1, uint32_t param2)
     /* Wait (bounded) for the link to drop AND any in-flight connect/pair
      * attempt or inquiry to resolve (see bt_link_busy), so deinit never runs
      * while Bluedroid still has an armed media watchdog alarm or is
-     * mid-connect. The bounded retry budget means a stuck link cannot hold
-     * the teardown forever. Re-check s_disabling afterwards so a concurrent
-     * bluetooth_audio_enable() can cancel the teardown even mid-wait. */
+     * mid-connect. If the link is still stuck when the budget runs out the
+     * teardown re-arms itself instead of forcing its way through (see below).
+     * Re-check s_disabling afterwards so a concurrent bluetooth_audio_enable()
+     * can cancel the teardown even mid-wait. */
     int waited = 0;
     while (bt_link_busy() && waited < BT_TD_MAX_RECHECK && !s_reenable_pending) {
         vTaskDelay(pdMS_TO_TICKS(BT_TD_RECHECK_MS));
@@ -803,21 +805,51 @@ static void bluetooth_audio_teardown(void *param1, uint32_t param2)
         return;
     }
     if (bt_link_busy()) {
-        ESP_LOGW(TAG, "link still busy after %d ms of teardown polling, "
-                      "tearing down anyway", waited * BT_TD_RECHECK_MS);
+        /* Link never dropped (e.g. the disconnect request was swallowed in
+         * the A2DP OPENING state, so no disconnect event will ever come).
+         * Deinit'ing the profiles while the SDP/L2CAP session is still alive
+         * frees the A2D discovery DB that a2d_cb.find.p_db points at; the
+         * late L2CAP disc cfm then runs a2d_sdp_cback() on freed memory
+         * (LoadProhibited in SDP_FindServiceInDb). NEVER force the teardown
+         * here: a half-disabled stack is recoverable, a crash is not. Keep
+         * the stack up and re-arm — the teardown retries until the link
+         * really drops (or the user flips BT back ON, which cancels it). */
+        ESP_LOGE(TAG, "link still busy after %d ms of teardown polling, "
+                      "deferring teardown", waited * BT_TD_RECHECK_MS);
+        s_teardown_running = false;
+        xTimerPendFunctionCall(bluetooth_audio_teardown, NULL, 0,
+                               pdMS_TO_TICKS(BT_TD_RETRY_MS));
+        return;
     }
     /* From here on the teardown is no longer cancellable: publish the stack
      * as down FIRST so a concurrent bluetooth_audio_enable() can never take the
      * "already up" shortcut into a half-destroyed stack — it defers via
-     * s_reenable_pending and is re-initialised at the end of this function.
-     * Bluedroid requires the AVRCP Target to be torn down *before* the A2DP
-     * source; deinit'ing A2DP first triggers a "AVRC TG should deinit in
-     * advance of A2DP" warning and can leave the AVRC profile half-freed. */
+     * s_reenable_pending and is re-initialised at the end of this function. */
+    /* Disable Bluedroid FIRST and require success. esp_bluedroid_disable()
+     * only returns ESP_OK once every ACL link —and with it any in-flight
+     * SDP/L2CAP session— is down (it polls links for up to ~5 s), and BTA
+     * tears the profiles down itself in the correct order as part of it.
+     * The old order (profile deinit first, then disable, return ignored)
+     * freed the A2D discovery DB while the SDP session was still alive and
+     * bluedroid stayed half-up; the late L2CAP disc cfm then ran
+     * a2d_sdp_cback() on the freed DB (SDP_FindServiceInDb crash). If the
+     * disable fails, nothing has been torn down yet — just defer and retry. */
     s_initialized = false;
+    esp_err_t err = esp_bluedroid_disable();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_bluedroid_disable failed: %s, deferring teardown",
+                 esp_err_to_name(err));
+        s_teardown_running = false;
+        xTimerPendFunctionCall(bluetooth_audio_teardown, NULL, 0,
+                               pdMS_TO_TICKS(BT_TD_RETRY_MS));
+        return;
+    }
+    /* Links are down: the profile deinits are safe now (BTA already tore the
+     * profiles down inside esp_bluedroid_disable, so these mostly no-op —
+     * the AVRCP-before-A2DP ordering is handled by the stack itself). */
     esp_avrc_tg_deinit();
     esp_avrc_ct_deinit();
     esp_a2d_source_deinit();
-    esp_bluedroid_disable();
     esp_bluedroid_deinit();
     esp_bt_controller_disable();
     esp_bt_controller_deinit();
@@ -869,12 +901,14 @@ void bluetooth_audio_disable(void)
     if (s_connected || s_discovering || s_pair_state != BT_PAIR_IDLE) {
         /* A live (or in-flight) link: stop the media stream and kick a
          * disconnect, then defer the teardown to the Timer task —it re-checks
-         * the link with a bounded retry budget (see bluetooth_audio_teardown) instead
-         * of relying on the disconnect-complete event alone. The second
-         * pending call is the safety net: if that event is lost, the teardown
-         * still runs after BT_TD_SAFETY_MS, polls for the link to drop, and
-         * proceeds —the stack cannot stay half-disabled forever. Doing it
-         * inline here is what crashes. */
+         * the link and, if it is still busy when the budget runs out, keeps
+         * re-arming itself (see bluetooth_audio_teardown) instead of relying
+         * on the disconnect-complete event alone. The second pending call is
+         * the safety net: if that event is lost, the teardown still runs
+         * after BT_TD_SAFETY_MS and polls for the link to drop. Deinit'ing
+         * while a session is still alive is what crashes, so the teardown
+         * NEVER proceeds on a live link. Doing any of this inline here is
+         * what crashes. */
         s_disabling = true;
         s_tx_stopped = true;
         s_conn_auto = false;             /* no auto-retry while tearing down */
