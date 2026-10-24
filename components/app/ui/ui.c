@@ -259,19 +259,49 @@ void set_action(const char *msg)
 /* ui_theme_text_set() (set a label only when the text really changed) lives
  * in ui_theme.c. */
 
-/* Step the master volume by `dir` (+1/-1) in a FIXED amount of dB (the driver
- * resolves it through its dB-linear perceptual taper, so every press is an equal
- * audible change). 2 dB ≈ a clearly audible step and, on the current 0..100 % /
- * 0..-40 dB curve, equals a 5 % percent step. Near silence the knob gets a finer
- * 1 dB step so quiet levels can be dialled in precisely. */
-#define UI_VOL_STEP_DB      2.0f
-#define UI_VOL_STEP_FINE_DB 1.0f
-#define UI_VOL_FINE_MAX     20   /* <= this %, use the fine step */
+/* Master-volume step: a FIXED 1 dB per press, resolved by the driver through
+ * its dB-linear perceptual taper (dB = (v/100 - 1) * VOL_MAX_ATTEN_DB), which
+ * is ~2.5 % on the percent knob. 1 dB is the smallest change the ear reliably
+ * notices (JND), so every press is audible yet fine enough to dial in quiet
+ * levels — the ~0.5-1 dB step popular portable players use (Android steps
+ * 0.5 dB internally; hardware volume ICs 0.5-1 dB). The old 2 dB / fine-1 dB
+ * scheme was replaced by this uniform 1 dB step plus hold acceleration.
+ *
+ * Hold-to-accelerate: the keypad auto-repeats every 90 ms after a 250 ms hold
+ * (see ui_input_init), and the step grows with the TOTAL hold time
+ * (1 -> 2 -> 3 dB), so a tap stays precise while a hold sweeps the range —
+ * the same trick the ebook reader's page flip uses. Releasing for
+ * UI_VOL_RUN_GAP_MS, or pressing the opposite direction, starts a fresh run
+ * at the fine step. All three volume entry points (player ↑↓, settings ←→,
+ * ebook panel ↑↓) funnel through ui_volume_change() and share this. */
+#define UI_VOL_STEP_DB       1.0f
+#define UI_VOL_RUN_GAP_MS    400    /* idle this long = a new press run */
+#define UI_VOL_ACCEL2_MS     600    /* held past this: 2 dB per repeat */
+#define UI_VOL_ACCEL3_MS     1400   /* held past this: 3 dB per repeat */
+
+static int      s_vol_run_dir;      /* +1 / -1 direction of the current run */
+static uint32_t s_vol_run_ms;       /* tick when the current run began */
+
 void ui_volume_step(int dir)
 {
-    const int v = (int)hw_audio_get_volume();
-    const float step = (v <= UI_VOL_FINE_MAX) ? UI_VOL_STEP_FINE_DB : UI_VOL_STEP_DB;
-    hw_audio_volume_step_db(dir > 0 ? step : -step);
+    const int sign = (dir > 0) ? 1 : -1;
+    const uint32_t now = lv_tick_get();
+
+    /* New run on direction change or after a release gap; otherwise the run
+     * keeps aging so a long hold accelerates. */
+    if (sign != s_vol_run_dir || lv_tick_elaps(s_vol_run_ms) > UI_VOL_RUN_GAP_MS) {
+        s_vol_run_dir = sign;
+        s_vol_run_ms = now;
+    }
+    const uint32_t held = lv_tick_elaps(s_vol_run_ms);
+    float step = UI_VOL_STEP_DB;
+    if (held >= UI_VOL_ACCEL3_MS) {
+        step *= 3.0f;
+    }
+    else if (held >= UI_VOL_ACCEL2_MS) {
+        step *= 2.0f;
+    }
+    hw_audio_volume_step_db(sign * step);
 }
 
 /* One call for every volume entry point: step + debounced persist + toast.

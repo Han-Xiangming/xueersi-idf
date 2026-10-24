@@ -23,7 +23,8 @@ MP3 解码（helix） ──> hw_audio_write_pcm() → 按路由分发
 | ---- | ---- |
 | 百分比 0..100 | UI 层音量（`hw_audio_get/set_volume`），NVS 持久化 |
 | 每路由独立槽位 | 喇叭与蓝牙各一个（`hw_audio_set/get_speaker_volume`、`hw_audio_set/get_bt_volume`）；`hw_audio_get/set_volume` 操作**当前生效路由**的槽位，路由切换时 `hw_audio_set_route()` 切换生效槽位 |
-| dB 锥度 | `gain_dB(v) = (v/100 - 1) × (-40dB)`，0dB@100%，每 5% ≈ 2dB，全量程恒定可闻 |
+| dB 锥度 | `gain_dB(v) = (v/100 - 1) × (-40dB)`，0dB@100%，每 5% = 2dB（dB 对百分比线性，故定 dB 步进 = 定百分比步进），全量程恒定可闻 |
+| 按键步进 | UI 侧 **1dB/按（≈2.5%）**，经 `hw_audio_volume_step_db()` 在 dB 域步进后取整回百分比；1dB 为人耳 JND，每按可闻且近静音可精细微调；按住加速见 `docs/ui.md` §4 |
 | 增益表 | 初始化时预计算 **401 项**（0.1dB 步进，`VOL_TAB_ENTRIES=401`）Q15 线性增益（`s_vol_tab`），运行时零浮点；AVRCP 0..127 满刻度也走同一 0.1dB 表，每步 ≈ 0.32dB |
 | 平滑 | 一阶 **~5ms** 时间常数（`VOL_SMOOTH_A_Q15`）线性渐变到目标，避免音量突变爆音（点击）；路由切换/换曲时增益快照直达 |
 
