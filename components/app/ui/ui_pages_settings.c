@@ -22,7 +22,6 @@
 #include "esp_system.h"
 #include "lcd.h"
 #include "lvgl.h"
-#include "log_sink.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "player.h"
@@ -58,9 +57,6 @@ static const char *ui_set_sleep_text(void);
 static const char *ui_set_rescan_text(void);
 static const char *ui_set_reset_text(void);
 static const char *ui_set_clear_text(void);
-static const char *ui_set_logsave_text(void);
-static const char *ui_set_loglvl_text(void);
-static const char *ui_set_logclear_text(void);
 static const char *ui_set_autopause_text(void);
 static void ui_set_vol_lr(int dir);
 static void ui_set_gain_lr(int dir);
@@ -80,7 +76,6 @@ static void ui_set_autopause_lr(int dir);
 typedef enum {
     SET_GRP_AUDIO = 0,
     SET_GRP_DISPLAY,
-    SET_GRP_LOG,
     SET_GRP_SYSTEM,
     SET_GRP_COUNT,
 } settings_group_t;
@@ -89,7 +84,6 @@ static const char *s_group_names[SET_GRP_COUNT] = {
     [SET_GRP_AUDIO]   = "音频",
     [SET_GRP_DISPLAY] = "显示",
     [SET_GRP_SYSTEM]  = "系统",
-    [SET_GRP_LOG]     = "日志",
 };
 
 /* Group -> member items (indices into s_settings_table). Column width 4;
@@ -98,11 +92,9 @@ static const setting_item_t s_group_items[SET_GRP_COUNT][4] = {
     [SET_GRP_AUDIO]   = {SETTING_VOLUME, SETTING_MASTER_GAIN, SETTING_AUTOPAUSE_ROUTE},
     [SET_GRP_DISPLAY] = {SETTING_BACKLIGHT, SETTING_STANDBY},
     [SET_GRP_SYSTEM]  = {SETTING_RESCAN, SETTING_RESET, SETTING_CLEAR_PROG},
-    [SET_GRP_LOG]     = {SETTING_LOG_SAVE, SETTING_LOG_LEVEL, SETTING_LOG_CLEAR},
 };
 static const int s_group_cnt[SET_GRP_COUNT] = {
     [SET_GRP_AUDIO] = 3, [SET_GRP_DISPLAY] = 2, [SET_GRP_SYSTEM] = 3,
-    [SET_GRP_LOG] = 3,
 };
 
 /* A single settings row descriptor. Adding a setting = appending one row to
@@ -123,9 +115,6 @@ static const setting_entry_t s_settings_table[SETTING_COUNT] = {
     [SETTING_RESCAN]      = {UI_STR_SET_RESCAN, ui_set_rescan_text, NULL,       ui_set_rescan_enter, SET_GRP_SYSTEM},
     [SETTING_RESET]       = {UI_STR_SET_RESET, ui_set_reset_text, NULL,             ui_set_reset_enter, SET_GRP_SYSTEM},
     [SETTING_CLEAR_PROG]  = {UI_STR_SET_CLEAR_PROG, ui_set_clear_text, NULL,        ui_set_clear_enter, SET_GRP_SYSTEM},
-    [SETTING_LOG_SAVE]    = {UI_STR_SET_LOG_SAVE,  ui_set_logsave_text, ui_set_logsave_lr, NULL,              SET_GRP_LOG},
-    [SETTING_LOG_LEVEL]   = {UI_STR_SET_LOG_LEVEL, ui_set_loglvl_text,  ui_set_loglvl_lr,  NULL,              SET_GRP_LOG},
-    [SETTING_LOG_CLEAR]   = {UI_STR_SET_LOG_CLEAR, ui_set_logclear_text, NULL,       ui_set_logclear_enter, SET_GRP_LOG},
     [SETTING_AUTOPAUSE_ROUTE] = {UI_STR_SET_AUTOPAUSE, ui_set_autopause_text, ui_set_autopause_lr, NULL, SET_GRP_AUDIO},
 };
 
@@ -151,19 +140,6 @@ static const uint16_t s_standby_opts[STANDBY_OPT_COUNT] = {
 };
 static standby_opt_t s_standby_opt = STANDBY_OPT_30S;  /* default 30 s */
 
-/* Log mirror: SD save switch + global verbosity. Both persisted to NVS and
- * applied at boot. Index maps onto the esp_log severity ladder. */
-enum { LOG_LVL_COUNT = 6 };
-static const esp_log_level_t s_log_lvls[LOG_LVL_COUNT] = {
-    ESP_LOG_NONE, ESP_LOG_ERROR, ESP_LOG_WARN,
-    ESP_LOG_INFO, ESP_LOG_DEBUG, ESP_LOG_VERBOSE,
-};
-static const char *s_log_lvl_names[LOG_LVL_COUNT] = {
-    UI_STR_LOG_OFF, "错误", "警告", "信息", "调试", "详细",
-};
-static bool s_log_on = true;          /* SD mirror on by default */
-static int  s_log_lvl_idx = 3;        /* ESP_LOG_INFO */
-
 /* Auto-pause on output-route change (speaker <-> bluetooth). Off by default:
  * a route switch keeps playing on the new output. Persisted to NVS; the
  * runtime flag lives in the player (player_set_autopause_on_route_change). */
@@ -180,17 +156,15 @@ typedef enum { SET_VIEW_GROUPS = 0, SET_VIEW_ITEMS } settings_view_t;
 static settings_view_t s_set_view = SET_VIEW_GROUPS;
 static int s_set_group = 0;   /* which group the ITEMS view is showing */
 
-/* Settings persistence: volume and log level survive reboot via NVS.
- * NVS is initialised in app_main() before ui_create(), so these helpers
- * can open the handle at any time. */
+/* Settings persistence: volume, gain, backlight, standby and the route
+ * auto-pause flag survive reboot via NVS. NVS is initialised in app_main()
+ * before ui_create(), so these helpers can open the handle at any time. */
 #define UI_NVS_NS      "ui_cfg"
 #define UI_NVS_VOLUME  "volume"
 #define UI_NVS_VOLBT   "vol_bt"
 #define UI_NVS_GAIN    "gain_db"
 #define UI_NVS_BACKL   "backlight"
 #define UI_NVS_STBY    "standby_s"
-#define UI_NVS_LOG_EN  "log_en"
-#define UI_NVS_LOG_LVL "log_lvl"
 #define UI_NVS_AUTOPAUSE "autopause_route"
 
 void ui_settings_load(void)
@@ -231,17 +205,6 @@ void ui_settings_load(void)
         s_standby_opt = (standby_opt_t)stby;
     }
     hw_lcd_set_standby_timeout((uint32_t)s_standby_opts[s_standby_opt] * 1000);
-    int32_t log_en = -1;
-    if (nvs_get_i32(h, UI_NVS_LOG_EN, &log_en) == ESP_OK) {
-        s_log_on = (log_en != 0);
-    }
-    log_sink_set_enabled(s_log_on);    /* runtime gate for the SD mirror */
-    int32_t log_lvl = -1;
-    if (nvs_get_i32(h, UI_NVS_LOG_LVL, &log_lvl) == ESP_OK &&
-        log_lvl >= 0 && log_lvl < LOG_LVL_COUNT) {
-        s_log_lvl_idx = (int)log_lvl;
-    }
-    esp_log_level_set("*", s_log_lvls[s_log_lvl_idx]);
     int32_t autopause = -1;
     if (nvs_get_i32(h, UI_NVS_AUTOPAUSE, &autopause) == ESP_OK) {
         s_autopause_route = (autopause != 0);
@@ -289,17 +252,6 @@ static void ui_settings_save_standby(void)
     nvs_handle_t h;
     if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_i32(h, UI_NVS_STBY, (int32_t)s_standby_opt);
-        nvs_commit(h);
-        nvs_close(h);
-    }
-}
-
-static void ui_settings_save_log(void)
-{
-    nvs_handle_t h;
-    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_i32(h, UI_NVS_LOG_EN, s_log_on ? 1 : 0);
-        nvs_set_i32(h, UI_NVS_LOG_LVL, (int32_t)s_log_lvl_idx);
         nvs_commit(h);
         nvs_close(h);
     }
@@ -356,9 +308,6 @@ void ui_settings_flush(void)
     }
     if (s_save_pending & SETTINGS_DIRTY_STBY) {
         ui_settings_save_standby();
-    }
-    if (s_save_pending & SETTINGS_DIRTY_LOG) {
-        ui_settings_save_log();
     }
     if (s_save_pending & SETTINGS_DIRTY_AUTOPAUSE) {
         ui_settings_save_autopause();
@@ -646,64 +595,12 @@ static void ui_set_clear_enter(void)
     ui_refresh();
 }
 
-/* ----- Log settings (新分组「日志」) ----- */
-
-static const char *ui_set_logsave_text(void)
-{
-    static char buf[24];
-    snprintf(buf, sizeof(buf), s_log_on ? UI_STR_LOG_ON : UI_STR_LOG_OFF);
-    return buf;
-}
-
-static const char *ui_set_loglvl_text(void)
-{
-    static char buf[24];
-    snprintf(buf, sizeof(buf), "%s", s_log_lvl_names[s_log_lvl_idx]);
-    return buf;
-}
-
-static const char *ui_set_logclear_text(void)
-{
-    return UI_STR_CLEAR_A;
-}
-
-static void ui_set_logsave_lr(int dir)
-{
-    /* Left = off, right = on. Persisted on the next flush; the mirror stops
-     * touching the card immediately so SD wear is saved in normal use. */
-    s_log_on = (dir > 0);
-    log_sink_set_enabled(s_log_on);
-    ui_settings_mark_dirty(SETTINGS_DIRTY_LOG);
-    set_action(s_log_on ? "日志开" : "日志关");
-}
-
-static void ui_set_loglvl_lr(int dir)
-{
-    /* Cycle the global esp_log severity; the UART path is always live, only
-     * the SD mirror's verbosity and on-screen noise change. */
-    int idx = s_log_lvl_idx + dir;
-    idx = MAX(0, MIN(idx, LOG_LVL_COUNT - 1));
-    s_log_lvl_idx = idx;
-    esp_log_level_set("*", s_log_lvls[idx]);
-    ui_settings_mark_dirty(SETTINGS_DIRTY_LOG);
-    set_action(s_log_lvl_names[idx]);
-}
-
-static void ui_set_logclear_enter(void)
-{
-    /* Delete every on-card log segment; the next line opens a fresh one. */
-    log_sink_clear();
-    set_action(UI_STR_LOG_CLEARED);
-    ui_refresh();
-}
-
 /* ----- 路由变更暂停（音频组） ----- */
 
 static const char *ui_set_autopause_text(void)
 {
     static char buf[24];
-    snprintf(buf, sizeof(buf), "%s",
-             s_autopause_route ? UI_STR_LOG_ON : UI_STR_LOG_OFF);
+    snprintf(buf, sizeof(buf), "%s", s_autopause_route ? "开" : "关");
     return buf;
 }
 

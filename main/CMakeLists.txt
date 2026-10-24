@@ -14,5 +14,4 @@ idf_component_register(
                   player
                   sd
                   ui
-                  log_sink
 )
