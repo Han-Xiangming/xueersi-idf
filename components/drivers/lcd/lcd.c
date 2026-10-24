@@ -85,37 +85,52 @@ static inline uint32_t bl_percent_to_duty(uint8_t percent)
 static bool s_bl_inited;
 static uint8_t s_bl_step = BL_LUT_STEPS;   /* current level 0..BL_LUT_STEPS, full by default */
 
-/* Flush completion tracking. lvgl_flush_cb() queues one tx_color per row
- * (see below); every queued transfer produces one lcd_flush_ready_cb() from
- * the SPI ISR. s_flush_pending counts how many row transfers are still in
- * flight, and lv_display_flush_ready() is signalled exactly once per flush —
- * when the LAST row's DMA completes (success path) or after the drain in
- * lcd_flush_abort() (error path, where no DMA completes). Signalling early
+/* Flush completion tracking. lvgl_flush_cb() queues one tx_color per window
+ * (LCD_FLUSH_BATCH_ROWS rows, see below); every queued transfer produces one
+ * lcd_flush_ready_cb() from the SPI ISR. s_flush_pending counts how many window
+ * transfers are still in flight, and lv_display_flush_ready() is signalled
+ * exactly once per flush — when the LAST window's DMA completes (success path)
+ * or after the drain in lcd_flush_abort() (error path, where no DMA
+ * completes). Signalling early
  * (e.g. after the first row, as a plain "pending" bool would) lets LVGL
  * reuse the draw buffer while the remaining rows are still being DMA-read
  * out of px_map, which tears the panel.
  *
  * Both counters are touched from the SPI ISR and from the LVGL render task,
  * so every access goes through the s_flush_mux critical section. The counter
- * is ADDITIVE at flush start (s_flush_pending += rows, not an overwrite): a
+ * is ADDITIVE at flush start (s_flush_pending += windows, not an overwrite): a
  * late completion callback from a previous flush can overlap the start of the
- * next flush, and an overwrite would drop that row so the next flush would
- * release LVGL one row too early. */
+ * next flush, and an overwrite would drop that window so the next flush would
+ * release LVGL one window too early. */
 static portMUX_TYPE s_flush_mux = portMUX_INITIALIZER_UNLOCKED;
-static volatile int32_t s_flush_pending = 0;    /* row DMA transfers in flight */
+static volatile int32_t s_flush_pending = 0;    /* window DMA transfers in flight */
 static volatile bool s_flush_ready_sent = false; /* lv_display_flush_ready() delivered */
 
-/* DMA bounce buffer for row colour transfers. esp_lcd_panel_io_tx_color()
+/* DMA bounce buffers for window colour transfers. esp_lcd_panel_io_tx_color()
  * allocates a private TX buffer per call (a copy into non-cached internal DMA
  * memory) whenever the source is not DMA-safe — e.g. the draw buffers, which
  * live in cached PSRAM on ESP32-S3. Under memory pressure that allocation
  * fails (ESP_ERR_NO_MEM -> "flush line ... failed"). We instead keep a small
- * ring of DMA-capable, non-cached bounce buffers and copy each row into one
- * before queueing, so the SPI layer never needs to allocate. The ring must be
- * at least as deep as trans_queue_depth (10) so a slot is never reused while
- * its transfer is still queued. */
-#define LCD_FLUSH_BOUNCE_COUNT   10
+ * ring of DMA-capable, non-cached bounce buffers and copy each window into one
+ * before queueing, so the SPI layer never needs to allocate.
+ *
+ * Rows per window: one CASET+RASET+RAMWR transaction set per
+ * LCD_FLUSH_BATCH_ROWS rows instead of per row. A full-screen flush drops from
+ * 240x3 transactions to 20x3. Two wins:
+ *   1. per-transaction bus-lock / CS / command overhead is paid once per batch;
+ *   2. each SPI completion ISR preempts core 0 (where the decode task and the
+ *      Bluetooth stack live) for its duration, so per-row ISRs were a hidden
+ *      tax on playback — quartering them matters more than the bus time.
+ *
+ * The ring must stay deeper than the LCD io queue (trans_queue_depth, now 1:
+ * one transaction queued + one in flight) so a slot is never reused while its
+ * transfer is still queued. Slots are LCD_FLUSH_BATCH_ROWS rows deep each. */
+#define LCD_FLUSH_BATCH_ROWS     4
+#define LCD_FLUSH_BOUNCE_COUNT   3
 static uint8_t *s_flush_bounce[LCD_FLUSH_BOUNCE_COUNT];
+/* Rotating bounce-slot index, advanced once per queued window. Module-level so
+ * st7789_clear_black() and lvgl_flush_cb() share one ring. */
+static int s_flush_slot;
 
 /* ---- Auto screen-off (standby) ----
  * Idle timer: after s_standby_timeout_ms of no activity the backlight is
@@ -136,29 +151,72 @@ static void st7789_delay_ms(uint32_t ms)
     vTaskDelay(pdMS_TO_TICKS(ms));
 }
 
-static void st7789_clear_black(esp_lcd_panel_io_handle_t io_handle)
+/* Queue one rectangular window as a single CASET+RASET+RAMWR transaction set,
+ * copying `bytes` from `src` through the next DMA bounce slot. Returns false
+ * (error logged) if any esp_lcd call failed; the caller then aborts the flush
+ * with the windows it had NOT yet queued. */
+static bool lcd_send_window(esp_lcd_panel_io_handle_t io_handle,
+                            uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2,
+                            const uint8_t *src, size_t bytes)
 {
     const uint8_t caset[] = {
-        0x00, 0x00,
-        (LCD_H_RES - 1) >> 8, (LCD_H_RES - 1) & 0xFF,
+        (uint8_t)(((uint16_t)(x1 + LCD_X_GAP)) >> 8),
+        (uint8_t)(((uint16_t)(x1 + LCD_X_GAP)) & 0xFF),
+        (uint8_t)(((uint16_t)(x2 + LCD_X_GAP)) >> 8),
+        (uint8_t)(((uint16_t)(x2 + LCD_X_GAP)) & 0xFF),
+    };
+    const uint8_t raset[] = {
+        (uint8_t)(((uint16_t)(y1 + LCD_Y_GAP)) >> 8),
+        (uint8_t)(((uint16_t)(y1 + LCD_Y_GAP)) & 0xFF),
+        (uint8_t)(((uint16_t)(y2 + LCD_Y_GAP)) >> 8),
+        (uint8_t)(((uint16_t)(y2 + LCD_Y_GAP)) & 0xFF),
     };
 
-    /* Black row lives in the DMA bounce ring, so the SPI layer needs no private
-     * copy. Send one row at a time and index into the ring so a slot is never
-     * reused while its transfer is still queued. */
-    for (int i = 0; i < LCD_FLUSH_BOUNCE_COUNT; i++) {
-        memset(s_flush_bounce[i], 0, LCD_H_RES * sizeof(uint16_t));
+    esp_err_t err = esp_lcd_panel_io_tx_param(io_handle,
+                                              ST7789_CASET, caset, sizeof(caset));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "window caset failed: %s", esp_err_to_name(err));
+        return false;
     }
-    ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, ST7789_CASET, caset, sizeof(caset)));
-    for (uint16_t y = 0; y < LCD_V_RES; y++) {
-        const uint8_t raset[] = {
-            y >> 8, y & 0xFF,
-            y >> 8, y & 0xFF,
-        };
-        ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, ST7789_RASET, raset, sizeof(raset)));
-        ESP_ERROR_CHECK(esp_lcd_panel_io_tx_color(io_handle, ST7789_RAMWR,
-                                                 s_flush_bounce[y % LCD_FLUSH_BOUNCE_COUNT],
-                                                 LCD_H_RES * sizeof(uint16_t)));
+    err = esp_lcd_panel_io_tx_param(io_handle,
+                                    ST7789_RASET, raset, sizeof(raset));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "window raset failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    uint8_t *bb = s_flush_bounce[s_flush_slot % LCD_FLUSH_BOUNCE_COUNT];
+    s_flush_slot++;
+    memcpy(bb, src, bytes);
+    err = esp_lcd_panel_io_tx_color(io_handle, ST7789_RAMWR, bb, bytes);
+    if (err != ESP_OK) {
+        /* Never abort on a transient transfer error: just unlock the display
+         * so LVGL can retry next frame instead of deadlocking or crashing the
+         * whole firmware. */
+        ESP_LOGW(TAG, "window y=%u..%u failed: %s",
+                 (unsigned)y1, (unsigned)y2, esp_err_to_name(err));
+        return false;
+    }
+    return true;
+}
+
+/* Fill the whole panel black (boot / standby). Sent in batched windows, same
+ * as lvgl_flush_cb(). */
+static void st7789_clear_black(esp_lcd_panel_io_handle_t io_handle)
+{
+    /* Dedicated all-zero source: lcd_send_window() copies it into a bounce
+     * slot per window. Kept OUTSIDE the ring so the copy never aliases a slot
+     * that is still queued or in flight. */
+    static uint8_t black_src[LCD_H_RES * sizeof(uint16_t) * LCD_FLUSH_BATCH_ROWS];
+    memset(black_src, 0, sizeof(black_src));
+
+    for (uint16_t y = 0; y < LCD_V_RES; y += LCD_FLUSH_BATCH_ROWS) {
+        const uint16_t rows = (LCD_V_RES - y < LCD_FLUSH_BATCH_ROWS)
+                            ? (LCD_V_RES - y) : LCD_FLUSH_BATCH_ROWS;
+        ESP_ERROR_CHECK(lcd_send_window(io_handle, 0, y, LCD_H_RES - 1, y + rows - 1,
+                                        black_src,
+                                        LCD_H_RES * sizeof(uint16_t) * rows)
+                        ? ESP_OK : ESP_FAIL);
     }
 }
 
@@ -231,15 +289,15 @@ static bool lcd_flush_ready_cb(esp_lcd_panel_io_handle_t panel_io,
     return false;
 }
 
-/* Error path for lvgl_flush_cb: rows that were never queued will never get a
- * completion callback, so drop them from the counter first, then drain-wait
+/* Error path for lvgl_flush_cb: windows that were never queued will never get
+ * a completion callback, so drop them from the counter first, then drain-wait
  * for the in-flight transfers before releasing LVGL exactly once. Skipping
  * the drain would let a late callback corrupt the next flush's count and
  * release LVGL too early. */
-static void lcd_flush_abort(lv_display_t *display, int rows_total, int rows_queued)
+static void lcd_flush_abort(lv_display_t *display, int windows_total, int windows_queued)
 {
     portENTER_CRITICAL(&s_flush_mux);
-    s_flush_pending -= (rows_total - rows_queued);
+    s_flush_pending -= (windows_total - windows_queued);
     portEXIT_CRITICAL(&s_flush_mux);
 
     int wait = 0;
@@ -247,7 +305,7 @@ static void lcd_flush_abort(lv_display_t *display, int rows_total, int rows_queu
         vTaskDelay(pdMS_TO_TICKS(1));
     }
     if (wait >= 200) {
-        ESP_LOGW(TAG, "flush abort: %d row transfers still pending", (int)s_flush_pending);
+        ESP_LOGW(TAG, "flush abort: %d window transfers still pending", (int)s_flush_pending);
     }
 
     portENTER_CRITICAL(&s_flush_mux);
@@ -264,68 +322,45 @@ static void lcd_flush_abort(lv_display_t *display, int rows_total, int rows_queu
 
 static void lvgl_flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t *px_map)
 {
-    esp_lcd_panel_io_handle_t io_handle = lv_display_get_user_data(display);
     const int width = area->x2 - area->x1 + 1;
     const int rows = area->y2 - area->y1 + 1;
     const size_t line_bytes = (size_t)width * sizeof(uint16_t);
     const uint8_t *line = px_map;
 
-    /* Arm the completion counter for this flush: every row that queues a
-     * tx_color below will later produce one lcd_flush_ready_cb() from the
-     * SPI ISR, and LVGL is released only when the last of them completes.
-     * Additive, so a late callback from the previous flush (one that started
-     * before this arm) is still counted against that flush, not this one. */
+    /* Arm the completion counter for this flush: every window queued below
+     * will later produce one lcd_flush_ready_cb() from the SPI ISR, and LVGL
+     * is released only when the last of them completes. Additive, so a late
+     * callback from the previous flush (one that started before this arm) is
+     * still counted against that flush, not this one. */
+    const int windows = (rows + LCD_FLUSH_BATCH_ROWS - 1) / LCD_FLUSH_BATCH_ROWS;
     portENTER_CRITICAL(&s_flush_mux);
-    s_flush_pending += rows;
+    s_flush_pending += windows;
     s_flush_ready_sent = false;
     portEXIT_CRITICAL(&s_flush_mux);
+    int windows_queued = 0;
     int rows_queued = 0;
 
-    /* Send the dirty rectangle one row at a time. Each row is copied into a
-     * DMA-capable, non-cached bounce buffer (s_flush_bounce) before being
-     * queued, so esp_lcd_panel_io_tx_color() never has to allocate its own
-     * private TX buffer (which fails with ESP_ERR_NO_MEM under memory
-     * pressure). The bounce ring is indexed by submission order and is at least
-     * as deep as the SPI queue (trans_queue_depth), so a slot is never reused
-     * while its DMA transfer is still in flight. */
-    for (int y = area->y1; y <= area->y2; ++y) {
-        const uint16_t x_start = area->x1 + LCD_X_GAP;
-        const uint16_t x_end = area->x2 + LCD_X_GAP;
-        const uint16_t y_pos = y + LCD_Y_GAP;
-        const uint8_t caset[] = {
-            x_start >> 8, x_start & 0xFF,
-            x_end >> 8, x_end & 0xFF,
-        };
-        const uint8_t raset[] = {
-            y_pos >> 8, y_pos & 0xFF,
-            y_pos >> 8, y_pos & 0xFF,
-        };
+    /* Send the dirty rectangle in batched windows of up to
+     * LCD_FLUSH_BATCH_ROWS rows: one CASET+RASET+RAMWR set per window instead
+     * of three transactions per row (see LCD_FLUSH_BATCH_ROWS for why). The
+     * window's rows are contiguous in px_map — LVGL reshapes the partial-render
+     * draw buffer to the flush area (lv_refr.c: layer_reshape_draw_buf), so the
+     * row pitch is the area width — which makes the copy a single memcpy. */
+    while (rows_queued < rows) {
+        const int batch = (rows - rows_queued < LCD_FLUSH_BATCH_ROWS)
+                        ? (rows - rows_queued) : LCD_FLUSH_BATCH_ROWS;
+        const uint16_t y1 = (uint16_t)(area->y1 + rows_queued);
+        const uint16_t y2 = (uint16_t)(y1 + batch - 1);
 
-        esp_err_t err = esp_lcd_panel_io_tx_param(io_handle, ST7789_CASET, caset, sizeof(caset));
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "flush caset failed: %s", esp_err_to_name(err));
-            lcd_flush_abort(display, rows, rows_queued);
+        if (!lcd_send_window(s_lcd_io_handle, (uint16_t)area->x1, y1,
+                             (uint16_t)area->x2, y2,
+                             line, line_bytes * (size_t)batch)) {
+            lcd_flush_abort(display, windows, windows_queued);
             return;
         }
-        err = esp_lcd_panel_io_tx_param(io_handle, ST7789_RASET, raset, sizeof(raset));
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "flush raset failed: %s", esp_err_to_name(err));
-            lcd_flush_abort(display, rows, rows_queued);
-            return;
-        }
-        uint8_t *bb = s_flush_bounce[rows_queued % LCD_FLUSH_BOUNCE_COUNT];
-        memcpy(bb, line, line_bytes);
-        err = esp_lcd_panel_io_tx_color(io_handle, ST7789_RAMWR, bb, line_bytes);
-        if (err != ESP_OK) {
-            /* Never abort on a transient transfer error: just unlock the
-             * display so LVGL can retry next frame instead of deadlocking or
-             * crashing the whole firmware. */
-            ESP_LOGW(TAG, "flush line %d failed: %s", y, esp_err_to_name(err));
-            lcd_flush_abort(display, rows, rows_queued);
-            return;
-        }
-        rows_queued++;
-        line += line_bytes;
+        rows_queued += batch;
+        windows_queued++;
+        line += line_bytes * (size_t)batch;
     }
 
     /* Success path: every tx_color above is asynchronous (DMA). The last
@@ -351,26 +386,31 @@ void hw_lcd_init(void)
     };
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
-    /* Allocate the row-transfer bounce ring from the SPI bus's DMA-capable
-     * (non-cached, internal) pool. Small and allocated once, so it never
-     * contends with the per-frame priv-buffer churn that was failing. */
+    /* Allocate the window-transfer bounce ring from the SPI bus's DMA-capable
+     * (non-cached, internal) pool. Each slot holds one batched window
+     * (LCD_FLUSH_BATCH_ROWS rows); allocated once, so it never contends with
+     * the per-frame priv-buffer churn that was failing. */
     for (int i = 0; i < LCD_FLUSH_BOUNCE_COUNT; i++) {
-        s_flush_bounce[i] = spi_bus_dma_memory_alloc(LCD_HOST,
-                                                     LCD_H_RES * sizeof(uint16_t),
-                                                     0);
+        s_flush_bounce[i] = spi_bus_dma_memory_alloc(
+            LCD_HOST, LCD_H_RES * sizeof(uint16_t) * LCD_FLUSH_BATCH_ROWS, 0);
         assert(s_flush_bounce[i]);
     }
 
     ESP_LOGI(TAG, "Install panel IO");
     esp_lcd_panel_io_handle_t io_handle = NULL;
-    /* 队列深度 3（原 10）：SPI2 与 SDSPI 共用（见 board_config.h），SDSPI 每笔
-     * 事务都是前台 polling 获取总线，必须等本队列排空（spi_bus_lock 的 BG 位
-     * 清零）才能插入。连续刷屏时 LVGL 任务持续补货、深队列从不排空，一次
-     * 4 KB SD 读（~11 笔事务）被整体推迟到整个 flush 流结束；解码停摆超过
-     * ring+DMA(~325 ms) 裕量即欠载静音，听感为播放"变慢"。深度 3 把 LCD 的
-     * 独占窗口压到 ~0.3 ms（3 行 x ~85 us @60 MHz），SD 可逐笔插入。副作用
-     * 是好的：LVGL 更频繁阻塞在队列满处，反而把 Core 1 让给 i2s_wr(prio 6)。
-     * bounce ring 仍为 10 >= 深度，lvgl_flush_cb 的索引逻辑不变。 */
+    /* 队列深度 1（原 10 → 3 → 1）：SPI2 与 SDSPI 共用（见 board_config.h），
+     * spi_bus_lock 按设备 ID 仲裁，LCD（先注册，dev 0）在双方都有待发事务时
+     * 永远赢——SD 事务只能等 LCD 队列排空后才能插队。深队列时连续刷屏的
+     * LVGL 任务持续补货、队列从不排空，一次 4 KB SD 读（~11 笔事务）被整体
+     * 推迟到 flush 流结束；解码停摆超过 ring+DMA 裕量即欠载静音，听感为
+     * 播放"变慢"。
+     * 配合窗口批处理（LCD_FLUSH_BATCH_ROWS）：单笔事务变大（4 行 ≈ 340 us
+     * @60 MHz）但深度 1 保证 SD 最多等 1 笔，等待窗口与旧的"深度 3 x 1 行"
+     * (~0.3 ms) 持平；而每 flush 的事务数、总线锁/CS/命令开销与 SPI 完成
+     * ISR（每次都会抢占 Core 0 的解码/BT 任务）都降到 1/4。副作用是好的：
+     * LVGL 更频繁阻塞在队列满处，反而把 Core 1 让给 i2s_wr(prio 6)。
+     * bounce ring 为 3 槽 >= 深度 1（1 笔在队 + 1 笔在飞），槽位安全性
+     * 由 s_flush_slot 轮转保证。 */
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = PIN_NUM_LCD_DC,
         .cs_gpio_num = PIN_NUM_LCD_CS,
@@ -378,7 +418,7 @@ void hw_lcd_init(void)
         .lcd_cmd_bits = LCD_CMD_BITS,
         .lcd_param_bits = LCD_PARAM_BITS,
         .spi_mode = 0,
-        .trans_queue_depth = 3,
+        .trans_queue_depth = 1,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST,
                                              &io_config,
