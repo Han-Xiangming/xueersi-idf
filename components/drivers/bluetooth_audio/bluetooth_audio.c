@@ -31,6 +31,14 @@ static const char *TAG = "bluetooth_audio";
 static volatile bool s_enabled;      /* user wants BT output (settings) */
 static volatile bool s_connected;    /* an A2DP sink is connected */
 static volatile bool s_streaming;    /* media channel started */
+/* AVRCP CONTROLLER (CT) role: the stack brings the CT channel up together with
+ * the A2DP link, and we use it to mirror our own volume to the sink
+ * (bluetooth_audio_set_sink_volume). s_sink_vol* dedupe redundant pushes and
+ * are reset on disconnect so every new link gets a fresh volume push. */
+static volatile bool s_avrc_ct_conn;
+static uint8_t s_avrc_tl;               /* transaction label, 0..15 */
+static bool s_sink_vol_valid;           /* a value was pushed at least once */
+static uint8_t s_sink_vol;              /* last value pushed, 0..127 */
 /* True once a link has actually reached CONNECTED during the current dial-out
  * session. Used to stop auto-retry after a link that WAS up drops: a sink that
  * connects then dies (range / power) should not be hammered with re-dials that
@@ -45,6 +53,9 @@ static volatile uint32_t s_passkey;  /* SSP numeric-comparison code */
 static bt_avrc_cmd_cb_t s_avrc_cmd_cb;
 static bt_avrc_volume_cb_t s_avrc_vol_cb;
 static bt_conn_state_cb_t s_conn_state_cb;
+/* Snapshot provider for the connect-time volume push (see the CT role below).
+ * Also outside the #if so the setter compiles without Bluetooth. */
+static bt_avrc_sync_vol_cb_t s_sync_vol_cb;
 
 #if defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_A2DP_ENABLE)
 
@@ -349,6 +360,16 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             }
             ESP_LOGI(TAG, "A2DP connected, checking media readiness");
             esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
+            /* Mirror the device volume to the sink. The AVRCP CT channel is
+             * usually still coming up at this point (its connected event
+             * repeats the push then); the last-sent dedupe in
+             * bluetooth_audio_set_sink_volume() makes the overlap harmless. */
+            if (s_sync_vol_cb != NULL) {
+                uint8_t pct = s_sync_vol_cb();
+                if (pct <= 100) {
+                    bluetooth_audio_set_sink_volume(pct);
+                }
+            }
             if (s_conn_state_cb != NULL) {
                 s_conn_state_cb(true);
             }
@@ -384,6 +405,8 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             }
             s_connected = false;
             s_streaming = false;
+            s_avrc_ct_conn = false;      /* CT channel drops with the link */
+            s_sink_vol_valid = false;    /* next link gets a fresh volume push */
             /* Freeze the PCM feed IMMEDIATELY on link loss, not just during an
              * explicit teardown: the A2DP media channel may still be "started"
              * in our view while the underlying ACL is already gone, so the
@@ -483,6 +506,71 @@ static void avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *par
         if (s_avrc_vol_cb != NULL) {
             s_avrc_vol_cb(param->set_abs_vol.volume);   /* 0..127 */
         }
+        break;
+    default:
+        break;
+    }
+}
+
+/* Push the local Bluetooth-route volume to the sink as an AVRCP absolute
+ * volume command. `volume_pct` is the 0..100 % of the audio layer's BT slot;
+ * it maps to the 0..127 AVRCP scale with rounding — the inverse of the
+ * mapping the TG side applies to inbound commands, so a value round-trips
+ * within one percent. Redundant sends (the same value twice, e.g. the
+ * connect-time push racing the CT-connected event) are dropped via
+ * s_sink_vol; the flag resets on disconnect so every new link is pushed. */
+void bluetooth_audio_set_sink_volume(uint8_t volume_pct)
+{
+    if (volume_pct > 100) {
+        volume_pct = 100;
+    }
+    uint8_t vol127 = (uint8_t)(((uint32_t)volume_pct * 127u + 50u) / 100u);
+    if (!s_connected || !s_avrc_ct_conn) {
+        /* No sink, or its AVRCP channel not up yet: the local gain is the
+         * only volume control in this state — nothing to mirror. */
+        return;
+    }
+    if (s_sink_vol_valid && s_sink_vol == vol127) {
+        return;                         /* sink already at this level */
+    }
+    esp_err_t err = esp_avrc_ct_send_set_absolute_volume_cmd(s_avrc_tl, vol127);
+    if (err != ESP_OK) {
+        /* Typical for sinks without absolute-volume support: keep the local
+         * gain authoritative and move on (do not spam the log per press). */
+        ESP_LOGW(TAG, "set sink volume %u/127 failed: %s", vol127,
+                 esp_err_to_name(err));
+        return;
+    }
+    s_avrc_tl = (uint8_t)((s_avrc_tl + 1) & 0x0F);
+    s_sink_vol_valid = true;
+    s_sink_vol = vol127;
+    ESP_LOGI(TAG, "sink volume -> %u%% (%u/127)", (unsigned)volume_pct, vol127);
+}
+
+/* AVRCP Controller callback: we hold the CT role only to mirror our own
+ * volume to the sink. The CT channel is brought up by the stack together with
+ * the A2DP link, so "connected" here is the signal to push the current
+ * Bluetooth-route volume once (via s_sync_vol_cb). The absolute-volume
+ * response carries the value the sink actually applied — a sink may quantise
+ * it (e.g. 16 steps); we log it but keep our own percent as the UI truth. */
+static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param)
+{
+    switch (event) {
+    case ESP_AVRC_CT_CONNECTION_STATE_EVT:
+        s_avrc_ct_conn = param->conn_stat.connected;
+        ESP_LOGI(TAG, "AVRCP CT %sconnected", s_avrc_ct_conn ? "" : "dis");
+        if (s_avrc_ct_conn && s_connected && s_sync_vol_cb != NULL) {
+            /* Mirror the device volume to the sink now that the channel is
+             * up: the sink starts at our level instead of its own last one. */
+            uint8_t pct = s_sync_vol_cb();
+            if (pct <= 100) {
+                bluetooth_audio_set_sink_volume(pct);
+            }
+        }
+        break;
+    case ESP_AVRC_CT_SET_ABSOLUTE_VOLUME_RSP_EVT:
+        ESP_LOGI(TAG, "sink applied volume %u/127",
+                 (unsigned)param->set_volume_rsp.volume);
         break;
     default:
         break;
@@ -626,6 +714,12 @@ void bluetooth_audio_enable(void)
     esp_avrc_tg_register_callback(avrc_tg_cb);
     esp_avrc_tg_init();
 
+    /* Register the AVRCP Controller role so we can mirror our own volume to
+     * the sink (bluetooth_audio_set_sink_volume). The CT channel is brought
+     * up by the stack together with the A2DP link — no explicit connect. */
+    esp_avrc_ct_register_callback(avrc_ct_cb);
+    esp_avrc_ct_init();
+
     esp_a2d_register_callback(a2d_cb);
     esp_a2d_source_register_data_callback(a2d_data_cb);
     err = esp_a2d_source_init();
@@ -721,6 +815,7 @@ static void bluetooth_audio_teardown(void *param1, uint32_t param2)
      * advance of A2DP" warning and can leave the AVRC profile half-freed. */
     s_initialized = false;
     esp_avrc_tg_deinit();
+    esp_avrc_ct_deinit();
     esp_a2d_source_deinit();
     esp_bluedroid_disable();
     esp_bluedroid_deinit();
@@ -741,6 +836,8 @@ static void bluetooth_audio_teardown(void *param1, uint32_t param2)
     s_conn_retries = 0;
     s_ever_connected = false;
     s_user_dialing = false;
+    s_avrc_ct_conn = false;
+    s_sink_vol_valid = false;
     if (s_conn_timer != NULL) {
         xTimerStop(s_conn_timer, 0);
     }
@@ -1127,6 +1224,11 @@ void bluetooth_audio_write_pcm(const int16_t *stereo_frames, size_t frames)
     (void)frames;
 }
 
+void bluetooth_audio_set_sink_volume(uint8_t volume_pct)
+{
+    (void)volume_pct;                     /* no sink to mirror to */
+}
+
 void bluetooth_audio_set_sample_rate(uint32_t rate_hz)
 {
     (void)rate_hz;
@@ -1200,6 +1302,11 @@ void bluetooth_audio_set_avrc_cmd_cb(bt_avrc_cmd_cb_t cb)
 void bluetooth_audio_set_avrc_volume_cb(bt_avrc_volume_cb_t cb)
 {
     s_avrc_vol_cb = cb;
+}
+
+void bluetooth_audio_set_avrc_sync_vol_cb(bt_avrc_sync_vol_cb_t cb)
+{
+    s_sync_vol_cb = cb;
 }
 
 void bluetooth_audio_set_conn_state_cb(bt_conn_state_cb_t cb)

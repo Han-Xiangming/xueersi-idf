@@ -67,6 +67,13 @@ ui_state_t s_ui;
 static uint32_t s_action_until_ms;
 static char s_action[32];
 
+/* Last output-volume percent shown by the toast (0xFF = not sampled yet).
+ * The volume also moves without local input — an AVRCP remote setting the
+ * absolute volume on the BT route, or a route switch swapping in the other
+ * route's slot — so the refresh detects the change and acknowledges it with
+ * the same "音量 XX%" toast the local entry points use. */
+static uint8_t s_vol_view = 0xFF;
+
 /* On-change refresh (optimization #4): ui_refresh() recomputes the current
  * page only when this is set, then clears it. Input handlers and the engine
  * watcher arm it, turning the 60 Hz tick into an on-change refresh. */
@@ -612,6 +619,23 @@ static void ui_refresh_battery(void)
 void ui_refresh(void)
 {
     ui_settings_flush();
+
+    /* Volume moved without local input (AVRCP remote, or a route switch
+     * swapping in the other route's slot): acknowledge it like a local change
+     * and mark the volume dirty so the remote's value survives reboot too.
+     * Local changes come through here as well — set_action() only extends the
+     * identical toast, so the feedback stays uniform. */
+    const uint8_t vol = hw_audio_get_volume();
+    if (vol != s_vol_view) {
+        if (s_vol_view != 0xFF) {
+            char buf[24];
+            snprintf(buf, sizeof(buf), "音量 %u%%", (unsigned)vol);
+            set_action(buf);
+            ui_settings_mark_dirty(SETTINGS_DIRTY_VOLUME);
+        }
+        s_vol_view = vol;
+    }
+
     if (ui_nav_in_menu()) {
         /* Menu is event-driven, but keep the battery gauge and the playback
          * panel live on every tick. */

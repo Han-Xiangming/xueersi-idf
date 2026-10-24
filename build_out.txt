@@ -1,0 +1,27 @@
+Your environment is not configured to handle Unicode characters.
+
+Recommended fix (persistent):
+ - Enable "Beta: Use Unicode UTF-8 for worldwide language support" in Windows language/region settings.
+
+If you still see issues or this warning persists, you can also try one of these workarounds:
+ - Run "chcp 65001" in the current console before running idf.py.
+ - Set PYTHONUTF8=1 before running idf.py (or set it globally).
+
+Note: "chcp 65001" must be run in each new console session unless your console/profile is configured to apply it automatically.
+Executing action: all (aliases: build)
+Running ninja in directory C:\Users\OpenTankOfBeta\Desktop\Xiaomao\DEV\xueersi-idf\build
+Executing "ninja all"...
+[1/1002] Building C object esp-idf/bt/CMakeFiles/__idf_bt.dir/host/bluedroid/bta/pba/bta_pba_client_act.c.obj
+[2/1002] Building C object esp-idf/bt/CMakeFiles/__idf_bt.dir/host/bluedroid/bta/hf_client/bta_hf_client_sco.c.obj
+[3/1002] Building C object esp-idf/bt/CMakeFiles/__idf_bt.dir/host/bluedroid/bta/sdp/bta_sdp.c.obj
+[4/1002] Building C object esp-idf/bt/CMakeFiles/__idf_bt.dir/host/bluedroid/bta/hf_client/bta_hf_client_rfc.c.obj
+[5/1002] Building C object esp-idf/bt/CMakeFiles/__idf_bt.dir/host/bluedroid/bta/pba/bta_pba_client_sdp.c.obj
+[6/1002] Building C object esp-idf/bt/CMakeFiles/__idf_bt.dir/host/bluedroid/bta/hf_client/bta_hf_client_sdp.c.obj
+[7/1002] Building C object esp-idf/bt/CMakeFiles/__idf_bt.dir/host/bluedroid/bta/hf_client/bta_hf_client_main.c.obj
+[8/1002] Building C object esp-idf/bt/CMakeFiles/__idf_bt.dir/host/bluedroid/bta/hf_client/bta_hf_client_cmd.c.obj
+[9/1002] Building C object esp-idf/bt/CMakeFiles/__idf_bt.dir/host/bluedroid/bta/pba/bta_pba_client_main.c.obj
+[10/1002] Building C object esp-idf/bt/CMakeFiles/__idf_bt.dir/host/bluedroid/bta/pba/bta_pba_client_api.c.obj
+[11/1002] Building C object esp-idf/bt/CMakeFiles/__idf_bt.dir/host/bluedroid/bta/hf_client/bta_hf_client_at.c.obj
+[12/1002] Building C object esp-idf/bt/CMakeFiles/__idf_bt.dir/host/bluedroid/bta/hf_client/bta_hf_client_api.c.obj
+[13/1002] Building C object esp-idf/bt/CMakeFiles/__idf_bt.dir/host/bluedroid/bta/sdp/bta_sdp_api.c.obj
+[14/1002] Building C object esp-idf/bt/CMakeFiles/__idf_bt.dir/host/bluedroid/bta/sdp/bta_sdp_act.c.obj

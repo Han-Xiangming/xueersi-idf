@@ -137,6 +137,21 @@ static void xiaomiao_avrc_volume(uint8_t volume_0_127)
     hw_audio_set_avrc_volume(volume_0_127);
 }
 
+/* Local volume change on the Bluetooth route: mirror it to the connected
+ * sink so the remote's own level tracks the device (AVRCP absolute volume,
+ * Controller role). No-op when no sink is linked. */
+static void xiaomiao_bt_volume_changed(uint8_t volume_pct)
+{
+    bluetooth_audio_set_sink_volume(volume_pct);
+}
+
+/* Current Bluetooth-route volume, pushed once when the AVRCP CT channel comes
+ * up so the sink starts at the device's level instead of its own last one. */
+static uint8_t xiaomiao_bt_volume_snapshot(void)
+{
+    return hw_audio_get_bt_volume();
+}
+
 
 
 static void lvgl_task(void *arg)
@@ -225,6 +240,8 @@ void app_main(void)
     bluetooth_audio_init();
     bluetooth_audio_set_avrc_cmd_cb(xiaomiao_avrc_cmd);
     bluetooth_audio_set_avrc_volume_cb(xiaomiao_avrc_volume);
+    bluetooth_audio_set_avrc_sync_vol_cb(xiaomiao_bt_volume_snapshot);
+    hw_audio_set_bt_volume_change_cb(xiaomiao_bt_volume_changed);
     hw_sd_try_mount();
     player_init();
     ebook_init();

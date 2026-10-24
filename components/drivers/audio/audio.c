@@ -179,6 +179,12 @@ static audio_route_t s_route = AUDIO_ROUTE_SPEAKER;
  * audio_apply_route() after the new route is fully in effect. */
 static audio_route_change_cb_t s_route_change_cb;
 
+/* Bluetooth-route volume-change listener (see
+ * hw_audio_set_bt_volume_change_cb). Invoked whenever the BT slot's value
+ * changes while the BT route is the destination for it, so the app can mirror
+ * the volume to a connected A2DP sink. */
+static hw_audio_bt_volume_cb_t s_bt_vol_cb;
+
 /* Consecutive failed PCM ring writes (bounds the WARN/ERROR rate). */
 static uint32_t s_wr_errs;
 /* Consecutive timed-out i2s_channel_write()s (bounds the ERROR rate). Surfaces
@@ -404,6 +410,22 @@ audio_route_t hw_audio_get_route(void)
 void hw_audio_set_route_change_cb(audio_route_change_cb_t cb)
 {
     s_route_change_cb = cb;
+}
+
+void hw_audio_set_bt_volume_change_cb(hw_audio_bt_volume_cb_t cb)
+{
+    s_bt_vol_cb = cb;
+}
+
+/* Publish the Bluetooth slot's volume to the listener (if any). Only called
+ * on paths that change the slot WHILE the BT route is active, i.e. when the
+ * new value is the one the sink should mirror. Inbound AVRCP volume never
+ * comes through here: the sink is already at that value. */
+static void audio_publish_bt_volume(void)
+{
+    if (s_bt_vol_cb != NULL) {
+        s_bt_vol_cb(s_vol_bt);
+    }
 }
 
 static void audio_update_vol_gain(void)
@@ -972,6 +994,9 @@ void hw_audio_set_volume(uint8_t volume_pct)
     }
     s_volume = volume_pct;
     audio_update_vol_gain();
+    if (audio_route_is_bt()) {
+        audio_publish_bt_volume();  /* mirror the new level to the sink */
+    }
 }
 
 uint8_t hw_audio_get_volume(void)
@@ -1080,6 +1105,7 @@ void hw_audio_set_bt_volume(uint8_t volume_pct)
     if (audio_route_is_bt()) {
         s_volume = volume_pct;
         audio_update_vol_gain();
+        audio_publish_bt_volume();  /* mirror the new level to the sink */
     }
 }
 
@@ -1091,14 +1117,22 @@ uint8_t hw_audio_get_bt_volume(void)
 /* AVRCP absolute volume (0..127, full remote scale): each remote step is an
  * equal ~0.32 dB (40/127) change, resolved through the same 0.1 dB gain table
  * as the local percent volume, so the remote and the buttons share one
- * consistent taper. Writes the BT route's slot (the remote is a Bluetooth
- * peer) and updates the percent view (UI/NVS). */
+ * consistent taper. Always writes the BT route's slot (the remote is a
+ * Bluetooth peer); the live gain and the percent view follow only while the
+ * BT route is active. On the speaker route the value is stored for the next
+ * route switch — a remote command must never hijack the speaker output, and
+ * no sink echo is sent either (the sink is already at that value). */
 void hw_audio_set_avrc_volume(uint8_t volume_0_127)
 {
     if (volume_0_127 > 127) {
         volume_0_127 = 127;
     }
     s_vol_bt = (uint8_t)(((uint32_t)volume_0_127 * 100u + 63) / 127u);
+    if (!audio_route_is_bt()) {
+        ESP_LOGI(TAG, "AVRCP volume %u%% stored for BT route (speaker active)",
+                 (unsigned)s_vol_bt);
+        return;
+    }
     s_volume = s_vol_bt;
     if (volume_0_127 == 0) {
         s_vol_gain = 0;                /* hard mute */

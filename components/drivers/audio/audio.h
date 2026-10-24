@@ -76,9 +76,20 @@ void hw_audio_set_bt_volume(uint8_t volume_pct);
 uint8_t hw_audio_get_bt_volume(void);
 
 /* AVRCP absolute volume (0..127, full remote scale) with equal ~0.32 dB
- * steps, sharing the same gain table as set_volume; always writes the BT
- * route (the remote is a Bluetooth peer) and updates the percent view. */
+ * steps, sharing the same gain table as set_volume. Always writes the BT
+ * route's slot (the remote is a Bluetooth peer); the live gain and the percent
+ * view follow only while the BT route is active — on the speaker route the
+ * value is stored for the next route switch and the speaker keeps its own
+ * volume. */
 void hw_audio_set_avrc_volume(uint8_t volume_0_127);
+
+/* Listener for Bluetooth-route volume changes (local buttons, NVS restore,
+ * settings row). Lets the app mirror the value to a connected A2DP sink via
+ * AVRCP absolute volume. NOT invoked for inbound AVRCP volume — the sink is
+ * already at that value, echoing it back would be a pointless loop. Pass NULL
+ * to disable. */
+typedef void (*hw_audio_bt_volume_cb_t)(uint8_t volume_pct);
+void hw_audio_set_bt_volume_change_cb(hw_audio_bt_volume_cb_t cb);
 
 /* Per-track loudness gain in dB (ReplayGain 2.0, from the file's ID3 tags
  * written by tools like loudgain). Applied before the master volume on the

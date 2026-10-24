@@ -147,3 +147,26 @@ typedef void (*bt_conn_state_cb_t)(bool connected);
 void bluetooth_audio_set_avrc_cmd_cb(bt_avrc_cmd_cb_t cb);
 void bluetooth_audio_set_avrc_volume_cb(bt_avrc_volume_cb_t cb);
 void bluetooth_audio_set_conn_state_cb(bt_conn_state_cb_t cb);
+
+/* === AVRCP absolute-volume mirroring (Controller role) ======================
+ * We are the A2DP SOURCE, so besides the AVRCP Target role (which RECEIVES
+ * remote media-key and absolute-volume commands) we also register the AVRCP
+ * CONTROLLER role and mirror our own Bluetooth-route volume to the connected
+ * sink: every local volume change is sent as SetAbsoluteVolume, so the sink's
+ * internal volume (and any level it shows) tracks the device — the same
+ * bidirectional sync phones and Bluetooth speakers use. A sink that rejects
+ * the command (no absolute-volume support) simply keeps its own volume; the
+ * local gain stays authoritative either way. */
+
+/* Push the Bluetooth-route volume (0..100 %) to the connected sink as an AVRCP
+ * absolute-volume command (0..127). No-op when no sink (or its AVRCP CT
+ * channel) is up — the local gain is then the only volume control. Safe to
+ * call from any task. */
+void bluetooth_audio_set_sink_volume(uint8_t volume_pct);
+
+/* Invoked when the AVRCP CT channel comes up (the stack brings it up together
+ * with the A2DP link): the app returns the current Bluetooth-route volume so
+ * it can be pushed once and the sink starts at the device's level instead of
+ * whatever volume it remembered from its last session. */
+typedef uint8_t (*bt_avrc_sync_vol_cb_t)(void);
+void bluetooth_audio_set_avrc_sync_vol_cb(bt_avrc_sync_vol_cb_t cb);
