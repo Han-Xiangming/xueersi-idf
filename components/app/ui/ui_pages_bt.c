@@ -129,6 +129,10 @@ void ui_refresh_bt(void)
                         BT_DEV_NAME_LEN - 1);
                 s_bt_list_name[i][BT_DEV_NAME_LEN - 1] = '\0';
             }
+            /* The rows' data source changed underneath them: drop the paint
+             * shadow so every row repaints for real (the cached names alone
+             * would not re-assert a row whose text happens to be unchanged). */
+            ui_list_invalidate_paint(&s_ui.bt_list);
         }
 
         /* Devices occupy list rows 1..(UI_LIST_ROWS-1); the switch stays pinned at

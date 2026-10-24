@@ -567,6 +567,15 @@ static uint32_t bat_color_for_pct(uint8_t pct)
     return s_bat_palette[4];
 }
 
+/* Paint shadow for the battery gauge. ui_refresh_battery() runs on every
+ * refresh pass — every 16 ms for the 850 ms a toast is up — and LVGL's style
+ * setters plus lv_label_set_text() invalidate unconditionally, even for an
+ * unchanged value (lv_obj_style.c: lv_obj_refresh_style always invalidates).
+ * Without this shadow each toast repainted the whole gauge ~50 times, keeping
+ * the shared SPI2 bus busy exactly when the player's SD reads need it.
+ * Key: 0x100 = "no data yet" state, otherwise the percent; 0xFFFF = unpainted. */
+static uint16_t s_bat_paint_key = 0xFFFF;
+
 /* Update the persistent top-right battery gauge: re-paint the 5-segment fill
  * and the "100%" label in the band color. "--" stays until first sample. */
 static void ui_refresh_battery(void)
@@ -580,11 +589,21 @@ static void ui_refresh_battery(void)
 
     /* Pre-sample: no data yet. */
     if (pct == 0 && vbat <= 0.0f) {
+        if (s_bat_paint_key == 0x100) {
+            return;                 /* already showing "--": nothing to do */
+        }
         for (int i = 0; i < 5; ++i) {
             lv_obj_set_style_bg_opa(s_ui.bat_seg[i], LV_OPA_TRANSP, 0);
         }
         lv_label_set_text(s_ui.bat_text, "--%");
+        s_bat_paint_key = 0x100;
         return;
+    }
+
+    /* The gauge's whole appearance is a function of `pct` (band colour, filled
+     * segments, text), so one comparison covers every setter below. */
+    if (s_bat_paint_key == pct) {
+        return;                     /* unchanged: skip the invalidating setters */
     }
 
     const uint32_t color = bat_color_for_pct(pct);
@@ -613,6 +632,7 @@ static void ui_refresh_battery(void)
     char buf[8];
     snprintf(buf, sizeof(buf), "%u%%", (unsigned)pct);
     lv_label_set_text(s_ui.bat_text, buf);
+    s_bat_paint_key = pct;
 }
 
 

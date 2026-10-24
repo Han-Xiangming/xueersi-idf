@@ -340,6 +340,9 @@ void ui_ebook_list_action(void)
             s_ebv = EBV_LIST;
             s_eb_sel = 0;
             s_paint_eb_sel = -1;   /* force list repaint */
+            /* The rows now show a DIFFERENT source: drop the paint shadow so
+             * the focus/accent repaint is not skipped on a same-shape list. */
+            ui_list_invalidate_paint(&s_ui.eb_list);
             s_eb_loading = true;   /* hide stale books until this load finishes */
             set_action("加载中");
             return;
@@ -578,6 +581,8 @@ void ui_ebook_notify_sd_change(void)
     if (ui_nav_current() == UI_PAGE_EBOOK_LIST) {
         ui_discover_ebook_sources();
         s_paint_eb_src_sel = -1;
+        /* Card swapped underneath the live rows: drop the paint shadow. */
+        ui_list_invalidate_paint(&s_ui.eb_list);
     }
     if (s_ebv == EBV_LIST) {
         ebook_scan_root(s_eb_src_path[s_eb_src_sel]);

@@ -28,11 +28,37 @@ typedef struct {
     int       rows;                       /* visible rows */
     int       row_h;                      /* row pitch in px */
     int       first_y;                    /* y of row 0 */
+
+    /* Paint shadow: what each row currently SHOWS. A row's whole visual state
+     * is a function of (blank, selected, text): the focus fill and both text
+     * colours are pure functions of `selected`, and the text itself is already
+     * change-guarded inside ui_theme_text_set(). Shadowing the two booleans
+     * therefore lets ui_list_row() skip the remaining style setters for an
+     * unchanged row — LVGL's lv_obj_set_style_*() invalidates unconditionally,
+     * even when the value is identical (lv_obj_style.c:
+     * lv_obj_refresh_style always invalidates), and ui_list_row() runs on
+     * every refresh pass, i.e. every 16 ms while a toast is up. That churn
+     * kept the LCD (and with it the shared SPI2 bus) busy for no visible
+     * change.
+     * Reset by ui_list_create() (fresh row objects carry the creation-time
+     * styles, so a persistent struct must not trust a stale shadow) and by
+     * ui_list_invalidate_paint() (list content swapped underneath). */
+    bool      painted[UI_LIST_MAX_ROWS];  /* shadow below is valid */
+    bool      blank[UI_LIST_MAX_ROWS];    /* row currently shows the cleared state */
+    bool      selected[UI_LIST_MAX_ROWS]; /* row currently shows the focus state */
 } ui_list_t;
 
-/* Create `rows` cursor+text pairs inside `parent`. */
+/* Create `rows` cursor+text pairs inside `parent`. Resets the paint shadow:
+ * the new row objects carry the creation-time styles, so the first
+ * ui_list_row() pass after a (re)build always repaints for real. */
 void ui_list_create(ui_list_t *list, lv_obj_t *parent, int rows,
                     int first_y, int row_h);
+
+/* Drop the paint shadow so the next ui_list_row() pass repaints every row for
+ * real. Call when the list's CONTENT source changes underneath the rows (SD
+ * hotplug, live-scan publish, source switch) — the shadow would otherwise
+ * skip the repaint and leave a stale accent on the wrong row. */
+void ui_list_invalidate_paint(ui_list_t *list);
 
 /*
  * Scroll window: index of the first visible row. Keeps the selection centred

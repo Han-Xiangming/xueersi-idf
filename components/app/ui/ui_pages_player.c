@@ -619,6 +619,9 @@ void ui_player_action(void)
             s_pv = PV_LIST;
             s_mp3_sel = 0;
             s_paint_mp3_sel = -1;   /* force list repaint */
+            /* The rows now show a DIFFERENT folder: drop the paint shadow so
+             * the focus/accent repaint is not skipped on a same-shape list. */
+            ui_list_invalidate_paint(&s_ui.pl_list);
             s_mp3_loading = true;   /* hide stale list until this load finishes */
             set_action("加载中");
             return;
@@ -729,6 +732,8 @@ void ui_player_notify_sd_change(void)
     if (ui_nav_current() == UI_PAGE_PLAYER) {
         ui_discover_sources();
         s_paint_src_sel = -1;
+        /* Card swapped underneath the live rows: drop the paint shadow. */
+        ui_list_invalidate_paint(&s_ui.pl_list);
     }
     if (s_pv == PV_LIST && player_scan_busy()) {
         s_mp3_loading = true;

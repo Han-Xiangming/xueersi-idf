@@ -56,7 +56,10 @@ typedef enum {
 #define SETTINGS_DIRTY_LOG      (1u << 5)
 
 /* ---- Marquee (scrolling names that are wider than the row) ---- */
-#define LIST_SCROLL_MS      220
+/* Marquee scroll cadence (ms per character step). 300 ms keeps the now-playing
+ * line readable while cutting the LCD flush rate by ~27% versus 220 ms — each
+ * step dirties a full-width label row on the SPI2 bus the SD card shares. */
+#define LIST_SCROLL_MS      300
 #define LIST_SCROLL_GAP     8
 #define LIST_LINE_W         (UI_SCREEN_W - 32)
 /* Status-bar (pl_prog) text width: the full line minus the 8 px page margins. */

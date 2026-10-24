@@ -17,6 +17,9 @@ void ui_list_create(ui_list_t *list, lv_obj_t *parent, int rows,
         list->row_bg[i] = NULL;
         list->cursor[i] = NULL;
         list->text[i]   = NULL;
+        list->painted[i]   = false;   /* fresh objects: shadow is stale */
+        list->blank[i]     = false;
+        list->selected[i]  = false;
     }
 
     for (int i = 0; i < rows; i++) {
@@ -53,6 +56,18 @@ void ui_list_create(ui_list_t *list, lv_obj_t *parent, int rows,
         lv_obj_set_style_text_font(txt, UI_FONT, 0);
         lv_obj_set_style_text_color(txt, ui_theme_color(UI_COLOR_TEXT_DIM), 0);
         list->text[i] = txt;
+    }
+}
+
+/* Drop the paint shadow: the next ui_list_row() pass repaints every row for
+ * real. Used when the list content is swapped underneath live rows. */
+void ui_list_invalidate_paint(ui_list_t *list)
+{
+    if (list == NULL) {
+        return;
+    }
+    for (int i = 0; i < UI_LIST_MAX_ROWS; i++) {
+        list->painted[i] = false;
     }
 }
 
@@ -98,21 +113,49 @@ void ui_list_row(ui_list_t *list, int row, int idx, int count,
     lv_obj_t *cur = list->cursor[row];
     lv_obj_t *txt = list->text[row];
 
-    if (blank || idx < 0 || idx >= count) {
-        ui_list_row_focus(list, row, false);
-        ui_theme_text_set(cur, " ");
-        ui_theme_text_set(txt, "");
+    const bool is_blank = (blank || idx < 0 || idx >= count);
+    /* A blank row always shows the cleared (unfocused) state, whatever the
+     * caller passed for `selected`. */
+    const bool want_sel = is_blank ? false : selected;
+
+    /* Change-guard (see the shadow documentation in ui_widgets.h): skip the
+     * style setters when the row already shows exactly this state. Only the
+     * text can still differ, and ui_theme_text_set() compares it. Without
+     * this, every refresh pass — i.e. every 16 ms for the 850 ms a toast is
+     * up — invalidated all six rows and the shared SPI2 bus paid for it. */
+    if (list->painted[row] && list->blank[row] == is_blank &&
+        list->selected[row] == want_sel) {
+        if (is_blank) {
+            ui_theme_text_set(cur, " ");
+            ui_theme_text_set(txt, "");
+        }
+        else {
+            ui_theme_text_set(cur, selected ? ">" : " ");
+            ui_theme_text_set(txt, text ? text : "");
+        }
         return;
     }
 
-    ui_list_row_focus(list, row, selected);
-    ui_theme_text_set(cur, selected ? ">" : " ");
-    /* Recolour every pass, not only on a selection change: the underlying list
-     * can be swapped underneath us (cache load, live scan, SD hotplug) and a
-     * change-gated repaint leaves the accent on the wrong row. */
-    ui_theme_set_color(cur, UI_COLOR_ACCENT);
-    ui_theme_set_color(txt, selected ? UI_COLOR_ACCENT : UI_COLOR_TEXT_DIM);
-    ui_theme_text_set(txt, text ? text : "");
+    if (is_blank) {
+        ui_list_row_focus(list, row, false);
+        ui_theme_text_set(cur, " ");
+        ui_theme_text_set(txt, "");
+    }
+    else {
+        ui_list_row_focus(list, row, selected);
+        ui_theme_text_set(cur, selected ? ">" : " ");
+        /* The two colours are pure functions of `selected`, so the shadow
+         * above covers the old "recolour every pass" rule: a selection move
+         * flips the shadow on both affected rows, and a content swap goes
+         * through ui_list_invalidate_paint(). */
+        ui_theme_set_color(cur, UI_COLOR_ACCENT);
+        ui_theme_set_color(txt, selected ? UI_COLOR_ACCENT : UI_COLOR_TEXT_DIM);
+        ui_theme_text_set(txt, text ? text : "");
+    }
+
+    list->painted[row]  = true;
+    list->blank[row]    = is_blank;
+    list->selected[row] = want_sel;
 }
 
 /* ---- Launcher tiles --------------------------------------------------------- */
