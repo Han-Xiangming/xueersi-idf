@@ -164,9 +164,14 @@ void ui_refresh_bt(void)
             hw_audio_set_route(AUDIO_ROUTE_BT);
         }
         else if (bluetooth_audio_pair_state() == BT_PAIR_PAIRING) {
-            /* Show the SSP passkey so the user can verify it on the sink. */
+            /* Just Works: no code to verify. A passkey is only shown when a
+             * non-conforming peer forced numeric comparison (informational). */
             char st[28];
-            snprintf(st, sizeof(st), "配对码 %06u", (unsigned)bluetooth_audio_passkey());
+            if (bluetooth_audio_passkey() != 0) {
+                snprintf(st, sizeof(st), "配对码 %06u", (unsigned)bluetooth_audio_passkey());
+            } else {
+                snprintf(st, sizeof(st), "配对中 %s", bluetooth_audio_peer_name());
+            }
             st[27] = '\0';
             ui_theme_text_set(s_ui.bt_status, st);
             ui_set_hint("配对中... B返回");

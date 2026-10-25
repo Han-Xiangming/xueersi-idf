@@ -43,7 +43,7 @@ bluetooth_audio_disconnect()     断开但保留栈
 bluetooth_audio_peer_name()      已连/连接中设备名
 ```
 
-- 配对进度 `bt_pair_state_t`：`CONNECTING → PAIRING（SSP 数值比较，`bluetooth_audio_passkey()` 取 6 位密钥给 UI 显示）→ OK / FAIL`。
+- 配对进度 `bt_pair_state_t`：`CONNECTING → PAIRING（SSP 进行中）→ OK / FAIL`。**配对模型为纯 Just Works**：`bluetooth_audio_enable()` 显式声明 IO 能力 `NoInputNoOutput`（`esp_bt_gap_set_security_param(ESP_BT_SP_IOCAP_MODE)`），与手机/对端协商全自动零交互配对——与耳机/音箱的配对体验一致；屏幕上不要求核对配对码（数字比对只有用户真能在两端核对时才有 MITM 防护，键盘-less  sink 自动确认等于没有，故不采用）。`CFM_REQ`/`KEY_NOTIF` 仅作不合规对端强制数值比较时的防御性自动确认回退；老对端（2.0）走 Legacy PIN 时自动回固定 `1234`。
 - **扫描过滤**：仅保留 COD 有效（`esp_bt_gap_is_valid_cod`）的设备；已去掉 RENDERING-only 过滤，手机/音箱等省略 rendering 服务位的设备也能看到（能否 A2DP 连接仍由对端决定）。
 - **连接自动重试**：首次拨号常因 "remote features unknown" 竞态失败，FreeRTOS 定时器以 3.5s 退避自动重拨（`bluetooth_audio_connect_index` 置起 `s_conn_auto`），最多 4 次后才回到 UI "A重试"，避免用户反复按 A。重试跑在 Timer 服务任务而非 BTC 任务，重拨时不会阻塞协议栈回调。
 

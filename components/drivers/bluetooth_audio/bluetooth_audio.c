@@ -292,16 +292,19 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
     }
 #if defined(CONFIG_BT_SSP_ENABLED)
     case ESP_BT_GAP_CFM_REQ_EVT:
-        /* SSP numeric comparison: expose the passkey to the UI, then confirm
-         * (we have no keyboard; the number is shown for the user to verify
-         * against the sink if it has a display). */
+        /* We declare NoInputNoOutput, so conforming peers negotiate Just Works
+         * and never ask. This is the fallback for a peer that forces numeric
+         * comparison anyway: confirm without user interaction (we have no
+         * keyboard). The number is shown for information only — with Just
+         * Works there is deliberately no on-device verification step. */
         s_passkey = param->cfm_req.num_val;
         s_pair_state = BT_PAIR_PAIRING;
-        ESP_LOGI(TAG, "SSP confirm, passkey %06u", (unsigned)s_passkey);
+        ESP_LOGI(TAG, "SSP confirm requested (Just Works fallback), passkey %06u",
+                 (unsigned)s_passkey);
         esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
         break;
     case ESP_BT_GAP_KEY_NOTIF_EVT:
-        /* Peer will type this passkey on its side; just display it. */
+        /* Peer will type this passkey on its side; nothing to do here. */
         s_passkey = param->key_notif.passkey;
         s_pair_state = BT_PAIR_PAIRING;
         ESP_LOGI(TAG, "SSP passkey notify %06u", (unsigned)s_passkey);
@@ -545,7 +548,9 @@ void bluetooth_audio_set_sink_volume(uint8_t volume_pct)
     s_avrc_tl = (uint8_t)((s_avrc_tl + 1) & 0x0F);
     s_sink_vol_valid = true;
     s_sink_vol = vol127;
-    ESP_LOGI(TAG, "sink volume -> %u%% (%u/127)", (unsigned)volume_pct, vol127);
+    /* DEBUG, not INFO: a volume ramp (hold acceleration) pushes once per key
+     * repeat, and INFO flooded the console with a line per step. */
+    ESP_LOGD(TAG, "sink volume -> %u%% (%u/127)", (unsigned)volume_pct, vol127);
 }
 
 /* AVRCP Controller callback: we hold the CT role only to mirror our own
@@ -570,7 +575,9 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
         }
         break;
     case ESP_AVRC_CT_SET_ABSOLUTE_VOLUME_RSP_EVT:
-        ESP_LOGI(TAG, "sink applied volume %u/127",
+        /* DEBUG: pairs with the push log above — one line per ramp step at
+         * INFO was pure noise. */
+        ESP_LOGD(TAG, "sink applied volume %u/127",
                  (unsigned)param->set_volume_rsp.volume);
         break;
     default:
@@ -707,6 +714,22 @@ void bluetooth_audio_enable(void)
 
     esp_bt_gap_register_callback(gap_cb);
     esp_bt_gap_set_device_name("Xiaomao MP3");
+
+    /* Declare NoInputNoOutput so every SSP negotiation with a phone/peer lands
+     * on Just Works: pairing completes with zero user interaction, the way
+     * headsets and speakers pair. We do have a screen, but a 6-digit numeric
+     * comparison only buys MITM protection if the user actually checks the
+     * code on BOTH devices — auto-confirming it (which a keypad-less sink must
+     * do anyway) provides none, so the headless-audio model is the honest one.
+     * The CFM_REQ / KEY_NOTIF handlers below remain as a defensive fallback for
+     * non-conforming peers that force a numeric comparison anyway. */
+    uint8_t io_cap = ESP_BT_IO_CAP_NONE;
+    esp_err_t cap_err = esp_bt_gap_set_security_param(ESP_BT_SP_IOCAP_MODE,
+                                                      &io_cap, sizeof(io_cap));
+    if (cap_err != ESP_OK) {
+        ESP_LOGW(TAG, "set IO capability failed: %s", esp_err_to_name(cap_err));
+    }
+
     /* Source dials out; stay non-discoverable but connectable. */
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
 

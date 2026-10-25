@@ -86,7 +86,9 @@ const char *bluetooth_audio_peer_name(void);
 typedef enum {
     BT_PAIR_IDLE = 0,       /* nothing in progress */
     BT_PAIR_CONNECTING,     /* esp_a2d_source_connect() issued */
-    BT_PAIR_PAIRING,        /* SSP numeric comparison: passkey available */
+    BT_PAIR_PAIRING,        /* SSP in progress (Just Works; passkey below is
+                             * informational — shown only when a non-conforming
+                             * peer forces numeric comparison) */
     BT_PAIR_OK,             /* authentication finished successfully */
     BT_PAIR_FAIL,           /* authentication / connection failed */
 } bt_pair_state_t;
