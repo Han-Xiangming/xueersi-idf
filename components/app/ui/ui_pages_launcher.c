@@ -259,9 +259,3 @@ ui_page_t ui_launcher_page(void)
 {
     return s_launch[s_launch_sel].page;
 }
-
-void ui_launcher_reset(void)
-{
-    s_launch_sel = 0;
-    ui_launcher_indicator_place();   /* snap cursor back without glide */
-}

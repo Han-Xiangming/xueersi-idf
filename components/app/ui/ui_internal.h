@@ -208,7 +208,6 @@ void ui_build_launcher(void);
 void ui_refresh_launcher(void);
 void ui_launcher_nav(uint32_t key);     /* UP/DOWN/LEFT/RIGHT over the grid */
 ui_page_t ui_launcher_page(void);      /* page of the current selection */
-void ui_launcher_reset(void);
 
 /* ---- Page: ebook (list + reader) ---- */
 void ui_build_ebook_list(lv_obj_t *page);

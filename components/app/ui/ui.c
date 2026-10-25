@@ -422,7 +422,9 @@ static void ui_build_page_content(lv_obj_t *page)
 void ui_show_menu(void)
 {
     ui_nav_home();
-    ui_launcher_reset();
+    /* The launcher deliberately keeps its selection (s_launch_sel): exiting a
+     * page with B lands on the tile the user entered from, instead of snapping
+     * back to the first slot. */
     if (s_ui.page) {
         lv_obj_add_flag(s_ui.page, LV_OBJ_FLAG_HIDDEN);
     }
