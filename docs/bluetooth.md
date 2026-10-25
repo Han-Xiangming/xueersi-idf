@@ -70,7 +70,7 @@ bluetooth_audio_set_avrc_cmd_cb(cb);      /* BT_AVRC_CMD_PLAY/PAUSE/STOP/NEXT/PR
 bluetooth_audio_set_avrc_volume_cb(cb);   /* 绝对音量 0..127，应用侧按满刻度写蓝牙音量槽位 */
 ```
 
-- 音量映射：AVRCP 满刻度 0..127 → `hw_audio_set_avrc_volume()` 按满刻度查 0.1dB 表（每步 ≈ 0.32dB），写蓝牙槽位并更新百分比视图（与本地音量共用同一 dB 锥度表，见 `docs/audio.md` §2）。
+- 音量映射：AVRCP 满刻度 0..127 → `hw_audio_set_avrc_volume()` 按满刻度查蓝牙路由 0.1dB 表（每步 ≈ 0.09dB，满量程 12dB），写蓝牙槽位并更新百分比视图；本地按键步进同为 1dB（见 `docs/audio.md` §2）。
 - main.c 回调：PLAY 仅当**已暂停**时恢复；PAUSE 仅当**播放中**时暂停；STOP 停止；NEXT/PREV 忽略（播放器无列表导航，仅记日志）。
 
 ## 6. 与其它模块接口

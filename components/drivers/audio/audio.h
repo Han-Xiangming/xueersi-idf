@@ -58,15 +58,20 @@ void hw_audio_set_route_change_cb(audio_route_change_cb_t cb);
 /* Volume (0..100 %) of the ACTIVE route: while a Bluetooth sink is linked
  * and BT output is on, the BT volume is adjusted; otherwise the speaker
  * volume. The two routes keep independent settings (see the route-specific
- * accessors below). */
+ * accessors below) AND independent taper depths: the speaker route maps
+ * 0..100 % onto 0..-40 dB (the amp's usable range), the BT route onto only
+ * 0..-12 dB because the sink mirrors our level and attenuates again on its
+ * side — a deep local taper there multiplied out and made the low end of the
+ * knob silent. */
 void hw_audio_set_volume(uint8_t volume_pct);
 uint8_t hw_audio_get_volume(void);
 
 /* Step the ACTIVE route's volume by a fixed amount in dB (+ louder / - quieter),
  * resolved through the SAME perceptual taper as set_volume (linear dB over the
- * 0..100 % range). Because the taper is dB-linear, a fixed dB step is a constant
- * audible change anywhere on the knob — the unified step+curve model. Clamped
- * to the 0..100 % ends; the percent view is rounded to the nearest integer. */
+ * 0..100 % range, route-specific depth). Because the taper is dB-linear, a
+ * fixed dB step is a constant audible change anywhere on the knob — the unified
+ * step+curve model. Clamped to the route's ends; the percent view is rounded to
+ * the nearest integer (on the 12 dB BT route a 1 dB step is ~8 % of the knob). */
 void hw_audio_volume_step_db(float step_db);
 
 /* Route-specific volumes (0..100 %), for NVS persistence / restore. */
@@ -75,12 +80,12 @@ uint8_t hw_audio_get_speaker_volume(void);
 void hw_audio_set_bt_volume(uint8_t volume_pct);
 uint8_t hw_audio_get_bt_volume(void);
 
-/* AVRCP absolute volume (0..127, full remote scale) with equal ~0.32 dB
- * steps, sharing the same gain table as set_volume. Always writes the BT
- * route's slot (the remote is a Bluetooth peer); the live gain and the percent
- * view follow only while the BT route is active — on the speaker route the
- * value is stored for the next route switch and the speaker keeps its own
- * volume. */
+/* AVRCP absolute volume (0..127, full remote scale) with equal ~0.09 dB
+ * steps over the BT route's 12 dB taper (see set_volume). Always writes the
+ * BT route's slot (the remote is a Bluetooth peer); the live gain and the
+ * percent view follow only while the BT route is active — on the speaker
+ * route the value is stored for the next route switch and the speaker keeps
+ * its own volume. */
 void hw_audio_set_avrc_volume(uint8_t volume_0_127);
 
 /* Listener for Bluetooth-route volume changes (local buttons, NVS restore,

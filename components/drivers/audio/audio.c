@@ -265,7 +265,7 @@ static uint8_t s_volume = 30;            /* active route volume (UI view) */
 static int32_t s_vol_gain;               /* target Q15 linear gain */
 static int32_t s_vol_gain_sm;            /* smoothed gain actually applied */
 
-/* Perceptual volume taper (built once at init into s_vol_tab).
+/* Perceptual volume taper (built once at init into s_vol_tab / s_vol_tab_bt).
  *
  * A plain quadratic gain (v/100)² is concave in dB: near full scale a 5% step
  * is <1 dB, below the ear's just-noticeable-difference, so the top of the
@@ -273,10 +273,11 @@ static int32_t s_vol_gain_sm;            /* smoothed gain actually applied */
  * (a true audio/log taper) so EVERY percent is the same number of dB and the
  * difference between adjacent settings is always clearly audible:
  *
- *     gain_dB(v) = (v/100 - 1) * VOL_MAX_ATTEN_DB      (0 dB at v=100)
+ *     gain_dB(v) = (v/100 - 1) * MAX_ATTEN_DB(route)   (0 dB at v=100)
  *     gain_lin   = 10^(gain_dB / 20)
  *     Q15        = gain_lin * 32767
  *
+ *   speaker route (0..-40 dB, matches the MAX98357 amp's usable range):
  *   vol   gain(Q15)  level(dB)   5% step (dB)
  *   100   32767        0.0        ~2.0 each (constant & obvious)
  *    70    8231      -12.0
@@ -285,15 +286,25 @@ static int32_t s_vol_gain_sm;            /* smoothed gain actually applied */
  *    10     519      -36.0
  *     0       0        -∞          mute
  *
- * The table is built at 0.1 dB resolution (not per-percent) so the AVRCP
- * remote scale (0..127) also resolves to uniform ~0.32 dB steps. Mapping it
- * through the coarse percent grid instead made consecutive remote presses
- * alternate "no change / one step" and feel uneven. */
-#define VOL_MAX_ATTEN_DB 40   /* total attenuation at v=1 (silence ≈ -40 dB);
-                               * every 5% press ≈ 2 dB — clearly audible */
-#define VOL_TAB_STEP_DB  0.1f /* table resolution: 0.1 dB per entry */
-#define VOL_TAB_ENTRIES  ((VOL_MAX_ATTEN_DB * 10) + 1)  /* 40 dB / 0.1 dB + 0 dB */
-static int32_t s_vol_tab[VOL_TAB_ENTRIES];
+ *   BT route (0..-12 dB): the A2DP sink applies its OWN volume — we mirror
+ *   ours to it via AVRCP absolute volume, so the sink attenuates AGAIN on
+ *   its side. A deep local taper would MULTIPLY with the sink's and the low
+ *   end of the knob went silent (25 % used to be ≈ -30 dB local × the sink's
+ *   own ≈ -25 dB ≈ -55 dB total). The BT route therefore only trims locally
+ *   (±12 dB of authority); the sink does the coarse attenuation. 25 % now
+ *   lands at ≈ -9 dB local, clearly audible through any sink setting.
+ *
+ * Both tables are built at 0.1 dB resolution (not per-percent) so the AVRCP
+ * remote scale (0..127) also resolves to uniform steps. Mapping it through
+ * the coarse percent grid instead made consecutive remote presses alternate
+ * "no change / one step" and feel uneven. */
+#define VOL_SPK_MAX_ATTEN_DB 40  /* speaker: total attenuation at v=0; every 5% press
+                                  * ≈ 2 dB — clearly audible */
+#define VOL_BT_MAX_ATTEN_DB  12  /* BT: local trim only; the sink mirrors the rest */
+#define VOL_TAB_STEP_DB  0.1f    /* table resolution: 0.1 dB per entry */
+#define VOL_TAB_ENTRIES(MAX_DB)  ((int)((MAX_DB) * 10) + 1)  /* depth / 0.1 dB + 0 dB */
+static int32_t s_vol_tab[VOL_TAB_ENTRIES(VOL_SPK_MAX_ATTEN_DB)];    /* 401: 0..-40 dB */
+static int32_t s_vol_tab_bt[VOL_TAB_ENTRIES(VOL_BT_MAX_ATTEN_DB)];  /* 121: 0..-12 dB */
 
 /* First-order gain smoothing (anti-zipper): s_vol_gain_sm chases s_vol_gain
  * with a ~5 ms time constant, so a volume change ramps between levels instead
@@ -309,27 +320,41 @@ static int32_t s_lp_state[2];         /* per-channel LP history */
 static int32_t s_loud_boost;          /* target boost, Q15 */
 static int32_t s_loud_boost_sm;       /* smoothed boost, Q15 */
 
-static int vol_tab_index(float dB)
+/* Index into a taper table of depth `max_db` for the attenuation `dB`
+ * (0 at full scale, -max_db at silence). Rounded to the nearest 0.1 dB
+ * entry and clamped to the table ends. */
+static int vol_tab_index(float dB, float max_db)
 {
-    if (dB <= -(float)VOL_MAX_ATTEN_DB) {
+    if (dB <= -max_db) {
         return 0;
     }
     if (dB >= 0.0f) {
-        return VOL_TAB_ENTRIES - 1;
+        return (int)(max_db / VOL_TAB_STEP_DB);
     }
-    return (int)((dB + (float)VOL_MAX_ATTEN_DB) / VOL_TAB_STEP_DB + 0.5f);
+    return (int)((dB + max_db) / VOL_TAB_STEP_DB + 0.5f);
 }
 
 static void audio_build_vol_table(void)
 {
-    for (int i = 0; i < VOL_TAB_ENTRIES; i++) {
-        float dB = -(float)VOL_MAX_ATTEN_DB + i * VOL_TAB_STEP_DB;
+    /* Speaker table: 0..-40 dB. */
+    for (int i = 0; i < VOL_TAB_ENTRIES(VOL_SPK_MAX_ATTEN_DB); i++) {
+        float dB = -(float)VOL_SPK_MAX_ATTEN_DB + i * VOL_TAB_STEP_DB;
         float g = powf(10.0f, dB / 20.0f);
         int32_t val = (int32_t)(g * 32767.0f + 0.5f);
         if (val > 32767) {
             val = 32767;
         }
         s_vol_tab[i] = val;
+    }
+    /* BT table: 0..-12 dB (see the taper comment above). */
+    for (int i = 0; i < VOL_TAB_ENTRIES(VOL_BT_MAX_ATTEN_DB); i++) {
+        float dB = -(float)VOL_BT_MAX_ATTEN_DB + i * VOL_TAB_STEP_DB;
+        float g = powf(10.0f, dB / 20.0f);
+        int32_t val = (int32_t)(g * 32767.0f + 0.5f);
+        if (val > 32767) {
+            val = 32767;
+        }
+        s_vol_tab_bt[i] = val;
     }
 }
 
@@ -354,6 +379,21 @@ static void audio_update_loudness_boost(void)
 static bool audio_route_is_bt(void)
 {
     return s_route == AUDIO_ROUTE_BT;
+}
+
+/* Active route's taper depth (dB) and gain table. The BT route's shallow
+ * 12 dB depth is what keeps the low end of the knob audible: the sink
+ * mirrors our percent and attenuates again on its side (see the taper
+ * comment above). */
+static float vol_active_max_db(void)
+{
+    return audio_route_is_bt() ? (float)VOL_BT_MAX_ATTEN_DB
+                               : (float)VOL_SPK_MAX_ATTEN_DB;
+}
+
+static const int32_t *vol_active_tab(void)
+{
+    return audio_route_is_bt() ? s_vol_tab_bt : s_vol_tab;
 }
 
 /* Forward declarations (defined later in this file). */
@@ -441,8 +481,9 @@ static void audio_update_vol_gain(void)
         s_vol_gain = 0;                  /* hard mute */
         return;
     }
-    float dB = ((float)v / 100.0f - 1.0f) * (float)VOL_MAX_ATTEN_DB;
-    s_vol_gain = s_vol_tab[vol_tab_index(dB)];
+    const float max_db = vol_active_max_db();
+    float dB = ((float)v / 100.0f - 1.0f) * max_db;
+    s_vol_gain = vol_active_tab()[vol_tab_index(dB, max_db)];
     audio_update_loudness_boost();
 }
 
@@ -1005,11 +1046,13 @@ uint8_t hw_audio_get_volume(void)
 }
 
 /* Fixed-dB volume step on the ACTIVE route. The percent↔gain map is dB-linear
- * (see audio_update_vol_gain: dB = (v/100 - 1) * VOL_MAX_ATTEN_DB), so stepping
+ * (see audio_update_vol_gain: dB = (v/100 - 1) * route depth), so stepping
  * by a constant dB is a constant perceived-loudness change everywhere on the
  * knob — no position-dependent "fine near silence / coarse above" patch needed.
- * Convert percent→dB, apply the step, clamp to the 0..100 % (= 0..-40 dB) ends,
- * then round back to the nearest integer percent. */
+ * Convert percent→dB, apply the step, clamp to the route's ends, then round
+ * back to the nearest integer percent. NOTE: on the BT route the depth is only
+ * 12 dB, so a 1 dB step is ~8 % of the percent knob (the loudness change is
+ * still 1 dB; the readout simply moves in bigger jumps there). */
 void hw_audio_volume_step_db(float step_db)
 {
     int v = (int)s_volume;
@@ -1019,15 +1062,16 @@ void hw_audio_volume_step_db(float step_db)
     else if (v > 100) {
         v = 100;
     }
-    float dB = ((float)v / 100.0f - 1.0f) * (float)VOL_MAX_ATTEN_DB;
+    const float max_db = vol_active_max_db();
+    float dB = ((float)v / 100.0f - 1.0f) * max_db;
     dB += step_db;
     if (dB > 0.0f) {
         dB = 0.0f;
     }
-    if (dB < -(float)VOL_MAX_ATTEN_DB) {
-        dB = -(float)VOL_MAX_ATTEN_DB;
+    if (dB < -max_db) {
+        dB = -max_db;
     }
-    int pct = (int)((dB / (float)VOL_MAX_ATTEN_DB + 1.0f) * 100.0f + 0.5f);
+    int pct = (int)((dB / max_db + 1.0f) * 100.0f + 0.5f);
     if (pct < 0) {
         pct = 0;
     }
@@ -1115,13 +1159,13 @@ uint8_t hw_audio_get_bt_volume(void)
 }
 
 /* AVRCP absolute volume (0..127, full remote scale): each remote step is an
- * equal ~0.32 dB (40/127) change, resolved through the same 0.1 dB gain table
- * as the local percent volume, so the remote and the buttons share one
- * consistent taper. Always writes the BT route's slot (the remote is a
- * Bluetooth peer); the live gain and the percent view follow only while the
- * BT route is active. On the speaker route the value is stored for the next
- * route switch — a remote command must never hijack the speaker output, and
- * no sink echo is sent either (the sink is already at that value). */
+ * equal ~0.09 dB (12/127) change, resolved through the BT route's 0.1 dB gain
+ * table, so the remote and the buttons share one consistent taper. Writes the
+ * BT route's slot (the remote is a Bluetooth peer); the live gain and the
+ * percent view follow only while the BT route is active. On the speaker route
+ * the value is stored for the next route switch — a remote command must never
+ * hijack the speaker output, and no sink echo is sent either (the sink is
+ * already at that value). */
 void hw_audio_set_avrc_volume(uint8_t volume_0_127)
 {
     if (volume_0_127 > 127) {
@@ -1139,8 +1183,8 @@ void hw_audio_set_avrc_volume(uint8_t volume_0_127)
         audio_update_loudness_boost();
         return;
     }
-    float dB = ((float)volume_0_127 / 127.0f - 1.0f) * (float)VOL_MAX_ATTEN_DB;
-    s_vol_gain = s_vol_tab[vol_tab_index(dB)];
+    float dB = ((float)volume_0_127 / 127.0f - 1.0f) * (float)VOL_BT_MAX_ATTEN_DB;
+    s_vol_gain = s_vol_tab_bt[vol_tab_index(dB, VOL_BT_MAX_ATTEN_DB)];
     audio_update_loudness_boost();
 }
 
