@@ -10,7 +10,8 @@
  * Connection flow (we are the SOURCE, so we must dial out):
  *   scan -> devices with a RENDERING class-of-device collected into a list ->
  *   the user picks one in the BLUETOOTH UI page -> esp_a2d_source_connect() ->
- *   CONNECTED -> CHECK_SRC_RDY -> MEDIA START -> data callback pulls PCM.
+ *   CONNECTED -> settle delay -> CHECK_SRC_RDY -> MEDIA START -> data callback
+ *   pulls PCM.
  */
 #include "bluetooth_audio.h"
 
@@ -213,6 +214,29 @@ static void bt_set_connectable(bool on)
                              ESP_BT_NON_DISCOVERABLE);
 }
 
+/* Deferred media start. Bluedroid lets the SOURCE decide when the stream
+ * begins (we drive CHECK_SRC_RDY -> START), and starting it the millisecond the
+ * A2DP channel opens races the sink: its media RX and AVRCP channel are
+ * usually still coming up, and a stream that outruns them congests the L2CAP
+ * channel (the "l2cab is_cong_cback_context" flood, see the bitpool comment
+ * below) until the sink suspends and drops the link. One observed session:
+ * media started +1 ms after CONNECTED, AVRCP only came up +1.3 s, and the sink
+ * suspended the stream 4 s in. A short settle delay before the first media
+ * request is the standard mitigation in A2DP source designs. */
+#define BT_MEDIA_START_DELAY_MS  500
+
+static TimerHandle_t s_media_start_timer;
+
+static void bt_media_start_cb(TimerHandle_t t)
+{
+    (void)t;
+    if (!s_connected || s_disabling) {
+        return;                     /* link gone before the delay elapsed */
+    }
+    ESP_LOGI(TAG, "settle done, requesting media start");
+    esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
+}
+
 /* Extract a human-readable device name from inquiry properties (direct BDNAME
  * or from the EIR blob). Returns false if the peer sent no name. */
 static bool bt_prop_get_name(esp_bt_gap_cb_param_t *param, char *out, size_t out_len)
@@ -395,8 +419,25 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
                 esp_a2d_source_disconnect(s_peer_bda);
                 break;
             }
-            ESP_LOGI(TAG, "A2DP connected, checking media readiness");
-            esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
+            ESP_LOGI(TAG, "A2DP connected, media start deferred %d ms",
+                     BT_MEDIA_START_DELAY_MS);
+            /* Do NOT request media yet: give the sink's media RX / AVRCP
+             * channel time to come up before the stream starts (see
+             * bt_media_start_cb). The timer is one-shot and re-armed on every
+             * fresh link. */
+            if (s_media_start_timer == NULL) {
+                s_media_start_timer = xTimerCreate(
+                    "bt_media", pdMS_TO_TICKS(BT_MEDIA_START_DELAY_MS),
+                    pdFALSE, NULL, bt_media_start_cb);
+            }
+            if (s_media_start_timer != NULL) {
+                xTimerStart(s_media_start_timer, 0);   /* settle, then CHECK_SRC_RDY */
+            }
+            else {
+                /* Timer allocation failed: fall back to the immediate start
+                 * rather than never streaming. */
+                esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
+            }
             /* Mirror the device volume to the sink. The AVRCP CT channel is
              * usually still coming up at this point (its connected event
              * repeats the push then); the last-sent dedupe in
@@ -418,6 +459,11 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
              * bt_conn_start() when the backoff fires; our own outgoing page
              * never needs page scan, so a closed window costs nothing. */
             bt_set_connectable(false);
+            /* A pending settle delay belongs to the dead link: drop it so it
+             * cannot request media on a link that is already gone. */
+            if (s_media_start_timer != NULL) {
+                xTimerStop(s_media_start_timer, 0);
+            }
             if (!s_connected && s_pair_state != BT_PAIR_IDLE && !s_ever_connected) {
                 /* The attempt never reached CONNECTED, i.e. it failed. If
                  * auto-retry is armed and we have attempts left, schedule
@@ -936,6 +982,9 @@ static void bluetooth_audio_teardown(void *param1, uint32_t param2)
     if (s_conn_timer != NULL) {
         xTimerStop(s_conn_timer, 0);
     }
+    if (s_media_start_timer != NULL) {
+        xTimerStop(s_media_start_timer, 0);
+    }
     s_peer_name[0] = '\0';
 
     ESP_LOGI(TAG, "BT audio disabled, controller powered off");
@@ -978,6 +1027,9 @@ void bluetooth_audio_disable(void)
         if (s_conn_timer != NULL) {
             xTimerStop(s_conn_timer, 0);
         }
+        if (s_media_start_timer != NULL) {
+            xTimerStop(s_media_start_timer, 0);   /* no media start on a dying link */
+        }
         if (s_discovering) {
             esp_bt_gap_cancel_discovery();   /* radio can't scan and drop */
         }
@@ -1002,10 +1054,14 @@ void bluetooth_audio_set_enabled(bool enabled)
 {
     s_enabled = enabled;
     if (!enabled) {
-        /* BT output turned off: stop any in-flight auto-retry. */
+        /* BT output turned off: stop any in-flight auto-retry and the pending
+         * media-start settle delay. */
         s_conn_auto = false;
         if (s_conn_timer != NULL) {
             xTimerStop(s_conn_timer, 0);
+        }
+        if (s_media_start_timer != NULL) {
+            xTimerStop(s_media_start_timer, 0);
         }
         if (s_connected) {
             esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
