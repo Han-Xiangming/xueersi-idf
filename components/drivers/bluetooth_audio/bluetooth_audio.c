@@ -175,7 +175,9 @@ static uint32_t s_dev_version;
  * dial out while the inquiry is still cancelling. Both clear up if we just try
  * again after a short backoff, so we retry a bounded number of times instead of
  * making the user hammer the A button. The retry runs from a FreeRTOS timer
- * (not the BTC task), which is a safe context for esp_a2d_* calls. */
+ * (not the BTC task), which is a safe context for esp_a2d_* calls. The retry
+ * re-dials through bt_conn_start(), which re-opens the connectable window for
+ * the duration of each attempt (see bt_set_connectable). */
 #define BT_CONNECT_RETRY_MS   (3500)   /* backoff between auto retries */
 #define BT_CONNECT_MAX_RETRY  (4)      /* give up after this many failures */
 static TimerHandle_t s_conn_timer;
@@ -188,6 +190,28 @@ static uint8_t       s_conn_retries;
  * device from the scan list, and so an unsolicited link can never hijack the
  * audio route or appear "connected" without being in the list. */
 static volatile bool s_user_dialing;
+
+/* Open/close the inbound connectable window.
+ *
+ * While idle we stay NON-CONNECTABLE: a paired sink auto-reconnects to its
+ * last source by PAGING us when it powers on or comes back in range. With
+ * page scan on, the controller accepts that ACL and Bluedroid brings up A2DP,
+ * and only THEN do we refuse it in a2d_cb — the user-visible result is a
+ * "connected, then instantly dropped" flicker that the sink keeps retrying.
+ * Refusing it earlier is not possible once the link exists, so the link must
+ * never be allowed to form: with page scan off the sink's page simply fails.
+ *
+ * The window is therefore open ONLY while a user-initiated dial-out is in
+ * flight (bt_conn_start), and closed again as soon as it resolves (linked,
+ * failed, or dropped). While a link is up no NEW inbound connection is ever
+ * needed — AVRCP and everything else ride the existing ACL — so staying
+ * non-connectable while connected is safe, and it is exactly what stops the
+ * sink from re-establishing a link we would only tear down again. */
+static void bt_set_connectable(bool on)
+{
+    esp_bt_gap_set_scan_mode(on ? ESP_BT_CONNECTABLE : ESP_BT_NON_CONNECTABLE,
+                             ESP_BT_NON_DISCOVERABLE);
+}
 
 /* Extract a human-readable device name from inquiry properties (direct BDNAME
  * or from the EIR blob). Returns false if the peer sent no name. */
@@ -335,8 +359,13 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             /* Reject any link we did not explicitly dial out (a sink that
              * auto-reconnects to its last source, or a remote page). The user
              * must pick a device from the scan list; an unsolicited link would
-             * otherwise hijack the audio route and never appear in the list. */
-            if (!s_user_dialing) {
+             * otherwise hijack the audio route and never appear in the list.
+             * The address check matters: the connectable window is open exactly
+             * while our dial-out is in flight, so an inbound link can only
+             * arrive then — s_user_dialing alone could not tell "our target
+             * connected" from "another sink's auto-reconnect slipped in". */
+            if (!s_user_dialing ||
+                memcmp(rem, s_peer_bda, sizeof(esp_bd_addr_t)) != 0) {
                 ESP_LOGW(TAG, "rejecting unsolicited A2DP connect %02x:%02x:%02x:"
                          "%02x:%02x:%02x", rem[0], rem[1], rem[2],
                          rem[3], rem[4], rem[5]);
@@ -350,8 +379,12 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             s_pair_state = BT_PAIR_OK;
             s_conn_auto = false;             /* link is up: stop auto-retry */
             s_conn_retries = 0;
-            /* Re-arm the PCM feed: a previous disconnect (or an auto-retry
-             * failure) may have frozen it; the link is live now. */
+            /* Dial-out resolved: the link rides this ACL from now on, so the
+             * connectable window can close — a sink that later drops and
+             * auto-reconnects must NOT be allowed to page us back in. */
+            bt_set_connectable(false);
+            /* Re-arm the PCM feed: a previous disconnect may have frozen it;
+             * the link is live now. */
             s_tx_stopped = false;
             memcpy(s_peer_bda, rem, sizeof(esp_bd_addr_t));  /* in case it differs */
             s_enabled = true;                /* a live link means BT output is on */
@@ -380,6 +413,11 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         }
         else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
             s_user_dialing = false;
+            /* Close the connectable window again so the sink cannot page us
+             * while we sit idle. An armed auto-retry re-opens it through
+             * bt_conn_start() when the backoff fires; our own outgoing page
+             * never needs page scan, so a closed window costs nothing. */
+            bt_set_connectable(false);
             if (!s_connected && s_pair_state != BT_PAIR_IDLE && !s_ever_connected) {
                 /* The attempt never reached CONNECTED, i.e. it failed. If
                  * auto-retry is armed and we have attempts left, schedule
@@ -405,7 +443,6 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
                 /* A live link dropped (user or remote). Don't auto-retry a
                  * session that was already up —let the user decide. */
                 s_pair_state = BT_PAIR_IDLE;
-                s_conn_auto = false;
             }
             s_connected = false;
             s_streaming = false;
@@ -730,8 +767,11 @@ void bluetooth_audio_enable(void)
         ESP_LOGW(TAG, "set IO capability failed: %s", esp_err_to_name(cap_err));
     }
 
-    /* Source dials out; stay non-discoverable but connectable. */
-    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+    /* Source dials out; stay non-discoverable and NON-CONNECTABLE when idle.
+     * The connectable window is opened only for the duration of a user
+     * dial-out (see bt_set_connectable / bt_conn_start) — see the comment on
+     * bt_set_connectable for why inbound page scan must stay off. */
+    esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
 
     /* Register the AVRCP Target role so a paired headset/speaker can drive
      * local playback and volume with its media keys. */
@@ -1032,10 +1072,14 @@ static bool bt_conn_start(void)
 {
     s_pair_state = BT_PAIR_CONNECTING;
     s_user_dialing = true;              /* mark this link as user-initiated */
+    /* Open the connectable window for this dial-out only (see
+     * bt_set_connectable). */
+    bt_set_connectable(true);
     esp_err_t err = esp_a2d_source_connect(s_peer_bda);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "connect failed: %s", esp_err_to_name(err));
         s_pair_state = BT_PAIR_FAIL;
+        bt_set_connectable(false);      /* dial-out never started: close again */
         return false;
     }
     ESP_LOGI(TAG, "connecting to '%s'...", s_peer_name);

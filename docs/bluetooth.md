@@ -45,7 +45,8 @@ bluetooth_audio_peer_name()      已连/连接中设备名
 
 - 配对进度 `bt_pair_state_t`：`CONNECTING → PAIRING（SSP 进行中）→ OK / FAIL`。**配对模型为纯 Just Works**：`bluetooth_audio_enable()` 显式声明 IO 能力 `NoInputNoOutput`（`esp_bt_gap_set_security_param(ESP_BT_SP_IOCAP_MODE)`），与手机/对端协商全自动零交互配对——与耳机/音箱的配对体验一致；屏幕上不要求核对配对码（数字比对只有用户真能在两端核对时才有 MITM 防护，键盘-less  sink 自动确认等于没有，故不采用）。`CFM_REQ`/`KEY_NOTIF` 仅作不合规对端强制数值比较时的防御性自动确认回退；老对端（2.0）走 Legacy PIN 时自动回固定 `1234`。
 - **扫描过滤**：仅保留 COD 有效（`esp_bt_gap_is_valid_cod`）的设备；已去掉 RENDERING-only 过滤，手机/音箱等省略 rendering 服务位的设备也能看到（能否 A2DP 连接仍由对端决定）。
-- **连接自动重试**：首次拨号常因 "remote features unknown" 竞态失败，FreeRTOS 定时器以 3.5s 退避自动重拨（`bluetooth_audio_connect_index` 置起 `s_conn_auto`），最多 4 次后才回到 UI "A重试"，避免用户反复按 A。重试跑在 Timer 服务任务而非 BTC 任务，重拨时不会阻塞协议栈回调。
+- **拨号自动重试**：首次拨号常因 "remote features unknown" 竞态失败，FreeRTOS 定时器以 3.5s 退避自动重拨（`bluetooth_audio_connect_index` 置起 `s_conn_auto`），最多 4 次后才回到 UI "A重试"，避免用户反复按 A。重试跑在 Timer 服务任务而非 BTC 任务，重拨时不会阻塞协议栈回调；每次重拨都经 `bt_conn_start()` 重新打开可连接窗口（见下条）。注意：这只是**本机拨号失败后的重拨**，与对端音箱的自动回连是两回事。
+- **不会自动回连已配对设备**：进入蓝牙页只扫描并展示设备列表，必须由用户在列表里选择一个设备才会 `esp_a2d_source_connect()` 拨号。**空闲时协议栈保持不可被连接**（`ESP_BT_NON_CONNECTABLE`），仅在拨号进行中打开可连接窗口、拨号结果落地（连上/失败/掉线）立即关闭——配对过的音箱开机或回到范围时会主动 page 我们，若允许建链再到 A2DP 层拒绝，用户看到的就是"连上→瞬间断开"的反复闪烁；page scan 关闭后对端的回连在控制器层直接失败，根本不会产生 A2DP 事件。窗口期内蹭进来的非目标链路（`s_user_dialing` 为真但 `remote_bda` 与拨号目标不符）同样在 `a2d_cb` 的 `CONNECTED` 里拒绝。开机/进蓝牙页不做任何回连。
 
 ## 4. PCM 输入与重采样
 
@@ -57,7 +58,7 @@ bluetooth_audio_set_sample_rate(hz)    A2DP/SBC 恒 44.1kHz，其它采样率内
 
 - 路由由 `audio.c` 的单一状态 `s_route` 决定：**连接成功会通过 `s_conn_state_cb`（`audio.c` 的 `hw_audio_on_bt_conn_state`）自动切到 `AUDIO_ROUTE_BT`**（手机式"蓝牙接管输出"体验），PCM 随即改喂蓝牙（音量、全频段，无喇叭侧的 HPF/限幅）；`hw_audio_write_pcm()` 只在开头读一次路由，绝不探测是否已连接。
   - **链路掉线会自动回喇叭**（`hw_audio_on_bt_conn_state`），无论当前在哪个 UI 页，保证喇叭会话立刻恢复。
-  - **不会自动重连已配对设备**：进入蓝牙页只扫描并展示设备列表，必须由用户在列表里选择一个设备才会 `esp_a2d_source_connect()` 拨号；任何非本机主动拨号建立的连接（对端自动重连 / 主动连入）都会在 `a2d_cb` 的 `CONNECTED` 里被拒绝，避免静默劫持路由或绕过列表。
+  - **不会自动重连已配对设备**：进入蓝牙页只扫描并展示设备列表，必须由用户在列表里选择一个设备才会 `esp_a2d_source_connect()` 拨号。**空闲时协议栈保持不可被连接**（`ESP_BT_NON_CONNECTABLE`），仅在用户拨号进行中打开可连接窗口、拨号结果落地（连上/失败/掉线）立即关闭——配对过的音箱开机或回到范围时会主动 page 我们，若允许建链再到 A2DP 层拒绝，用户看到的就是"连上→瞬间断开"的反复闪烁；page scan 关闭后对端的回连在控制器层直接失败，根本不会产生 A2DP 事件。窗口期内蹭进来的非目标链路（`s_user_dialing` 为真但 `remote_bda` 与拨号目标不符）同样在 `a2d_cb` 的 `CONNECTED` 里拒绝。
   - 蓝牙页的蓝牙总开关只改 `s_enabled` / 拆栈，**不切路由**（连接（用户操作）才触发路由切换，见 `docs/audio.md` §1）。
 - 数据回调 `a2d_data_cb`：栈按 44.1kHz 拉取；欠载时补静音保证流不断；teardown 期间返回 0 让 Bluedroid 自行静音填充。
 
