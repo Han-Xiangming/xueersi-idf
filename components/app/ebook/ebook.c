@@ -436,17 +436,67 @@ static size_t skip_newline(reader_t *r, size_t off)
     return off;
 }
 
+/* Emit one code point into the rendered line, honoring 标点压缩 for the
+ * full-width glyphs that have an ASCII-width equivalent. */
+static void emit_glyph(char *out, size_t *out_len, size_t cap,
+                       uint32_t cp, const uint8_t *raw, int len)
+{
+    uint8_t sub = (cp >= 0x80) ? compress_punct(cp) : 0;
+    if (sub) {
+        page_putc(out, out_len, cap, (char)sub);
+    } else if (cp < 0x80) {
+        page_putc(out, out_len, cap, (char)cp);
+    } else {
+        page_put_raw(out, out_len, cap, raw, len);
+    }
+}
+
+/* A code point that belongs to a (mostly ASCII) "word" and must never be
+ * split from its neighbours: alphanumerics, intra-word connectors, trailing
+ * punctuation that must not start a line, and composite tokens such as
+ * email/URL/code. Opening brackets and quotes are deliberately excluded so
+ * they remain a legal break point. Everything here is < 0x80 except a couple
+ * of non-ASCII closing quotes, so CJK line-breaking is unaffected. */
+static bool is_ascii_word_char(uint32_t cp)
+{
+    if (cp < 0x80) {
+        if ((cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z') ||
+            (cp >= '0' && cp <= '9')) {
+            return true;
+        }
+        switch (cp) {
+        case '-': case '\'': case '_':
+        case '.': case ',': case ';': case ':': case '!': case '?':
+        case ')': case ']': case '}':
+        case '%': case '&': case '+': case '=': case '@': case '#': case '/':
+            return true;
+        default:
+            return false;
+        }
+    }
+    /* non-ASCII closing quotes that must not start a line */
+    if (cp == 0xBB /* » */ || cp == 0x201D /* ” */) {
+        return true;
+    }
+    return false;
+}
+
 /* --- greedy line-fill engine (deterministic pagination) ---
  *
- * Pipeline:  scan glyphs  ->  emit  ->  break on newline OR width overflow.
+ * Pipeline:  scan glyphs  ->  emit  ->  break on newline / width overflow /
+ *            before an ASCII word that would overflow.
  *
- * fill_line() walks the source from *po, measuring each glyph with cp_width()
- * and emitting it. A line stops at the EARLIEST of:
+ * fill_line() walks the source from *po. A maximal run of "word" code points
+ * (is_ascii_word_char) is measured as a single unbreakable unit: if it does
+ * not fit on a non-empty line it is pushed to the next line whole, so English
+ * words are never split mid-word (e.g. the old "metal" -> "r/etal" bug).
+ * Everything else (CJK, spaces, punctuation, tabs) is emitted per glyph and
+ * may break between any two glyphs. A line also stops at the EARLIEST of:
  *   - a source newline (\n / \r / CRLF): preserved verbatim as a hard break;
- *   - the next glyph overflowing EBOOK_LINE_W16: a hard break is taken right
- *     before it, so the line is filled to the brim.
- * No other rule exists: no word integrity, no punctuation guard, no "--"
- * handling, no soft-line merging. Deterministic pagination follows. */
+ *   - the next glyph/word overflowing EBOOK_LINE_W16: a hard break is taken
+ *     right before it, so the line is filled to the brim.
+ * A word wider than a whole line degrades to character-by-character emission
+ * (line start only) so no text is lost. Deterministic pagination follows. */
 
 /* Fill one display line starting at *po. Emits glyphs into out[] and stops at
  * the first source newline or when the next glyph would overflow the line
@@ -482,6 +532,62 @@ static bool fill_line(reader_t *r, size_t *po, char *out, size_t *out_len,
             break;
         }
 
+        /* --- word-aware wrap: measure an ASCII/quote word run as one unit so it
+         * is never broken in the middle of a word. --- */
+        if (is_ascii_word_char((uint32_t)cp)) {
+            /* Measure the whole run first. */
+            size_t we = cur;
+            uint32_t ww = 0;
+            for (;;) {
+                uint8_t r2[4];
+                int l2;
+                int32_t c2 = reader_char(r, we, r2, &l2);
+                if (c2 < 0 || !is_ascii_word_char((uint32_t)c2)) {
+                    break;
+                }
+                ww += cp_width((uint32_t)c2);
+                we += (size_t)l2;
+            }
+
+            /* Push the whole word to the next line if it would overflow a
+             * non-empty line (break taken before the word). */
+            if (w16 > 0 && w16 + ww > EBOOK_LINE_W16) {
+                break;
+            }
+
+            /* A word longer than a full line at line start: emit it
+             * character-by-character so we never lose text or loop forever. */
+            if (w16 == 0 && ww > EBOOK_LINE_W16) {
+                for (;;) {
+                    if (w16 + cp_width((uint32_t)cp) > EBOOK_LINE_W16) {
+                        break;
+                    }
+                    emit_glyph(out, out_len, cap, (uint32_t)cp, raw, clen);
+                    w16 += cp_width((uint32_t)cp);
+                    *po = cur + (size_t)clen;
+                    cur = *po;
+                    int32_t nx = reader_char(r, cur, raw, &clen);
+                    if (nx < 0 || !is_ascii_word_char((uint32_t)nx)) {
+                        break;
+                    }
+                    cp = nx;
+                }
+                break;
+            }
+
+            /* Emit the whole run as a single unbreakable unit. */
+            for (size_t run = cur; run < we; ) {
+                uint8_t rr[4];
+                int rl;
+                int32_t rc = reader_char(r, run, rr, &rl);
+                emit_glyph(out, out_len, cap, (uint32_t)rc, rr, rl);
+                run += (size_t)rl;
+            }
+            w16 += ww;
+            *po = we;
+            continue;
+        }
+
         /* Normalize the emitted code point (tab -> space). */
         int32_t emit_cp = cp;
         uint8_t emit_raw[4];
@@ -509,15 +615,7 @@ static bool fill_line(reader_t *r, size_t *po, char *out, size_t *out_len,
             continue;
         }
 
-        /* Emit. */
-        uint8_t sub = (emit_cp >= 0x80) ? compress_punct((uint32_t)emit_cp) : 0;
-        if (sub) {
-            page_putc(out, out_len, cap, (char)sub);
-        } else if (emit_cp < 0x80) {
-            page_putc(out, out_len, cap, (char)emit_cp);
-        } else {
-            page_put_raw(out, out_len, cap, emit_raw, emit_len);
-        }
+        emit_glyph(out, out_len, cap, (uint32_t)emit_cp, emit_raw, emit_len);
         w16 += cw;
         *po = cur + (size_t)clen;
     }
