@@ -3,6 +3,7 @@
  * See lcd.h.
  */
 #include <assert.h>
+#include <math.h>
 #include <string.h>
 #include <sys/param.h>
 
@@ -54,18 +55,41 @@ static volatile bool s_lcd_first_flush_done;
 
 /* Non-linear (gamma-corrected) brightness curve. Human perception of
  * brightness is roughly logarithmic, so a linear 0..100% -> 0..1023 duty
- * map makes low steps invisible and high steps jumpy. This (BL_LUT_STEPS+1)
- * entry LUT (index 0..BL_LUT_STEPS, i.e. BL_LUT_STEPS levels) is precomputed
- * as:
- *     duty = round(BL_DUTY_MAX * (i / BL_LUT_STEPS)^2.2)
- * so equal percentage steps feel uniform to the eye. BL_LUT_STEPS mirrors the
- * public HW_LCD_BACKLIGHT_STEPS in lcd.h. */
+ * map makes low steps invisible and high steps jumpy. The (BL_LUT_STEPS+1)
+ * entry LUT (index 0..BL_LUT_STEPS) is built at run time so the dimmest
+ * visible level is a tunable floor rather than collapsing to 0:
+ *
+ *     lut[0]                       = 0                (the ONLY off level)
+ *     lut[i], i=1..BL_LUT_STEPS    = round(BL_LUT_MIN_ON
+ *                                 + (BL_DUTY_MAX - BL_LUT_MIN_ON)
+ *                                   * ((i-1)/(BL_LUT_STEPS-1))^BL_LUT_GAMMA)
+ *
+ * This guarantees a strictly increasing, always-visible range from
+ * BL_LUT_MIN_ON (dimmest) up to full brightness, with exactly one black
+ * level at index 0. Without the MIN_ON floor the first two entries both
+ * round to 0, creating a dark "dead zone" where two presses are needed to
+ * escape black. Tune BL_LUT_MIN_ON against real hardware. BL_LUT_STEPS
+ * mirrors the public HW_LCD_BACKLIGHT_STEPS in lcd.h. */
 #define BL_LUT_STEPS          HW_LCD_BACKLIGHT_STEPS
-static const uint16_t s_bl_lut[BL_LUT_STEPS + 1] = {
-    0, 0, 2, 6, 11, 17, 26, 36, 48, 63, 79, 98, 118, 141, 166, 193,
-    223, 255, 289, 326, 364, 406, 449, 494, 543, 593, 646, 701, 764, 820,
-    887, 957, 1023
-};
+#define BL_LUT_MIN_ON         30      /* dimmest visible 10-bit duty (0..1023) */
+#define BL_LUT_GAMMA          2.2f
+static uint16_t s_bl_lut[BL_LUT_STEPS + 1];
+
+/* Fill s_bl_lut[] with the gamma curve described above. Called once from
+ * backlight_init() before any duty is applied. */
+static void backlight_lut_init(void)
+{
+    s_bl_lut[0] = 0;   /* off */
+    for (int i = 1; i <= BL_LUT_STEPS; i++) {
+        float t = (float)(i - 1) / (BL_LUT_STEPS - 1);
+        float duty = BL_LUT_MIN_ON + (BL_DUTY_MAX - BL_LUT_MIN_ON) * powf(t, BL_LUT_GAMMA);
+        int d = (int)(duty + 0.5f);
+        if (d > BL_DUTY_MAX) {
+            d = BL_DUTY_MAX;
+        }
+        s_bl_lut[i] = (uint16_t)d;
+    }
+}
 
 /* Map a 0..100 % brightness to the nearest LUT level (0..BL_LUT_STEPS). */
 static inline uint8_t bl_percent_to_step(uint8_t percent)
@@ -496,6 +520,8 @@ static void backlight_init(void)
     if (s_bl_inited) {
         return;
     }
+
+    backlight_lut_init();   /* build gamma LUT before any duty is set */
 
     const ledc_timer_config_t timer_cfg = {
         .speed_mode      = LEDC_LOW_SPEED_MODE,
