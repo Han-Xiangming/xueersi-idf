@@ -191,7 +191,7 @@ static int read_adc_burst_mv(void)
         }
         else {
             if (raw < 0) raw = 0;
-            if (raw > (1 << 12)) raw = (1 << 12);
+            if (raw > ((1 << 12) - 1)) raw = (1 << 12) - 1;   /* 12-bit ADC max = 4095 */
             v_mv = (int)(((float)raw / (float)(1 << 12)) * BAT_ADC_VMAX_MV);
         }
         sum += v_mv;

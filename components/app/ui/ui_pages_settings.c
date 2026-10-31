@@ -108,6 +108,7 @@ typedef struct {
 } setting_entry_t;
 
 static const setting_entry_t s_settings_table[SETTING_COUNT] = {
+    [SETTING_NONE]        = { NULL, NULL, NULL, NULL, SET_GRP_AUDIO },   /* sentinel, never shown */
     [SETTING_VOLUME]      = {UI_STR_SET_VOL,    ui_set_vol_text,   ui_set_vol_lr,   NULL,              SET_GRP_AUDIO},
     [SETTING_MASTER_GAIN] = {UI_STR_SET_GAIN,  ui_set_gain_text,  ui_set_gain_lr,  NULL,              SET_GRP_AUDIO},
     [SETTING_BACKLIGHT]   = {UI_STR_SET_BACKLIGHT,    ui_set_bl_text,    ui_set_bl_lr,    NULL,              SET_GRP_DISPLAY},
@@ -375,7 +376,7 @@ void ui_refresh_settings(void)
     const int n = s_group_cnt[s_set_group];
     const setting_item_t *items = s_group_items[s_set_group];
     for (int i = 0; i < SETTING_COUNT; i++) {
-        if (i < n) {
+        if (i < n && items[i] != SETTING_NONE) {
             const int sel = (i == s_setting_sel);
             const setting_entry_t *e = &s_settings_table[items[i]];
             if (sel) {
@@ -419,9 +420,12 @@ void ui_settings_action(void)
         return;
     }
     /* ITEMS view: dispatch to the selected item's on_enter (action items like
-     * 重建列表 / 恢复出厂). Inert items do nothing. */
-    const setting_entry_t *e =
-        &s_settings_table[s_group_items[s_set_group][s_setting_sel]];
+     * 重建列表 / 恢复出厂). Inert / empty (SETTING_NONE) slots do nothing. */
+    const setting_item_t item = s_group_items[s_set_group][s_setting_sel];
+    if (item == SETTING_NONE) {
+        return;
+    }
+    const setting_entry_t *e = &s_settings_table[item];
     if (e->on_enter) {
         e->on_enter();
     }
@@ -440,8 +444,11 @@ void ui_settings_lr(int dir)
     if (s_set_view != SET_VIEW_ITEMS) {
         return;
     }
-    const setting_entry_t *e =
-        &s_settings_table[s_group_items[s_set_group][s_setting_sel]];
+    const setting_item_t item = s_group_items[s_set_group][s_setting_sel];
+    if (item == SETTING_NONE) {
+        return;
+    }
+    const setting_entry_t *e = &s_settings_table[item];
     if (e->on_lr) {
         e->on_lr(dir);          /* callback owns dirty-marking + set_action */
         ui_refresh();

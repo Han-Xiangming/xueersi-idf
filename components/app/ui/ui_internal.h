@@ -30,7 +30,8 @@
  * Adding an option = appending one id here plus one row to the settings table
  * in ui_pages_settings.c. */
 typedef enum {
-    SETTING_VOLUME = 0,
+    SETTING_NONE = 0,        /* sentinel: an empty/unused group slot */
+    SETTING_VOLUME,
     SETTING_MASTER_GAIN,
     SETTING_BACKLIGHT,
     SETTING_STANDBY,
