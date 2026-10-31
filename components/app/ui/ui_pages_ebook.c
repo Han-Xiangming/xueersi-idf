@@ -145,12 +145,16 @@ void ui_build_ebook_read(lv_obj_t *page)
     /* Single body label: the reader engine joins exactly 8 lines with '\n'
      * and measures with the same font, so the layout matches exactly. The
      * 16 px font's natural line height is 30 px; we compress it with a
-     * negative line-space so the effective row height becomes 22 px and the
-     * widget needs 8*22 = 176 px (y=36..212, just above the y=214 status bar). */
+     * negative line-space so the effective row pitch becomes 22 px. Rows sit
+     * at a 22 px pitch, but a row's INK is deeper than its pitch: baseline at
+     * +21 (line_height 30, base_line 9) and descender glyphs reach +24, so
+     * row 8 (top y=190) paints down to y=214. The label is therefore 180 px
+     * tall (y=36..216): 176 would clip the last 2 px of descenders off the
+     * last row. The status bar starts at y=218 (UI_LEGEND_Y), still clear. */
     lv_obj_t *txt = lv_label_create(page);
     lv_label_set_long_mode(txt, LV_LABEL_LONG_MODE_CLIP);
     lv_obj_set_pos(txt, 0, 36);
-    lv_obj_set_size(txt, 320, 176);
+    lv_obj_set_size(txt, 320, 180);
     lv_obj_set_style_text_font(txt, UI_FONT, 0);
     lv_obj_set_style_text_color(txt, lv_color_hex(UI_COLOR_TEXT), 0);
     lv_obj_set_style_text_line_space(txt, -8, 0);

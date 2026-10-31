@@ -61,7 +61,9 @@ static const char *TAG = "ebook";
  * validated by the book's content fingerprint + size, so a renamed/moved book
  * keeps its cache while a changed book is ignored and re-counted. */
 #define EBOOK_PAG_MAGIC  0x50414731U     /* "PAG1" */
-#define EBOOK_PAG_VER    1
+/* v2: cp_width() now quantizes advances to LVGL's whole-px rendering step, so
+ * page breaks moved slightly — old v1 sidecar tables no longer match. */
+#define EBOOK_PAG_VER    2
 /* Sidecar header = 8 x uint32_t (no padding): magic, ver, fp_lo, fp_hi,
  * size_lo, size_hi, page_count, table_count; followed by table_count offsets. */
 static void ebook_pag_save(void);   /* forward decl: used by ebook_count_task */
@@ -396,23 +398,35 @@ static void line_end(char *out, size_t *out_len, size_t cap,
 /* Width (1/16 px) of one code point, honoring 标点压缩: a compressible
  * full-width punctuation is measured at its narrow ASCII advance. CJK and the
  * bulk of full-width glyphs use EBOOK_CHAR_W16. The exact advances of the rare
- * typographic glyphs come from s_typ_w16. */
+ * typographic glyphs come from s_typ_w16.
+ *
+ * The result is QUANTIZED to the whole-pixel advance LVGL actually renders
+ * with: lv_font_get_glyph_dsc_fmt_txt() converts the stored 1/16 px adv_w via
+ * (adv_w + 8) >> 4 (round half up) and lv_draw_label steps the pen by that
+ * integer per glyph. Summing the raw fractional values instead lets an error
+ * of up to 0.5 px per glyph accumulate (≈4 px on a 40-char ASCII line), so
+ * lines filled to the brim rendered wider than measured and clipped at the
+ * right screen edge. Quantizing every advance here keeps the line-fill
+ * arithmetic in 1/16 px units (callers unchanged) while making each summed
+ * step identical to the rendered one. */
 static uint32_t cp_width(uint32_t cp)
 {
+    uint32_t w;
     if (cp < 0x80) {
         /* Outside the printable ASCII range (control chars etc.) measure as a
          * space so they don't corrupt line-fill accounting. */
-        return (cp >= 0x20) ? s_ascii_w16[cp] : s_ascii_w16[0x20];
+        w = (cp >= 0x20) ? s_ascii_w16[cp] : s_ascii_w16[0x20];
+    } else {
+        uint8_t sub = compress_punct(cp);
+        if (sub) {
+            w = s_ascii_w16[sub];
+        } else if (typ_adv_w(cp, &w)) {
+            /* w set by typ_adv_w */
+        } else {
+            w = EBOOK_CHAR_W16;
+        }
     }
-    uint8_t sub = compress_punct(cp);
-    if (sub) {
-        return s_ascii_w16[sub];
-    }
-    uint32_t w;
-    if (typ_adv_w(cp, &w)) {
-        return w;
-    }
-    return EBOOK_CHAR_W16;
+    return (w + 8) & ~0xFU;              /* round to LVGL's whole-px advance */
 }
 
 /* Skip one newline sequence (LF, or CR / CRLF) at `off`. Returns the offset
