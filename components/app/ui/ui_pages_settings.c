@@ -722,10 +722,16 @@ static const char *ui_set_bt_bitpool_text(void)
 
 static void ui_set_bt_bitpool_lr(int dir)
 {
-    /* LEFT = more robust (lower bitpool), RIGHT = higher quality. Pushed to
-     * the driver at once (applies on next BT connect) and persisted on flush. */
+    /* LEFT = more robust (lower bitpool), RIGHT = higher quality. Cycle
+     * through the presets, wrapping at both ends, so every step is always
+     * reachable. Pushed to the driver at once (applies on next BT connect)
+     * and persisted on flush. */
     int p = (int)s_bt_bitpool_preset + dir;
-    p = MAX(0, MIN(p, (int)BT_BITPOOL_COUNT - 1));
+    if (p < 0) {
+        p = BT_BITPOOL_COUNT - 1;
+    } else if (p >= BT_BITPOOL_COUNT) {
+        p = 0;
+    }
     s_bt_bitpool_preset = (bt_bitpool_preset_t)p;
     bluetooth_audio_set_bitpool(s_bt_bitpool_vals[s_bt_bitpool_preset]);
     ui_settings_mark_dirty(SETTINGS_DIRTY_BT_BITPOOL);
