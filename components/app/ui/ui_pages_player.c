@@ -390,12 +390,13 @@ static void ui_panel_activate(void)
     case 4:   /* 循环: 切换播放模式 (列表循环 -> 单曲循环 -> 随机 -> 列表...).
                * The button label shows the CURRENT mode; pressing cycles to
                * the next one. */
-        player_repeat_toggle();
-        set_action(player_repeat_mode() == PLAYER_REPEAT_ONE
-                       ? UI_STR_LOOP_ONE
-                       : player_repeat_mode() == PLAYER_REPEAT_RANDOM
-                             ? UI_STR_LOOP_RANDOM : UI_STR_LOOP_LIST);
-        break;
+    player_repeat_toggle();
+    ui_settings_mark_dirty(SETTINGS_DIRTY_REPEAT);   /* persist the new mode */
+    set_action(player_repeat_mode() == PLAYER_REPEAT_ONE
+                   ? UI_STR_LOOP_ONE
+                   : player_repeat_mode() == PLAYER_REPEAT_RANDOM
+                         ? UI_STR_LOOP_RANDOM : UI_STR_LOOP_LIST);
+    break;
     default:  /* 停止 */
         if (player_state() != PLAYER_IDLE) {
             player_stop();
@@ -698,6 +699,7 @@ void ui_player_select(void)
 {
     ui_mark_dirty();
     player_repeat_toggle();
+    ui_settings_mark_dirty(SETTINGS_DIRTY_REPEAT);   /* persist the new mode */
 }
 
 bool ui_player_esc(void)

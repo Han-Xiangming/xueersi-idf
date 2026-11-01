@@ -29,6 +29,7 @@
 #define UI_STR_RESETTING  "重置中..."
 #define UI_STR_CLEAR_A    "按A清除"
 #define UI_STR_CLEARED    "已清除进度"
+#define UI_STR_SET_REPEAT "循环模式"   /* settings row: 列表/单曲/随机 */
 
 /* --- Player panel controls --- */
 #define UI_STR_PREV        "上一曲"

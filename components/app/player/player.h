@@ -253,5 +253,9 @@ typedef enum {
 /* Current repeat mode. */
 player_repeat_t player_repeat_mode(void);
 
+/* Set the repeat mode explicitly (used to restore the persisted mode at boot
+ * and from the settings page). Out-of-range values are ignored. */
+void player_set_repeat_mode(player_repeat_t mode);
+
 /* Cycle the repeat mode: list loop -> single-track -> random -> list loop. */
 void player_repeat_toggle(void);

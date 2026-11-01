@@ -1937,6 +1937,15 @@ static const char *repeat_mode_text(void)
     }
 }
 
+void player_set_repeat_mode(player_repeat_t mode)
+{
+    if (mode < PLAYER_REPEAT_ALL || mode > PLAYER_REPEAT_RANDOM) {
+        return;   /* ignore anything outside the valid enum range */
+    }
+    s_repeat = mode;
+    ESP_LOGI(TAG, "repeat mode -> %s", repeat_mode_text());
+}
+
 void player_repeat_toggle(void)
 {
     s_repeat = (player_repeat_t)(((int)s_repeat + 1) % (PLAYER_REPEAT_RANDOM + 1));

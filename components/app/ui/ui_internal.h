@@ -39,6 +39,7 @@ typedef enum {
     SETTING_RESET,
     SETTING_CLEAR_PROG,
     SETTING_AUTOPAUSE_ROUTE, /* 路由变更暂停：播放中切扬声器/蓝牙自动暂停 */
+    SETTING_REPEAT,          /* 循环模式：列表/单曲/随机（持久化） */
     SETTING_COUNT,
 } setting_item_t;
 
@@ -51,6 +52,7 @@ typedef enum {
 #define SETTINGS_DIRTY_AUTOPAUSE (1u << 2)
 #define SETTINGS_DIRTY_BACKL    (1u << 3)
 #define SETTINGS_DIRTY_STBY     (1u << 4)
+#define SETTINGS_DIRTY_REPEAT   (1u << 5)
 
 /* ---- Marquee (scrolling names that are wider than the row) ---- */
 /* Marquee scroll cadence (ms per character step). 300 ms keeps the now-playing

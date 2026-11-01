@@ -69,6 +69,8 @@ static void ui_set_logsave_lr(int dir);
 static void ui_set_loglvl_lr(int dir);
 static void ui_set_logclear_enter(void);
 static void ui_set_autopause_lr(int dir);
+static const char *ui_set_repeat_text(void);
+static void ui_set_repeat_lr(int dir);
 
 /* Settings are grouped (P2): the flat list is split into Audio / Display /
  * System. The launcher-stle two-level view (group list -> group items) reuses
@@ -89,12 +91,12 @@ static const char *s_group_names[SET_GRP_COUNT] = {
 /* Group -> member items (indices into s_settings_table). Column width 4;
  * s_group_cnt says how many of each row are live. */
 static const setting_item_t s_group_items[SET_GRP_COUNT][4] = {
-    [SET_GRP_AUDIO]   = {SETTING_VOLUME, SETTING_MASTER_GAIN, SETTING_AUTOPAUSE_ROUTE},
+    [SET_GRP_AUDIO]   = {SETTING_VOLUME, SETTING_MASTER_GAIN, SETTING_AUTOPAUSE_ROUTE, SETTING_REPEAT},
     [SET_GRP_DISPLAY] = {SETTING_BACKLIGHT, SETTING_STANDBY},
     [SET_GRP_SYSTEM]  = {SETTING_RESCAN, SETTING_RESET, SETTING_CLEAR_PROG},
 };
 static const int s_group_cnt[SET_GRP_COUNT] = {
-    [SET_GRP_AUDIO] = 3, [SET_GRP_DISPLAY] = 2, [SET_GRP_SYSTEM] = 3,
+    [SET_GRP_AUDIO] = 4, [SET_GRP_DISPLAY] = 2, [SET_GRP_SYSTEM] = 3,
 };
 
 /* A single settings row descriptor. Adding a setting = appending one row to
@@ -117,6 +119,7 @@ static const setting_entry_t s_settings_table[SETTING_COUNT] = {
     [SETTING_RESET]       = {UI_STR_SET_RESET, ui_set_reset_text, NULL,             ui_set_reset_enter, SET_GRP_SYSTEM},
     [SETTING_CLEAR_PROG]  = {UI_STR_SET_CLEAR_PROG, ui_set_clear_text, NULL,        ui_set_clear_enter, SET_GRP_SYSTEM},
     [SETTING_AUTOPAUSE_ROUTE] = {UI_STR_SET_AUTOPAUSE, ui_set_autopause_text, ui_set_autopause_lr, NULL, SET_GRP_AUDIO},
+    [SETTING_REPEAT]          = {UI_STR_SET_REPEAT,    ui_set_repeat_text,    ui_set_repeat_lr,    NULL, SET_GRP_AUDIO},
 };
 
 /* Backlight brightness (0..100 %), driven via PWM on PIN_NUM_LCD_BL.
@@ -167,6 +170,7 @@ static int s_set_group = 0;   /* which group the ITEMS view is showing */
 #define UI_NVS_BACKL   "backlight"
 #define UI_NVS_STBY    "standby_s"
 #define UI_NVS_AUTOPAUSE "autopause_route"
+#define UI_NVS_REPEAT    "repeat"
 
 void ui_settings_load(void)
 {
@@ -211,6 +215,11 @@ void ui_settings_load(void)
         s_autopause_route = (autopause != 0);
     }
     player_set_autopause_on_route_change(s_autopause_route);
+    int32_t repeat = -1;
+    if (nvs_get_i32(h, UI_NVS_REPEAT, &repeat) == ESP_OK &&
+        repeat >= PLAYER_REPEAT_ALL && repeat <= PLAYER_REPEAT_RANDOM) {
+        player_set_repeat_mode((player_repeat_t)repeat);
+    }
     nvs_close(h);
 }
 
@@ -268,6 +277,16 @@ static void ui_settings_save_autopause(void)
     }
 }
 
+static void ui_settings_save_repeat(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, UI_NVS_REPEAT, (int32_t)player_repeat_mode());
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
 /* Debounced persistence: a setting change only marks a dirty bit and arms a
  * timer; ui_settings_flush() (called every refresh) commits once the user
  * stops tweaking, folding long-press repeats into a single NVS write. */
@@ -312,6 +331,9 @@ void ui_settings_flush(void)
     }
     if (s_save_pending & SETTINGS_DIRTY_AUTOPAUSE) {
         ui_settings_save_autopause();
+    }
+    if (s_save_pending & SETTINGS_DIRTY_REPEAT) {
+        ui_settings_save_repeat();
     }
     s_save_pending = 0;
 }
@@ -619,6 +641,36 @@ static void ui_set_autopause_lr(int dir)
     player_set_autopause_on_route_change(s_autopause_route);
     ui_settings_mark_dirty(SETTINGS_DIRTY_AUTOPAUSE);
     set_action(s_autopause_route ? "路由变更暂停开" : "路由变更暂停关");
+}
+
+/* ----- 循环模式（音频组） ----- */
+
+static const char *ui_set_repeat_text(void)
+{
+    /* Same short labels the player/panel use: 列表 / 单曲 / 随机. */
+    switch (player_repeat_mode()) {
+    case PLAYER_REPEAT_ONE:    return UI_STR_REPEAT_ONE;
+    case PLAYER_REPEAT_RANDOM: return UI_STR_REPEAT_RANDOM;
+    default:                   return UI_STR_REPEAT_LIST;
+    }
+}
+
+static void ui_set_repeat_lr(int dir)
+{
+    /* Step the mode by dir (wrapping); LEFT/RIGHT both cycle, just in opposite
+     * directions. Pushed to the player at once and persisted on the next flush. */
+    player_repeat_t m = (player_repeat_t)((int)player_repeat_mode() + dir);
+    if (m < PLAYER_REPEAT_ALL) {
+        m = PLAYER_REPEAT_RANDOM;
+    } else if (m > PLAYER_REPEAT_RANDOM) {
+        m = PLAYER_REPEAT_ALL;
+    }
+    player_set_repeat_mode(m);
+    ui_settings_mark_dirty(SETTINGS_DIRTY_REPEAT);
+    set_action(m == PLAYER_REPEAT_ONE
+                   ? UI_STR_LOOP_ONE
+                   : m == PLAYER_REPEAT_RANDOM ? UI_STR_LOOP_RANDOM
+                                               : UI_STR_LOOP_LIST);
 }
 
 void ui_build_settings(lv_obj_t *page)
