@@ -508,7 +508,7 @@ void ui_settings_lr(int dir)
     }
     const setting_entry_t *e = &s_settings_table[item];
     if (e->on_lr) {
-        e->on_lr(dir);          /* callback owns dirty-marking + set_action */
+        e->on_lr(dir);          /* callback owns dirty-marking + value push */
         ui_refresh();
     }
 }
@@ -592,12 +592,16 @@ static const char *ui_set_reset_text(void)
     return UI_STR_RESTORE;
 }
 
-/* Left/right adjust callbacks. Each owns its dirty-mark + set_action. */
+/* Left/right adjust callbacks. Each owns its dirty-mark + value push; the
+ * audio page intentionally keeps the bottom hint static (no toast) on change. */
 
 static void ui_set_vol_lr(int dir)
 {
-    /* Step + persist + toast all handled by the shared volume entry point. */
-    ui_volume_change(dir);
+    /* Step + debounced persist, but NO toast: the audio page keeps the bottom
+     * hint static on every adjustment. (The player / ebook pages still show a
+     * toast via ui_volume_change().) */
+    ui_volume_step(dir);
+    ui_settings_mark_dirty(SETTINGS_DIRTY_VOLUME);
 }
 
 static void ui_set_gain_lr(int dir)
@@ -679,7 +683,6 @@ static void ui_set_autopause_lr(int dir)
     s_autopause_route = !s_autopause_route;
     player_set_autopause_on_route_change(s_autopause_route);
     ui_settings_mark_dirty(SETTINGS_DIRTY_AUTOPAUSE);
-    set_action(s_autopause_route ? "路由变更暂停开" : "路由变更暂停关");
 }
 
 /* ----- 循环模式（音频组） ----- */
@@ -709,10 +712,6 @@ static void ui_set_repeat_lr(int dir)
     }
     player_set_repeat_mode((player_repeat_t)m);
     ui_settings_mark_dirty(SETTINGS_DIRTY_REPEAT);
-    set_action(m == PLAYER_REPEAT_ONE
-                   ? UI_STR_LOOP_ONE
-                   : m == PLAYER_REPEAT_RANDOM ? UI_STR_LOOP_RANDOM
-                                               : UI_STR_LOOP_LIST);
 }
 
 /* ----- 蓝牙音质 / SBC bitpool 预设（音频组） ----- */
@@ -738,7 +737,6 @@ static void ui_set_bt_bitpool_lr(int dir)
     s_bt_bitpool_preset = (bt_bitpool_preset_t)p;
     bluetooth_audio_set_bitpool(s_bt_bitpool_vals[s_bt_bitpool_preset]);
     ui_settings_mark_dirty(SETTINGS_DIRTY_BT_BITPOOL);
-    set_action(s_bt_bitpool_names[s_bt_bitpool_preset]);
 }
 
 void ui_build_settings(lv_obj_t *page)
