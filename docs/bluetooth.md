@@ -92,3 +92,4 @@ ui.c：      蓝牙页刷新设备列表/配对状态/连接名；蓝牙页 BT �
 - 扫描为 GAP inquiry，范围/速度受蓝牙射频环境限制。
 - SBC 编码 CPU 开销随 44.1kHz 固定，重采样在内部完成。
 - SBC bitpool 上限 **33**（`BT_SBC_MAX_BITPOOL`，44.1kHz joint stereo ≈ 229 kbps）。已从最初的 64 逐级下调（64 → 53 → 45 → 33）以消除弱 sink 上的 L2CAP 拥塞与爆音；若对端 sink 表现良好且追求音质，可回调到 45/53 试。
+- 该上限现在可在**设置 → 音频 → 蓝牙音质**里切换（预设 稳定/33、均衡/45、高质/53，持久化到 NVS，下次蓝牙连接生效）。驱动层经 `bluetooth_audio_set_bitpool()` 改写 A2DP SEP 的 `max_bitpool`；UI 不在蓝牙页时只储值，进入蓝牙页拉起栈时才应用。

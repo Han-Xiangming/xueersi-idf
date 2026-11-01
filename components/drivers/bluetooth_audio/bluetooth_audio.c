@@ -98,12 +98,17 @@ static bt_avrc_sync_vol_cb_t s_sync_vol_cb;
  * flood), so we trade a little quality for a robust link. */
 #define BT_SBC_MAX_BITPOOL     33
 
+/* Runtime-capped SBC bitpool (overrides the BT_SBC_MAX_BITPOOL default above).
+ * Set via bluetooth_audio_set_bitpool() from the settings page; applied to the
+ * A2DP SEP at bring-up, so it takes effect on the next Bluetooth connection. */
+static uint8_t s_bitpool = BT_SBC_MAX_BITPOOL;
+
 /* Preferred SBC capability advertised to sinks: same shape as the stack
  * default config, but with max_bitpool capped (see BT_SBC_MAX_BITPOOL).
  * The CIE bitfields pack exactly like the A2DP SBC capability octets:
  *   octet0 = ch_mode (b3..b0) | samp_freq (b7..b4)
  *   octet1 = alloc_mthd (b1..b0) | num_subbands (b3..b2) | block_len (b7..b4) */
-static const esp_a2d_mcc_t s_sbc_mcc = {
+static esp_a2d_mcc_t s_sbc_mcc = {
     .type = ESP_A2D_MCT_SBC,
     .cie.sbc_info = {
         .ch_mode      = 0x3,   /* joint stereo */
@@ -471,13 +476,16 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
                  * failure to the UI ("A重试"). */
                 if (s_conn_auto && s_conn_retries < BT_CONNECT_MAX_RETRY
                     && s_conn_timer != NULL) {
-                    /* Drop any half-open ACL left hanging from the failed
-                     * dial-out (Page Timeout / SDP race can leave a stale link
-                     * that makes the next esp_a2d_source_connect() overlap and
-                     * trip the BTC security state machine, "rs_disc_pending").
-                     * The disconnect is idempotent: if nothing is pending it is
-                     * a harmless no-op. Only then re-arm the backoff timer. */
-                    esp_a2d_source_disconnect(s_peer_bda);
+                    /* Do NOT call esp_a2d_source_disconnect() from here: this
+                     * callback runs in BTC_TASK, so queuing a disconnect
+                     * re-enters btc_av_state_idle_handler -> DISCONNECTED ->
+                     * this same branch, an infinite loop that wedges BTC_TASK
+                     * and trips the task watchdog (observed: 'No Link At All'
+                     * flood then abort). The stale/half-open ACL from the
+                     * failed page is dropped safely by bt_conn_retry_cb, which
+                     * runs in the Timer task (not BTC_TASK), before each
+                     * re-dial. Just re-arm the backoff timer; it re-dials on
+                     * its own. */
                     xTimerStart(s_conn_timer, 0);   /* backoff then retry */
                 }
                 else {
@@ -735,6 +743,23 @@ void bluetooth_audio_init(void)
 /* Bring up the Bluetooth controller, Bluedroid stack and A2DP Source role.
  * Safe to call repeatedly (idempotent); the first call does the real work.
  * Call when the user opens the BLUETOOTH page, not at boot. */
+/* Retry a profile init that can transiently fail with ESP_ERR_INVALID_STATE
+ * while a prior bluetooth_audio_disable()'s asynchronous profile teardown is
+ * still being processed by the BTC task. Used on re-enable (BT toggled off
+ * then on) so the trailing deinit doesn't reject the fresh init. */
+static esp_err_t bt_profile_init_retry(esp_err_t (*init_fn)(void))
+{
+    esp_err_t e = ESP_FAIL;
+    for (int i = 0; i < 50; i++) {
+        e = init_fn();
+        if (e == ESP_OK) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return e;
+}
+
 void bluetooth_audio_enable(void)
 {
     if (s_teardown_running) {
@@ -794,6 +819,20 @@ void bluetooth_audio_enable(void)
         s_enabling = false;
         return;
     }
+    /* esp_bluedroid_enable() returns before the stack is actually up: the
+     * ESP_BLUEDROID_STATUS_ENABLED state is set later by the BTC task. The
+     * A2DP/AVRCP init and the SEP registration below all require that state,
+     * so wait briefly for it — otherwise they return ESP_ERR_INVALID_STATE and
+     * the SBC bitpool cap is silently never applied. */
+    for (int i = 0; i < 200 &&
+         esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_ENABLED; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_ENABLED) {
+        ESP_LOGE(TAG, "Bluedroid did not reach ENABLED state");
+        s_enabling = false;
+        return;
+    }
 
     esp_bt_gap_register_callback(gap_cb);
     esp_bt_gap_set_device_name("Xiaomao MP3");
@@ -822,30 +861,65 @@ void bluetooth_audio_enable(void)
     /* Register the AVRCP Target role so a paired headset/speaker can drive
      * local playback and volume with its media keys. */
     esp_avrc_tg_register_callback(avrc_tg_cb);
-    esp_avrc_tg_init();
+    err = bt_profile_init_retry(esp_avrc_tg_init);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "AVRC TG init: %s", esp_err_to_name(err));
+        s_enabling = false;
+        return;
+    }
 
     /* Register the AVRCP Controller role so we can mirror our own volume to
      * the sink (bluetooth_audio_set_sink_volume). The CT channel is brought
      * up by the stack together with the A2DP link — no explicit connect. */
     esp_avrc_ct_register_callback(avrc_ct_cb);
-    esp_avrc_ct_init();
+    err = bt_profile_init_retry(esp_avrc_ct_init);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "AVRC CT init: %s", esp_err_to_name(err));
+        s_enabling = false;
+        return;
+    }
 
     esp_a2d_register_callback(a2d_cb);
     esp_a2d_source_register_data_callback(a2d_data_cb);
+    /* A fresh init normally returns ESP_OK at once. If Bluedroid is up (our
+     * poll guarantees it) and init still returns ESP_ERR_INVALID_STATE, the
+     * source is stuck in the "initialised" state from a previous session whose
+     * teardown did not clear g_a2dp_on_init: esp_bluedroid_disable()'s internal
+     * teardown leaves that flag set, and the esp_a2d_source_deinit() queued
+     * after it was a no-op once Bluedroid was already down. Bluedroid is up
+     * here, so force a clean deinit then re-init. */
     err = esp_a2d_source_init();
+    if (err == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "A2DP source still initialised; forcing deinit+reinit");
+        esp_a2d_source_deinit();
+        vTaskDelay(pdMS_TO_TICKS(50));
+        err = bt_profile_init_retry(esp_a2d_source_init);
+    } else if (err != ESP_OK) {
+        err = bt_profile_init_retry(esp_a2d_source_init);
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "A2DP source init: %s", esp_err_to_name(err));
         s_enabling = false;
         return;
     }
-    /* Re-register SEP 0 with the capped SBC bitpool (overwrites the default
-     * bitpool-53 endpoint the init registered; must happen before connect). */
-    err = esp_a2d_source_register_stream_endpoint(0, &s_sbc_mcc);
+    /* Register the capped SBC SEP now that Bluedroid is up (the poll above
+     * guarantees ESP_BLUEDROID_STATUS_ENABLED). Registering it before init, or
+     * while the stack is still coming up, returns ESP_ERR_INVALID_STATE and
+     * silently leaves the default bitpool-53 endpoint in place. Retry briefly
+     * in case the BTC task is still flipping the state. */
+    s_sbc_mcc.cie.sbc_info.max_bitpool = s_bitpool;
+    for (int i = 0; i < 50; i++) {
+        err = esp_a2d_source_register_stream_endpoint(0, &s_sbc_mcc);
+        if (err == ESP_OK) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "SBC bitpool cap not applied: %s", esp_err_to_name(err));
     }
     else {
-        ESP_LOGI(TAG, "SBC stream capped at bitpool %d", BT_SBC_MAX_BITPOOL);
+        ESP_LOGI(TAG, "SBC stream capped at bitpool %d", (unsigned)s_bitpool);
     }
 
     s_initialized = true;
@@ -1353,6 +1427,30 @@ void bluetooth_audio_flush_pcm_ring(void)
     }
 }
 
+/* --- SBC bitpool cap (runtime, set from the settings page) --------------
+ * Clamped to the legal SBC bitpool range [2, 64]. The value is stored and
+ * applied when the A2DP SEP is (re-)registered at stack bring-up, which is
+ * before esp_a2d_source_init(): so it takes effect on the NEXT Bluetooth
+ * connection. A live stream keeps its current bitpool until the sink
+ * reconnects — the SEP cannot be re-registered once the stack is initialised
+ * (that returns ESP_ERR_INVALID_STATE). */
+void bluetooth_audio_set_bitpool(uint8_t bitpool)
+{
+    if (bitpool < 2) {
+        bitpool = 2;
+    } else if (bitpool > 64) {
+        bitpool = 64;
+    }
+    s_bitpool = bitpool;
+    ESP_LOGI(TAG, "SBC bitpool cap set to %u (applied on next BT connect)",
+             (unsigned)s_bitpool);
+}
+
+uint8_t bluetooth_audio_get_bitpool(void)
+{
+    return s_bitpool;
+}
+
 #else /* Bluetooth / A2DP not compiled in */
 
 void bluetooth_audio_init(void)
@@ -1444,6 +1542,17 @@ uint8_t bluetooth_audio_retry_max(void)
 const char *bluetooth_audio_peer_name(void)
 {
     return "";
+}
+
+/* SBC bitpool cap: inert when Bluetooth/A2DP is not compiled in. */
+void bluetooth_audio_set_bitpool(uint8_t bitpool)
+{
+    (void)bitpool;
+}
+
+uint8_t bluetooth_audio_get_bitpool(void)
+{
+    return BT_SBC_MAX_BITPOOL;
 }
 
 #endif /* CONFIG_BT_ENABLED && CONFIG_BT_A2DP_ENABLE */

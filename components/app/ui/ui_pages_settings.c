@@ -16,6 +16,7 @@
 #include "battery.h"
 #include "board_config.h"
 #include "buttons.h"
+#include "bluetooth_audio.h"
 #include "ebook.h"
 #include "esp_attr.h"
 #include "esp_log.h"
@@ -71,6 +72,8 @@ static void ui_set_logclear_enter(void);
 static void ui_set_autopause_lr(int dir);
 static const char *ui_set_repeat_text(void);
 static void ui_set_repeat_lr(int dir);
+static const char *ui_set_bt_bitpool_text(void);
+static void ui_set_bt_bitpool_lr(int dir);
 
 /* Settings are grouped (P2): the flat list is split into Audio / Display /
  * System. The launcher-stle two-level view (group list -> group items) reuses
@@ -88,15 +91,15 @@ static const char *s_group_names[SET_GRP_COUNT] = {
     [SET_GRP_SYSTEM]  = "系统",
 };
 
-/* Group -> member items (indices into s_settings_table). Column width 4;
+/* Group -> member items (indices into s_settings_table). Column width 5;
  * s_group_cnt says how many of each row are live. */
-static const setting_item_t s_group_items[SET_GRP_COUNT][4] = {
-    [SET_GRP_AUDIO]   = {SETTING_VOLUME, SETTING_MASTER_GAIN, SETTING_AUTOPAUSE_ROUTE, SETTING_REPEAT},
+static const setting_item_t s_group_items[SET_GRP_COUNT][5] = {
+    [SET_GRP_AUDIO]   = {SETTING_VOLUME, SETTING_MASTER_GAIN, SETTING_AUTOPAUSE_ROUTE, SETTING_REPEAT, SETTING_BT_BITPOOL},
     [SET_GRP_DISPLAY] = {SETTING_BACKLIGHT, SETTING_STANDBY},
     [SET_GRP_SYSTEM]  = {SETTING_RESCAN, SETTING_RESET, SETTING_CLEAR_PROG},
 };
 static const int s_group_cnt[SET_GRP_COUNT] = {
-    [SET_GRP_AUDIO] = 4, [SET_GRP_DISPLAY] = 2, [SET_GRP_SYSTEM] = 3,
+    [SET_GRP_AUDIO] = 5, [SET_GRP_DISPLAY] = 2, [SET_GRP_SYSTEM] = 3,
 };
 
 /* A single settings row descriptor. Adding a setting = appending one row to
@@ -120,6 +123,7 @@ static const setting_entry_t s_settings_table[SETTING_COUNT] = {
     [SETTING_CLEAR_PROG]  = {UI_STR_SET_CLEAR_PROG, ui_set_clear_text, NULL,        ui_set_clear_enter, SET_GRP_SYSTEM},
     [SETTING_AUTOPAUSE_ROUTE] = {UI_STR_SET_AUTOPAUSE, ui_set_autopause_text, ui_set_autopause_lr, NULL, SET_GRP_AUDIO},
     [SETTING_REPEAT]          = {UI_STR_SET_REPEAT,    ui_set_repeat_text,    ui_set_repeat_lr,    NULL, SET_GRP_AUDIO},
+    [SETTING_BT_BITPOOL]       = {UI_STR_SET_BT_BITPOOL, ui_set_bt_bitpool_text, ui_set_bt_bitpool_lr, NULL, SET_GRP_AUDIO},
 };
 
 /* Backlight brightness (0..100 %), driven via PWM on PIN_NUM_LCD_BL.
@@ -149,6 +153,19 @@ static standby_opt_t s_standby_opt = STANDBY_OPT_30S;  /* default 30 s */
  * runtime flag lives in the player (player_set_autopause_on_route_change). */
 static bool s_autopause_route = false;
 
+/* Bluetooth audio quality (SBC bitpool preset). Three steps trade link
+ * robustness for fidelity: 稳定(33) / 均衡(45) / 高质(53). Persisted to NVS
+ * and pushed to the driver, which applies it on the next Bluetooth connect. */
+typedef enum {
+    BT_BITPOOL_STABLE = 0,   /* 33 ~229 kbps, most robust on weak sinks */
+    BT_BITPOOL_BALANCED,     /* 45 ~295 kbps */
+    BT_BITPOOL_QUALITY,      /* 53 ~328 kbps, best quality for 44.1 kHz */
+    BT_BITPOOL_COUNT,
+} bt_bitpool_preset_t;
+static const uint8_t s_bt_bitpool_vals[BT_BITPOOL_COUNT] = {33, 45, 53};
+static const char *s_bt_bitpool_names[BT_BITPOOL_COUNT] = {"稳定", "均衡", "高质"};
+static bt_bitpool_preset_t s_bt_bitpool_preset = BT_BITPOOL_STABLE;
+
 /* Selected row, and the paint guard that remembers what is currently drawn
  * (-1 forces a repaint right after the page is rebuilt). */
 static int s_setting_sel = 0;
@@ -171,6 +188,7 @@ static int s_set_group = 0;   /* which group the ITEMS view is showing */
 #define UI_NVS_STBY    "standby_s"
 #define UI_NVS_AUTOPAUSE "autopause_route"
 #define UI_NVS_REPEAT    "repeat"
+#define UI_NVS_BT_BITPOOL "bt_bitpool"
 
 void ui_settings_load(void)
 {
@@ -220,6 +238,14 @@ void ui_settings_load(void)
         repeat >= PLAYER_REPEAT_ALL && repeat <= PLAYER_REPEAT_RANDOM) {
         player_set_repeat_mode((player_repeat_t)repeat);
     }
+    int32_t bp = -1;
+    if (nvs_get_i32(h, UI_NVS_BT_BITPOOL, &bp) == ESP_OK &&
+        bp >= BT_BITPOOL_STABLE && bp < BT_BITPOOL_COUNT) {
+        s_bt_bitpool_preset = (bt_bitpool_preset_t)bp;
+    }
+    /* Apply the chosen SBC bitpool cap to the A2DP SEP (takes effect on the
+     * next Bluetooth connection). Safe no-op when BT is disabled in the build. */
+    bluetooth_audio_set_bitpool(s_bt_bitpool_vals[s_bt_bitpool_preset]);
     nvs_close(h);
 }
 
@@ -287,6 +313,16 @@ static void ui_settings_save_repeat(void)
     }
 }
 
+static void ui_settings_save_bt_bitpool(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, UI_NVS_BT_BITPOOL, (int32_t)s_bt_bitpool_preset);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
 /* Debounced persistence: a setting change only marks a dirty bit and arms a
  * timer; ui_settings_flush() (called every refresh) commits once the user
  * stops tweaking, folding long-press repeats into a single NVS write. */
@@ -334,6 +370,9 @@ void ui_settings_flush(void)
     }
     if (s_save_pending & SETTINGS_DIRTY_REPEAT) {
         ui_settings_save_repeat();
+    }
+    if (s_save_pending & SETTINGS_DIRTY_BT_BITPOOL) {
+        ui_settings_save_bt_bitpool();
     }
     s_save_pending = 0;
 }
@@ -671,6 +710,26 @@ static void ui_set_repeat_lr(int dir)
                    ? UI_STR_LOOP_ONE
                    : m == PLAYER_REPEAT_RANDOM ? UI_STR_LOOP_RANDOM
                                                : UI_STR_LOOP_LIST);
+}
+
+/* ----- 蓝牙音质 / SBC bitpool 预设（音频组） ----- */
+
+static const char *ui_set_bt_bitpool_text(void)
+{
+    /* 稳定 / 均衡 / 高质 — the chosen preset's short name. */
+    return s_bt_bitpool_names[s_bt_bitpool_preset];
+}
+
+static void ui_set_bt_bitpool_lr(int dir)
+{
+    /* LEFT = more robust (lower bitpool), RIGHT = higher quality. Pushed to
+     * the driver at once (applies on next BT connect) and persisted on flush. */
+    int p = (int)s_bt_bitpool_preset + dir;
+    p = MAX(0, MIN(p, (int)BT_BITPOOL_COUNT - 1));
+    s_bt_bitpool_preset = (bt_bitpool_preset_t)p;
+    bluetooth_audio_set_bitpool(s_bt_bitpool_vals[s_bt_bitpool_preset]);
+    ui_settings_mark_dirty(SETTINGS_DIRTY_BT_BITPOOL);
+    set_action(s_bt_bitpool_names[s_bt_bitpool_preset]);
 }
 
 void ui_build_settings(lv_obj_t *page)

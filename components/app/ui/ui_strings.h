@@ -19,6 +19,7 @@
 #define UI_STR_SET_RESET      "恢复出厂设置" /* was 重置NVS (internal jargon) */
 #define UI_STR_SET_CLEAR_PROG "清除阅读进度"
 #define UI_STR_SET_AUTOPAUSE  "路由变更暂停"
+#define UI_STR_SET_BT_BITPOOL "蓝牙音质"   /* SBC bitpool 预设：稳定/均衡/高质 */
 
 /* --- Settings value / action feedback --- */
 #define UI_STR_NEVER      "永不"

@@ -114,6 +114,16 @@ void bluetooth_audio_set_sample_rate(uint32_t rate_hz);
  * the inter-pass pause. Safe against a concurrent A2DP data callback. */
 void bluetooth_audio_flush_pcm_ring(void);
 
+/* Cap the SBC bitpool used when encoding A2DP audio (2..64; the A2DP bandwidth
+ * cap limits 44.1 kHz to 53 and 48 kHz to ~53). Higher = better quality but
+ * more L2CAP traffic; lower is more robust on weak sinks. Applied to the A2DP
+ * SEP at bring-up, so it takes effect on the next Bluetooth connection. Safe
+ * no-op when Bluetooth/A2DP is disabled in the build. */
+void bluetooth_audio_set_bitpool(uint8_t bitpool);
+
+/* Current SBC bitpool cap (the value last set, or the compile-time default). */
+uint8_t bluetooth_audio_get_bitpool(void);
+
 /* === AVRCP remote control ===================================================
  * The device is an A2DP SOURCE, so it registers the AVRCP TARGET (TG) role and
  * lets a paired remote (the headset/speaker's media keys) drive local playback
