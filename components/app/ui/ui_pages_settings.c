@@ -694,14 +694,17 @@ static const char *ui_set_repeat_text(void)
 static void ui_set_repeat_lr(int dir)
 {
     /* Step the mode by dir (wrapping); LEFT/RIGHT both cycle, just in opposite
-     * directions. Pushed to the player at once and persisted on the next flush. */
-    player_repeat_t m = (player_repeat_t)((int)player_repeat_mode() + dir);
+     * directions. Use signed int for the arithmetic + bounds check: the enum is
+     * unsigned-backed (all enumerators are non-negative), so a dir of -1 would
+     * otherwise wrap to a huge value and miss the <ALL branch. Pushed to the
+     * player at once and persisted on the next flush. */
+    int m = (int)player_repeat_mode() + dir;
     if (m < PLAYER_REPEAT_ALL) {
         m = PLAYER_REPEAT_RANDOM;
     } else if (m > PLAYER_REPEAT_RANDOM) {
         m = PLAYER_REPEAT_ALL;
     }
-    player_set_repeat_mode(m);
+    player_set_repeat_mode((player_repeat_t)m);
     ui_settings_mark_dirty(SETTINGS_DIRTY_REPEAT);
     set_action(m == PLAYER_REPEAT_ONE
                    ? UI_STR_LOOP_ONE
