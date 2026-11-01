@@ -671,9 +671,12 @@ static const char *ui_set_autopause_text(void)
 
 static void ui_set_autopause_lr(int dir)
 {
-    /* Left = off, right = on. Pushed to the player at once so a route change
-     * in the same session already honours it; persisted on the next flush. */
-    s_autopause_route = (dir > 0);
+    /* Toggle the on/off state, cycling in both directions (so either LEFT or
+     * RIGHT flips the current state, matching the other cycle-style settings).
+     * Pushed to the player at once so a route change in the same session already
+     * honours it; persisted on the next flush. */
+    (void)dir;
+    s_autopause_route = !s_autopause_route;
     player_set_autopause_on_route_change(s_autopause_route);
     ui_settings_mark_dirty(SETTINGS_DIRTY_AUTOPAUSE);
     set_action(s_autopause_route ? "路由变更暂停开" : "路由变更暂停关");
