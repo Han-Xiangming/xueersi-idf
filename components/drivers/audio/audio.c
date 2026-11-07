@@ -959,8 +959,10 @@ static esp_err_t audio_create_channel(void)
     /* Pin to Core 1: this is the final real-time link (PCM ring -> I2S DMA).
      * An unpinned task can be scheduled on Core 0, where the Bluetooth
      * controller+stack run at higher priority and starve it during heavy BT
-     * traffic, causing I2S underruns (clicks/dropouts). Core 1 hosts the app;
-     * priority 6 keeps it below the decode (8) and LVGL (7) tasks there. */
+     * traffic, causing I2S underruns (clicks/dropouts). Core 1 hosts the app:
+     * priority 6 keeps it below lvgl (7), the only app task on this core that
+     * outranks it. The decode task (8) is pinned to Core 0, so its higher
+     * priority number cannot preempt anything on Core 1. */
     BaseType_t tr = xTaskCreatePinnedToCore(i2s_writer_task, "i2s_wr", 4096,
                                             NULL, 6, &s_i2s_task, 1);
     if (tr != pdPASS) {

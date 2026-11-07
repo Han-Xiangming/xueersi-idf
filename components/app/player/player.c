@@ -79,7 +79,12 @@
  * while s_state still claims PLAYING (the documented "frozen log, never
  * recovers" failure). A genuine pause is left alone. */
 #define PAUSE_STUCK_MS           30000
-/* Decode task priority: MUST stay ABOVE LVGL_TASK_PRIORITY (7, see ui.h).
+/* Decode task priority: kept ABOVE LVGL_TASK_PRIORITY (7, see ui.h).
+ *
+ * The two tasks now run on different cores (decode: 0, lvgl: 1), so this
+ * ordering no longer prevents lvgl from preempting decode; 8 stays so decode
+ * wins on Core 0 over any unpinned helper task that lands there. The rationale
+ * below describes the shared-core setup it was originally written for.
  *
  * The decode task is the only real-time consumer here: it must refill the I2S
  * DMA ring faster than the hardware drains it, or the stream underruns. Every

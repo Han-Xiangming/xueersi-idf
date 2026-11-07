@@ -20,19 +20,23 @@
  * lv_timer_handler(). */
 #define LVGL_TASK_STACK_SIZE        (16 * 1024)
 /* BELOW the MP3 decode task (PLAYER_TASK_PRIORITY = 8, see player.c).
+ * Both tasks are now pinned to different cores (decode: 0, lvgl: 1), so this
+ * numeric ordering no longer protects decode from lvgl preemption; it stays
+ * so decode outranks any unpinned helper task scheduled on Core 0.
  *
- * This ordering was previously the other way round (LVGL 7 above decode 6),
- * which starved the decode task and caused the I2S underrun failure: a 48 kHz
- * frame is only 24 ms of audio, so even a few ms of preemption per frame
- * drains the ~256 ms DMA ring within a second — logged as chronic
- * "I2S write gap > 30 ms" and heard as dropouts / silence. The old comment's
- * assumption ("the decode task tolerates being preempted for one full page
- * render") only holds for occasional renders, not for the continuous refresh
- * of an active player page.
+ * This ordering was previously the other way round (LVGL 7 above decode 6)
+ * when both tasks shared a core, which starved the decode task and caused
+ * the I2S underrun failure: a 48 kHz frame is only 24 ms of audio, so even
+ * a few ms of preemption per frame drains the ~256 ms DMA ring within a
+ * second — logged as chronic "I2S write gap > 30 ms" and heard as dropouts
+ * or silence. The old comment's assumption ("the decode task tolerates being
+ * preempted for one full page render") only holds for occasional renders,
+ * not for the continuous refresh of an active player page.
  *
- * Key events and the synchronous render are still responsive: the decode task
- * blocks on I2S DMA back-pressure for most of each frame, so LVGL gets the
- * remaining CPU whenever the decoder is waiting on the hardware. */
+ * In that shared-core setup key events and the synchronous render stayed
+ * responsive because the decode task blocked on I2S DMA back-pressure for most
+ * of each frame. Today the two tasks run on separate cores and do not contend
+ * for the same CPU at all. */
 #define LVGL_TASK_PRIORITY          7
 #define LVGL_TASK_MIN_DELAY_MS      1
 #define LVGL_TASK_MAX_DELAY_MS      16

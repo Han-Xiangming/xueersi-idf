@@ -10,16 +10,17 @@
 
 ```text
 player.c
-  ├─ mp3_player（16KB 栈，优先级 8，绑 Core 1）
+  ├─ mp3_player（16KB 栈，优先级 8，绑 Core 0）
   │    解码循环：读文件 → helix 解码 → hw_audio_write_pcm()（带背压）
-  ├─ mp3_scan（4KB 栈，优先级 4）
+  ├─ mp3_scan（4KB 栈，优先级 4，不绑核）
   │    后台扫描 /sdcard/Music 的 .mp3 → 双缓冲快照发布曲目列表
-  ├─ mp3_watch（4KB 栈，优先级 2）
+  ├─ mp3_watch（4KB 栈，优先级 2，不绑核）
   │    解码停顿看门狗 + 喂 RTC WDT
   └─ 状态机       IDLE / PLAYING / PAUSED
 ```
 
-- 优先级层级（Core 1）：解码 `mp3_player`(8) > `lvgl`(7) > `i2s_wr`(6) > `mp3_scan`(4) > `mp3_watch`(2)。解码必须高于 LVGL 才能及时喂 DMA（`player.c` 注释）。
+- **双核分配**：Core 0 = `mp3_player`(8) 解码 + BT 控制器/协议栈 + main/`esp_timer` 等系统任务；Core 1 = `lvgl`(7) UI 渲染 + `i2s_wr`(6) 写 I2S DMA（`audio.c`）。`mp3_scan`(4)、`mp3_watch`(2) 以及 ebook 的三个 4KB 后台任务都用 `xTaskCreate` 不绑核，由调度器在两核间迁移。
+- **优先级只在同核内有效**：Core 1 上是 `lvgl`(7) > `i2s_wr`(6)；Core 0 上解码 (8) 优先于落到该核的未绑核任务，但与 `lvgl` 不互相抢占。把 `lvgl`/`i2s_wr` 绑到 Core 1 是为了避开 Core 0 上高优先级的 BT 负载（否则按键反馈抖动、I2S 欠载）；解码 8 高于 LVGL 7 是两任务同核时代防止渲染抢占解码的要求，现保留以保证解码在 Core 0 上优先（`player.c` 注释）。
 - 解码 PCM 缓冲：`s_pcm`（立体声，常见情况）**刻意留在内部 DRAM**——它是每 ~40Hz 交给 `hw_audio_write_pcm` 的缓冲，放 PSRAM 会把 cache-workaround 拷贝压到热路径上（蓝牙控制器负载下的已知崩溃源）；仅单声道上混用的 `s_stereo` 放 PSRAM（`EXT_RAM_BSS_ATTR`）以节省 DRAM 预算。
 
 ## 2. 曲目列表（后台扫描）

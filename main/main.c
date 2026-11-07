@@ -241,9 +241,9 @@ void app_main(void)
     /* Pin the LVGL task to core 1: the Bluetooth controller + stack run on
      * core 0 by default, and an unpinned task can be scheduled there and
      * starved by BT's higher-priority work (visible as key-feedback jitter
-     * while a sink is linked). Core 1 hosts the app; with LVGL_TASK_PRIORITY
-     * above the decode task, key events + the synchronous render are never
-     * delayed by a decode burst either. */
+     * while a sink is linked). Core 1 hosts the app alongside i2s_wr (6);
+     * the decode task (8) is pinned to core 0, so a decode burst cannot
+     * preempt key handling or the synchronous render here. */
     BaseType_t ret = xTaskCreatePinnedToCore(lvgl_task,
                                              "lvgl",
                                              LVGL_TASK_STACK_SIZE,
