@@ -103,8 +103,9 @@ mini bar  y 196 .. 215  全局常驻：非播放页 + 播放中时显示 `> 曲�
 
 ## 5. toast 与按键反馈
 
-- `set_action(msg)`：toast 在下一次刷新立即可见，显示 `UI_ACTION_MSG_MS=850ms`；快速连按只更新文字并顺延过期时间，不反复延迟。toast 期间 `s_ui_dirty` 保持置位，保证过期后刷新回正常文本。
-- toast 与普通状态行共用 `s_ui.hint`：`ui_set_hint(normal)` 在 toast 激活期显示 toast，否则显示 normal。
+- `set_action(msg)`：toast 在下一次刷新立即可见，显示 `UI_ACTION_MSG_MS=850ms`；快速连按只更新文字并顺延过期时间。toast 只触发**一次**整页重绘，之后由 `ui_toast_refresh()` 每帧单独维护提示行（不整页重绘，避免播放中连续刷屏抢占用 SPI2 的 SD 总线）。
+- toast 与普通状态行共用 `s_ui.hint`：`set_action()` 在开始时快照提示行原文，到期由 `ui_toast_refresh()` 恢复；`ui_set_hint(normal)` 在页面重绘时同步该原文，并在 toast 激活期显示 toast。
+- **播放期不写 NVS**：设置变更只置 dirty bit，`ui_settings_flush()` 在 `player_state()==PLAYER_PLAYING` 时跳过 `nvs_commit()`（flash 写会关 cache、停双核，表现为 I2S 断流），播放停止后的下一帧自动补写；`ui_settings_flush_force()` 可无视防抖与播放闸门立即落盘，供掉电/待机入口使用。
 - 阅读页 toast（下一页/上一页/第一页/最后一页）临时替换进度行，遮挡 SD 读取延迟。
 
 ## 6. 播放器页布局

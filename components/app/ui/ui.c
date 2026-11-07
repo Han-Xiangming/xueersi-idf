@@ -66,6 +66,9 @@ static const char *const s_page_names[UI_PAGE_COUNT] = {
 ui_state_t s_ui;
 static uint32_t s_action_until_ms;
 static char s_action[32];
+/* Hint-row text to restore when a toast expires. set_action() snapshots the
+ * label's current text; ui_set_hint() keeps it in sync with the page. */
+static char s_hint_normal[128];
 
 /* Last output-volume percent shown by the toast (0xFF = not sampled yet).
  * The volume also moves without local input — an AVRCP remote setting the
@@ -248,12 +251,24 @@ bool ui_marquee_step(ui_marquee_t *mq, char *out, size_t out_size,
 
 void set_action(const char *msg)
 {
+    /* Remember the row's current text before the toast takes it over. Only on
+     * the first press of a run: auto-repeats must not snapshot the toast text
+     * itself. Pages that never call ui_set_hint() (the launcher) are covered
+     * here too. */
+    if (s_ui.hint != NULL &&
+        (int32_t)(s_action_until_ms - lv_tick_get()) <= 0) {
+        const char *cur = lv_label_get_text(s_ui.hint);
+        if (cur != NULL) {
+            copy_text(s_hint_normal, sizeof(s_hint_normal), cur);
+        }
+    }
     copy_text(s_action, sizeof(s_action), msg);
     /* The toast shows immediately on the next refresh and stays up for
      * UI_ACTION_MSG_MS. Rapid repeats (key auto-repeat) only update the text
-     * and extend the expiry. */
+     * and extend the expiry; one repaint is enough — ui_toast_refresh() keeps
+     * the hint row up to date without repainting the whole page. */
     s_action_until_ms = lv_tick_get() + UI_ACTION_MSG_MS;
-    s_ui_dirty = true;                 /* refresh until the toast expires */
+    s_ui_dirty = true;
 }
 
 /* ui_theme_text_set() (set a label only when the text really changed) lives
@@ -302,6 +317,11 @@ void ui_volume_step(int dir)
         step *= 2.0f;
     }
     hw_audio_volume_step_db(sign * step);
+    /* Local change: ui_volume_change() already showed the toast (and the
+     * settings page deliberately shows none). Sync the view so ui_refresh()'s
+     * remote-volume watcher (AVRCP / route switch) does not fire a second
+     * toast and re-extend the 850 ms window for every key repeat. */
+    s_vol_view = hw_audio_get_volume();
 }
 
 /* One call for every volume entry point: step + debounced persist + toast.
@@ -332,28 +352,65 @@ void ui_backlight_change(int dir)
 
 /* Label / page / bar constructors live in ui_theme.c. */
 
+/* The ebook progress bar/percentage share the hint row. Only change their
+ * visibility on a real state transition: lv_obj_*_flag() invalidates, and
+ * calling it on every toast tick would dirty the row every 16 ms. */
+static void ui_toast_bars_set(bool hidden)
+{
+    if (s_ui.eb_bar == NULL || s_ui.eb_pct == NULL) {
+        return;
+    }
+    if (hidden == lv_obj_has_flag(s_ui.eb_bar, LV_OBJ_FLAG_HIDDEN)) {
+        return;
+    }
+    if (hidden) {
+        lv_obj_add_flag(s_ui.eb_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_ui.eb_pct, LV_OBJ_FLAG_HIDDEN);
+    }
+    else {
+        lv_obj_remove_flag(s_ui.eb_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_ui.eb_pct, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* Toast upkeep touches ONLY the hint row. Repainting the whole page every
+ * 16 ms for the 850 ms a toast is up kept the LCD (and the SPI2 bus the SD
+ * card shares) busy — audible as I2S write gaps / dropped beats while
+ * ramping the volume. The label setter is change-guarded, so a steady toast
+ * costs no invalidations at all. */
+static void ui_toast_refresh(void)
+{
+    if (s_action_until_ms == 0) {
+        return;
+    }
+    if ((int32_t)(s_action_until_ms - lv_tick_get()) > 0) {
+        ui_theme_text_set(s_ui.hint, s_action);
+        ui_toast_bars_set(true);
+        return;
+    }
+    s_action_until_ms = 0;             /* expired: arm the next toast afresh */
+    ui_theme_text_set(s_ui.hint, s_hint_normal);
+    ui_toast_bars_set(false);
+}
+
 void ui_set_hint(const char *normal)
 {
     if (!s_ui.hint) {
         return;
     }
+    /* Keep the restore text in sync with whatever page is painted now. */
+    copy_text(s_hint_normal, sizeof(s_hint_normal), normal);
     const uint32_t now_ms = lv_tick_get();
     if (s_action_until_ms && (int32_t)(s_action_until_ms - now_ms) > 0) {
         ui_theme_text_set(s_ui.hint, s_action);
         /* Toast takes over the status row: hide the ebook bar/percentage
          * so the centered toast text does not collide with them. */
-        if (s_ui.eb_bar && s_ui.eb_pct) {
-            lv_obj_add_flag(s_ui.eb_bar, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(s_ui.eb_pct, LV_OBJ_FLAG_HIDDEN);
-        }
+        ui_toast_bars_set(true);
     }
     else {
         s_action_until_ms = 0;         /* toast expired: arm the next one afresh */
         ui_theme_text_set(s_ui.hint, normal);
-        if (s_ui.eb_bar && s_ui.eb_pct) {
-            lv_obj_remove_flag(s_ui.eb_bar, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_remove_flag(s_ui.eb_pct, LV_OBJ_FLAG_HIDDEN);
-        }
+        ui_toast_bars_set(false);
     }
 }
 
@@ -672,11 +729,12 @@ void ui_refresh(void)
 {
     ui_settings_flush();
 
-    /* Volume moved without local input (AVRCP remote, or a route switch
-     * swapping in the other route's slot): acknowledge it like a local change
-     * and mark the volume dirty so the remote's value survives reboot too.
-     * Local changes come through here as well — set_action() only extends the
-     * identical toast, so the feedback stays uniform. */
+    /* Volume moved WITHOUT local input (AVRCP remote, or a route switch
+     * swapping in the other route's slot): acknowledge it with the same toast
+     * and mark it dirty so the remote's value survives reboot. Local changes
+     * sync s_vol_view in ui_volume_step(), so they never reach this branch —
+     * otherwise every key repeat fired a second toast and re-armed the
+     * 850 ms refresh window. */
     const uint8_t vol = hw_audio_get_volume();
     if (vol != s_vol_view) {
         if (s_vol_view != 0xFF) {
@@ -688,6 +746,10 @@ void ui_refresh(void)
         s_vol_view = vol;
     }
 
+    /* Hint-row-only toast upkeep, including the menu (which never paints a
+     * full page). See ui_toast_refresh(). */
+    ui_toast_refresh();
+
     if (ui_nav_in_menu()) {
         /* Menu is event-driven, but keep the battery gauge and the playback
          * panel live on every tick. */
@@ -695,11 +757,6 @@ void ui_refresh(void)
         ui_player_refresh_panel();
         return;                         /* menu is event-driven */
     }
-
-    /* An action toast is still counting down (s_action_until_ms set): keep
-     * refreshing until ui_set_hint() clears it on expiry, even if nothing else
-     * changed. */
-    bool toast_active = (s_action_until_ms != 0);
 
     /* Marquees are advanced every tick even when the page is otherwise idle:
      * only the scrolling label is touched, so the main loop stays free and
@@ -716,7 +773,7 @@ void ui_refresh(void)
     if (ui_external_changed()) {
         s_ui_dirty = true;             /* Bluetooth/player/SD changed via callback */
     }
-    if (!s_ui_dirty && !toast_active) {
+    if (!s_ui_dirty) {
         return;                         /* idle: nothing visible changed */
     }
 

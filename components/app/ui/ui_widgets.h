@@ -36,10 +36,10 @@ typedef struct {
      * therefore lets ui_list_row() skip the remaining style setters for an
      * unchanged row — LVGL's lv_obj_set_style_*() invalidates unconditionally,
      * even when the value is identical (lv_obj_style.c:
-     * lv_obj_refresh_style always invalidates), and ui_list_row() runs on
-     * every refresh pass, i.e. every 16 ms while a toast is up. That churn
-     * kept the LCD (and with it the shared SPI2 bus) busy for no visible
-     * change.
+     * lv_obj_refresh_style always invalidates), and ui_list_row() runs for all
+     * rows on every repaint (each key press, each external state change).
+     * That churn kept the LCD (and with it the shared SPI2 bus) busy for no
+     * visible change; a toast no longer forces a repaint every 16 ms.
      * Reset by ui_list_create() (fresh row objects carry the creation-time
      * styles, so a persistent struct must not trust a stale shadow) and by
      * ui_list_invalidate_paint() (list content swapped underneath). */

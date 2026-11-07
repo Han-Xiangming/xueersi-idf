@@ -121,8 +121,8 @@ void ui_list_row(ui_list_t *list, int row, int idx, int count,
     /* Change-guard (see the shadow documentation in ui_widgets.h): skip the
      * style setters when the row already shows exactly this state. Only the
      * text can still differ, and ui_theme_text_set() compares it. Without
-     * this, every refresh pass — i.e. every 16 ms for the 850 ms a toast is
-     * up — invalidated all six rows and the shared SPI2 bus paid for it. */
+     * this, every repaint invalidated all six rows and the shared SPI2 bus
+     * paid for it (a toast used to force one every 16 ms). */
     if (list->painted[row] && list->blank[row] == is_blank &&
         list->selected[row] == want_sel) {
         if (is_blank) {

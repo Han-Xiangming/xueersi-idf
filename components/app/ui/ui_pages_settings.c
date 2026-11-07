@@ -322,7 +322,14 @@ static void ui_settings_save_bt_bitpool(void)
 
 /* Debounced persistence: a setting change only marks a dirty bit and arms a
  * timer; ui_settings_flush() (called every refresh) commits once the user
- * stops tweaking, folding long-press repeats into a single NVS write. */
+ * stops tweaking, folding long-press repeats into a single NVS write.
+ *
+ * Playback gate: an NVS commit is a flash write, which disables the cache and
+ * stalls BOTH cores (and all PSRAM traffic) for its duration. On this board
+ * that is audible as I2S write gaps / dropped beats, so a pending write is
+ * held until playback stops and committed by the next idle refresh tick.
+ * player_state() covers the Bluetooth route too — hw_audio_is_playing() is
+ * speaker-only and would let an A2DP stream be interrupted by the write. */
 static uint32_t s_save_pending;
 static uint32_t s_save_at_ms;
 
@@ -342,12 +349,9 @@ void ui_settings_mark_dirty(uint32_t which)
     s_save_at_ms = lv_tick_get() + UI_SETTINGS_SAVE_DELAY_MS;
 }
 
-void ui_settings_flush(void)
+static void settings_commit_pending(void)
 {
     if (s_save_pending == 0) {
-        return;
-    }
-    if ((int32_t)(s_save_at_ms - lv_tick_get()) > 0) {
         return;
     }
     if (s_save_pending & SETTINGS_DIRTY_VOLUME) {
@@ -372,6 +376,27 @@ void ui_settings_flush(void)
         ui_settings_save_bt_bitpool();
     }
     s_save_pending = 0;
+}
+
+void ui_settings_flush(void)
+{
+    if (s_save_pending == 0) {
+        return;
+    }
+    if ((int32_t)(s_save_at_ms - lv_tick_get()) > 0) {
+        return;
+    }
+    if (player_state() == PLAYER_PLAYING) {
+        return;   /* keep dirty; the next idle tick commits it */
+    }
+    settings_commit_pending();
+}
+
+void ui_settings_flush_force(void)
+{
+    /* Ignore the debounce AND the playback gate: for a power-down / standby
+     * path that must persist the last change immediately. */
+    settings_commit_pending();
 }
 void ui_refresh_settings(void)
 {
