@@ -75,7 +75,7 @@ static volatile bool s_lcd_first_flush_done;
  * BL_LUT_STEPS mirrors the public HW_LCD_BACKLIGHT_STEPS in lcd.h. */
 #define BL_LUT_STEPS          HW_LCD_BACKLIGHT_STEPS
 #define BL_LUT_MIN_ON         40      /* dimmest visible 10-bit duty (0..1023) */
-#define BL_LUT_SHAPE          1.5f    /* >1 = low-fine / high-coarse; 1 = even */
+#define BL_LUT_SHAPE          1.8f    /* >1 = low-fine / high-coarse; 1 = even */
 static uint16_t s_bl_lut[BL_LUT_STEPS + 1];
 
 /* Fill s_bl_lut[] with the low-fine / high-coarse curve above. Called once
