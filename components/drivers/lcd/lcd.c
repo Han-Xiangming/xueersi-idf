@@ -53,37 +53,49 @@ static volatile bool s_lcd_first_flush_done;
 #define BL_LEDC_DUTY_RES      LEDC_TIMER_10_BIT   /* 0..1023 */
 #define BL_DUTY_MAX           ((1 << 10) - 1)
 
-/* Non-linear (gamma-corrected) brightness curve. Human perception of
- * brightness is roughly logarithmic, so a linear 0..100% -> 0..1023 duty
- * map makes low steps invisible and high steps jumpy. The (BL_LUT_STEPS+1)
- * entry LUT (index 0..BL_LUT_STEPS) is built at run time so the dimmest
- * visible level is a tunable floor rather than collapsing to 0:
+/* Non-uniform (low-fine / high-coarse) brightness curve.
  *
- *     lut[0]                       = 0                (the ONLY off level)
- *     lut[i], i=1..BL_LUT_STEPS    = round(BL_LUT_MIN_ON
- *                                 + (BL_DUTY_MAX - BL_LUT_MIN_ON)
- *                                   * ((i-1)/(BL_LUT_STEPS-1))^BL_LUT_GAMMA)
+ * Brightness perception is logarithmic (Weber-Fechner): a fixed PWM duty
+ * step looks far smaller at high brightness than at low. A plain gamma curve
+ * (duty = MIN + (MAX-MIN)*p^gamma) over-corrects and spends its *coarse*
+ * steps at the dim end (where you actually want fine control for night
+ * reading) and its *fine* steps at the bright end. To flip that — many small
+ * steps when dim, fewer big steps when bright — lay the levels out in
+ * log-duty space with a shaping exponent > 1:
  *
- * This guarantees a strictly increasing, always-visible range from
- * BL_LUT_MIN_ON (dimmest) up to full brightness, with exactly one black
- * level at index 0. Without the MIN_ON floor the first two entries both
- * round to 0, creating a dark "dead zone" where two presses are needed to
- * escape black. Tune BL_LUT_MIN_ON against real hardware. BL_LUT_STEPS
- * mirrors the public HW_LCD_BACKLIGHT_STEPS in lcd.h. */
+ *     log_duty[i] = log(MIN_ON) + (log(MAX) - log(MIN_ON))
+ *                                * ((i-1)/(STEPS-1)) ^ BL_LUT_SHAPE
+ *     lut[i]      = round(exp(log_duty[i]))
+ *
+ * BL_LUT_SHAPE = 1 gives uniform *perceived* steps (duty exponential in the
+ * level index). Raising it packs more levels into the dim region (finer low
+ * end) and spreads fewer, larger steps across the bright region (coarser high
+ * end). Index 0 stays fully off; index 1 is the dimmest visible floor
+ * BL_LUT_MIN_ON. Tune BL_LUT_SHAPE / BL_LUT_MIN_ON against real hardware.
+ * BL_LUT_STEPS mirrors the public HW_LCD_BACKLIGHT_STEPS in lcd.h. */
 #define BL_LUT_STEPS          HW_LCD_BACKLIGHT_STEPS
 #define BL_LUT_MIN_ON         40      /* dimmest visible 10-bit duty (0..1023) */
-#define BL_LUT_GAMMA          1.4f
+#define BL_LUT_SHAPE          1.5f    /* >1 = low-fine / high-coarse; 1 = even */
 static uint16_t s_bl_lut[BL_LUT_STEPS + 1];
 
-/* Fill s_bl_lut[] with the gamma curve described above. Called once from
- * backlight_init() before any duty is applied. */
+/* Fill s_bl_lut[] with the low-fine / high-coarse curve above. Called once
+ * from backlight_init() before any duty is applied. */
 static void backlight_lut_init(void)
 {
     s_bl_lut[0] = 0;   /* off */
+    const float log_min = logf((float)BL_LUT_MIN_ON);
+    const float log_max = logf((float)BL_DUTY_MAX);
+    const float span = log_max - log_min;
     for (int i = 1; i <= BL_LUT_STEPS; i++) {
-        float t = (float)(i - 1) / (BL_LUT_STEPS - 1);
-        float duty = BL_LUT_MIN_ON + (BL_DUTY_MAX - BL_LUT_MIN_ON) * powf(t, BL_LUT_GAMMA);
+        float n = (float)(i - 1) / (BL_LUT_STEPS - 1);   /* 0..1 level position */
+        float duty = expf(log_min + span * powf(n, BL_LUT_SHAPE));
         int d = (int)(duty + 0.5f);
+        /* Guard against integer rounding collapsing two adjacent levels into
+         * a dead step (possible right above the dim floor); keep strictly
+         * increasing and clamped to the 10-bit range. */
+        if (d <= (int)s_bl_lut[i - 1]) {
+            d = (int)s_bl_lut[i - 1] + 1;
+        }
         if (d > BL_DUTY_MAX) {
             d = BL_DUTY_MAX;
         }
