@@ -46,6 +46,10 @@ static int  s_bt_sel;
  * device stays silent at boot (the stack is brought up lazily on page entry
  * when this is true). */
 static bool s_bt_on;
+/* BT switch state changed during playback: the NVS commit is deferred until
+ * playback stops, because a flash write stalls the PSRAM bus mid-stream. */
+static bool s_bt_save_pending;
+static void ui_bt_save_master(void);   /* defined below, used by ui_refresh_bt */
 /* Snapshot of the BT device list so the UI does not re-format device names
  * (incl. the MAC-address fallback) on every 16 ms tick. Refreshed only when
  * bluetooth_audio_device_version() advances. */
@@ -90,6 +94,14 @@ void ui_build_bt(lv_obj_t *page)
 
 void ui_refresh_bt(void)
 {
+        /* Commit a switch change made during playback now that the PSRAM bus
+         * is idle. Runs every UI tick, so the write lands as soon as the
+         * track ends or is stopped. */
+        if (s_bt_save_pending && player_state() != PLAYER_PLAYING) {
+            s_bt_save_pending = false;
+            ui_bt_save_master();
+        }
+
         /* Row 0 is the pinned master switch; below it live the device rows. */
         {
             static char sw[32];
@@ -217,6 +229,18 @@ void ui_refresh_bt(void)
 /* Toggle the Bluetooth master switch. ON powers the radio up and scans; OFF
  * disconnects (bluetooth_audio_disable() tears the link down safely) and powers
  * the controller off. Persisted so the choice survives reboot. */
+/* Persist the master switch. Called only when no track is playing: an NVS
+ * commit disables the flash cache and stalls both cores / PSRAM traffic. */
+static void ui_bt_save_master(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, UI_NVS_BT, s_bt_on ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
 static void ui_bt_toggle_master(void)
 {
     s_bt_on = !s_bt_on;
@@ -229,11 +253,10 @@ static void ui_bt_toggle_master(void)
         set_action("蓝牙关");
         s_bt_sel = 0;   /* keep the highlight on the switch row */
     }
-    nvs_handle_t h;
-    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_i32(h, UI_NVS_BT, s_bt_on ? 1 : 0);
-        nvs_commit(h);
-        nvs_close(h);
+    if (player_state() == PLAYER_PLAYING) {
+        s_bt_save_pending = true;   /* ui_refresh_bt() commits once idle */
+    } else {
+        ui_bt_save_master();
     }
     ui_refresh();
 }

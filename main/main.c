@@ -27,6 +27,7 @@
 #include "ebook.h"
 #include "rtc_wdt.h"
 #include "esp_attr.h"
+#include "esp_system.h"
 #include "hal/uart_ll.h"
 
 /* LVGL UI refresh cadence in the main loop (milliseconds). */
@@ -79,9 +80,11 @@ static int IRAM_ATTR xm_console_vprintf(const char *fmt, va_list ap)
  * user-visible "logs stop, only reboot recovers" crash). The RTC watchdog
  * runs on its own RTC clock, independent of the CPU and its interrupts:
  * when fed stops for RTC_WDT_TIMEOUT_MS, it resets the system on its own.
- * The boot log then prints both CPUs' PCs at the moment of the reset,
- * which pinpoints the exact freeze site. The player watchdog task feeds it
- * every 2 s in every healthy state, so nothing normal can trip it. */
+ * A pure hardware reset cannot capture the CPUs' PCs, so app_main prints
+ * esp_reset_reason() and player_init prints the pre-reset player snapshot
+ * kept in RTC_NOINIT memory; together they identify a silent freeze. The
+ * player watchdog task feeds it every 2 s in every healthy state, so
+ * nothing normal can trip it. */
 #define RTC_WDT_TIMEOUT_MS 30000
 
 static void rtc_wdt_arm(void)
@@ -190,6 +193,27 @@ static void lvgl_task(void *arg)
     }
 }
 
+/* A silent freeze (RTC WDT, brownout, bus stall) leaves no runtime log, so
+ * the reset reason is the only clue. Print it as the first line after the
+ * non-blocking console is installed. */
+static const char *reset_reason_name(esp_reset_reason_t r)
+{
+    switch (r) {
+    case ESP_RST_UNKNOWN:   return "unknown";
+    case ESP_RST_POWERON:   return "power-on";
+    case ESP_RST_EXT:       return "external pin";
+    case ESP_RST_SW:        return "software";
+    case ESP_RST_PANIC:     return "panic/exception";
+    case ESP_RST_INT_WDT:   return "interrupt WDT";
+    case ESP_RST_TASK_WDT:  return "task WDT";
+    case ESP_RST_WDT:       return "WDT (RTC WDT backstop)";
+    case ESP_RST_DEEPSLEEP: return "deep sleep";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT (supply dipped)";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "other";
+    }
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "Xiaomiao LVGL 9.5 dashboard boot");
@@ -197,6 +221,10 @@ void app_main(void)
     /* Non-blocking console: a wedged UART must never freeze a task that
      * logs (see xm_console_vprintf). Installed before any subsystem logs. */
     esp_log_set_vprintf(xm_console_vprintf);
+
+    const esp_reset_reason_t rr = esp_reset_reason();
+    ESP_LOGW(TAG, "[BOOT] reset reason: %s (%d)",
+             reset_reason_name(rr), (int)rr);
 
     /* Arm the last-resort RTC watchdog before anything that can stall the
      * CPU (see rtc_wdt_arm above). Fed every 2 s by the player watchdog

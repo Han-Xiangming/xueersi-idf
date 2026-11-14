@@ -31,6 +31,10 @@
 #define MP3_READ_CHUNK  (4 * 1024)
 /* Worst-case decoded PCM: MPEG1 Layer III, 2 channels, 1152 samples/frame. */
 #define MP3_PCM_MAX     (2 * 1152 * 2)
+/* Largest ID3v2 tag buffered for in-RAM parsing at track open. Covers are
+ * stripped by the PC-side clear-cover.ps1, so real tags are a few KB; a
+ * larger tag is skipped with ONE seek rather than walked frame by frame. */
+#define ID3_TAG_BUF_MAX (32 * 1024)
 
 /* Consecutive decode failures that mark a track corrupt. Resyncing garbage
  * one byte at a time is O(n^2) on a bad region; past this cap the track is
@@ -195,6 +199,21 @@ static volatile player_err_t s_last_err = PLAYER_ERR_NONE;
 /* Monotonic timestamp (ms, esp_timer) of the last decode progress. Read by
  * the watchdog task while the player is PLAYING to detect a hung decode. */
 static volatile uint32_t s_decode_beat_ms;
+
+/* --- Reset diagnostics -------------------------------------------------
+ * RTC_NOINIT survives an RTC-WDT / software / brownout reset but not a
+ * power cycle. The watchdog task refreshes this every 2 s, so after a
+ * silent CPU/bus freeze the next boot can report what the player was doing
+ * when the feed stopped. A pure hardware reset cannot capture the CPUs' PCs;
+ * this snapshot plus esp_reset_reason() is the closest available clue. */
+#define PLAYER_SNAPSHOT_MAGIC 0x504C5952u   /* "PLYR" */
+typedef struct {
+    uint32_t magic;
+    uint32_t state;
+    uint32_t beat_ms;
+    uint32_t feeds;
+} player_snapshot_t;
+RTC_NOINIT_ATTR static player_snapshot_t s_snapshot;
 /* True while decode_loop() is running (including paused inside it). Lets
  * player_play() distinguish a self-call (single-track replay / list
  * auto-advance) from a UI call: a self-call must NOT set s_stop_req — the
@@ -222,6 +241,10 @@ static int s_bytes_left;
 static int s_consumed;
 static int16_t s_pcm[MP3_PCM_MAX];
 EXT_RAM_BSS_ATTR static int16_t s_stereo[MP3_PCM_MAX];
+/* ID3v2 tag scratch: filled with ONE sequential fread at track open and
+ * parsed entirely in RAM. PSRAM is fine here (never touched on the PCM hot
+ * path), and a static buffer avoids allocation failures / fragmentation. */
+EXT_RAM_BSS_ATTR static unsigned char s_id3_tag[ID3_TAG_BUF_MAX];
 
 /* --- Playback error reporting ------------------------------------------
  * Errors are sticky: set when a track is aborted / a play request is
@@ -754,41 +777,73 @@ static void parse_id3v2(void)
             return;
         }
     }
-    long tag_end = base + 10 + tag_size;
-    long pos = base + 10;
+    /* ---- One sequential read, then parse entirely in RAM ----------------
+     * The old frame walk did fseek + short fread per frame (it read only
+     * the first 96/128 bytes of TXXX/RVA2 and seeked past the rest): about
+     * two dozen non-aligned SDSPI random reads for a tag with 11 frames.
+     * On this board that pattern is a known trigger for an SDSPI / PSRAM
+     * bus hang, which freezes both cores so completely that even the
+     * direct-to-FIFO console stops. A single sequential read removes it. */
+    if (tag_size <= 0 || tag_size > ID3_TAG_BUF_MAX) {
+        ESP_LOGW(TAG, "ID3v2 tag %ld bytes exceeds %d B buffer, skipping",
+                 tag_size, ID3_TAG_BUF_MAX);
+        fseek(s_src.fp, base + 10 + tag_size, SEEK_SET);
+        hw_audio_set_track_gain_db(0.0f);
+        return;
+    }
+    if (fseek(s_src.fp, base + 10, SEEK_SET) != 0) {
+        hw_audio_set_track_gain_db(0.0f);
+        return;
+    }
+    long got = 0;
+    while (got < tag_size) {
+        size_t want = (size_t)(tag_size - got);
+        if (want > MP3_READ_CHUNK) {
+            want = MP3_READ_CHUNK;
+        }
+        size_t n = fread(s_id3_tag + got, 1, want, s_src.fp);
+        if (n == 0) {
+            break;
+        }
+        got += (long)n;
+#if defined(CONFIG_ESP_TASK_WDT_EN)
+        esp_task_wdt_reset();   /* a slow card must not trip the 5 s WDT */
+#endif
+    }
+    if (got != tag_size) {
+        ESP_LOGW(TAG, "ID3v2 short read (%ld/%ld), skipping metadata",
+                 got, tag_size);
+        fseek(s_src.fp, base + 10 + tag_size, SEEK_SET);
+        hw_audio_set_track_gain_db(0.0f);
+        return;
+    }
+
+    const unsigned char *t = s_id3_tag;
+    long pos = 0;
     if (hdr[5] & 0x40) {
         /* Extended header (flag 0x40). Its size field excludes itself in
          * v2.4 (syncsafe) but includes itself in v2.3 (plain big-endian). */
-        unsigned char eh[4];
-        if (fseek(s_src.fp, pos, SEEK_SET) == 0 &&
-            fread(eh, 1, sizeof(eh), s_src.fp) == sizeof(eh)) {
-            pos += (hdr[3] >= 4) ? id3_syncsafe32(eh) : id3_big32(eh);
+        if (pos + 4 <= tag_size) {
+            pos += (hdr[3] >= 4) ? id3_syncsafe32(t + pos) : id3_big32(t + pos);
         }
         else {
-            pos = tag_end;   /* header unreadable: no frames to scan */
+            pos = tag_size;   /* header unreadable: no frames to scan */
         }
     }
 
-    /* Bounded frame walk: even with the file-length check above, a
-     * pathological tag can still claim a large-but-valid size full of
-     * non-padding garbage (no 0x00 frame IDs). Cap the iterations so the
-     * worst case is a few hundred SD seeks (~0.3 s), far under the task
-     * WDT / stall-watchdog limits. */
+    /* Bounded in-RAM frame walk. A corrupt frame size that points past the
+     * buffered tag ends the walk instead of indexing out of bounds. */
     int frames_scanned = 0;
-    while (pos + 10 <= tag_end && frames_scanned++ < 512) {
-        unsigned char fh[10];
-        if (fseek(s_src.fp, pos, SEEK_SET) != 0 ||
-            fread(fh, 1, sizeof(fh), s_src.fp) != sizeof(fh)) {
-            break;
-        }
+    while (pos + 10 <= tag_size && frames_scanned++ < 512) {
+        const unsigned char *fh = t + pos;
         long fsz = (hdr[3] >= 4) ? id3_syncsafe32(fh + 4) : id3_big32(fh + 4);
-        if (fh[0] == 0x00 || fsz <= 0) {
-            break;   /* padding (or corrupt): done */
+        if (fh[0] == 0x00 || fsz <= 0 || fsz > tag_size - pos - 10) {
+            break;   /* padding / corrupt: done */
         }
+        const unsigned char *d = fh + 10;
         if (memcmp(fh, "TXXX", 4) == 0) {
-            unsigned char d[96];
-            size_t rd = (fsz < (long)sizeof(d)) ? (size_t)fsz : sizeof(d);
-            if (fread(d, 1, rd, s_src.fp) == rd && rd >= 3) {
+            size_t rd = (fsz < 96) ? (size_t)fsz : 96;
+            if (rd >= 3) {
                 int enc = d[0];
                 size_t dstart = 1;   /* first description byte */
                 if (enc == 1 || enc == 2) {
@@ -829,9 +884,8 @@ static void parse_id3v2(void)
             /* identification (NUL-terminated Latin-1) + channel type byte
              * (1=right, 2=left, 3=both) + 16-bit signed gain in 0.01 dB
              * steps + peak field (ignored). */
-            unsigned char d[128];
-            size_t rd = (fsz < (long)sizeof(d)) ? (size_t)fsz : sizeof(d);
-            if (fread(d, 1, rd, s_src.fp) == rd && rd >= 6) {
+            size_t rd = (fsz < 128) ? (size_t)fsz : 128;
+            if (rd >= 6) {
                 size_t idlen = 0;
                 while (idlen < rd && d[idlen] != 0x00) {
                     idlen++;
@@ -854,12 +908,14 @@ static void parse_id3v2(void)
                 }
             }
         }
-        pos += 10 + fsz;   /* loop top fseeks anyway; this bounds the walk */
+        pos += 10 + fsz;
     }
 
+    /* The sequential read already leaves the stream here; seek explicitly
+     * so a future early-return branch cannot desync the decoder. */
     fseek(s_src.fp, base + 10 + tag_size, SEEK_SET);
-    ESP_LOGD(TAG, "ID3v2 tag (%ld bytes): track %.2f dB, album %.2f dB",
-             tag_size, track_gain, album_gain);
+    ESP_LOGD(TAG, "ID3v2 tag (%ld bytes, %d frames): track %.2f dB, album %.2f dB",
+             tag_size, frames_scanned, track_gain, album_gain);
     /* ReplayGain 2.0 rule: track gain wins, album gain is the fallback. */
     float gain = has_track ? track_gain : (has_album ? album_gain : 0.0f);
     hw_audio_set_track_gain_db(gain);
@@ -1189,9 +1245,18 @@ static bool decode_frame(bool *rate_set)
     audio_write_result_t wr;
     if (info.nChans >= 2) {
         /* Stereo / multichannel: outputSamps is the total sample count, so the
-         * number of stereo frames to write is outputSamps / 2. This is the path
-         * every stereo/joint-stereo file takes. */
-        wr = hw_audio_write_pcm(s_pcm, (size_t)(info.outputSamps / 2));
+         * number of stereo frames to write is outputSamps / 2. Bound it like
+         * the mono branch: a malformed frame must never let the DSP/ring read
+         * past s_pcm[], and a negative outputSamps must not wrap into a huge
+         * size_t. Helix normally reports 2304 (1152 stereo frames). */
+        size_t frames = 0;
+        if (info.outputSamps > 0) {
+            frames = (size_t)info.outputSamps / 2;
+            if (frames > MP3_PCM_MAX / 2) {
+                frames = MP3_PCM_MAX / 2;
+            }
+        }
+        wr = hw_audio_write_pcm(s_pcm, frames);
     }
     else if (info.nChans == 1) {
         /* Genuine mono output from the decoder: upmix to stereo by duplicating
@@ -1636,6 +1701,12 @@ static void player_watch_task(void *arg)
          * the 30 s reset backstop can never trip; a total CPU freeze (PSRAM
          * bus stall, SD hardware hang) stops the feed and auto-resets. */
         rtc_wdt_feed();
+        /* Record the last known-good state. If the next boot finds this
+         * snapshot with a PLAYING state, the freeze happened mid-track. */
+        s_snapshot.magic   = PLAYER_SNAPSHOT_MAGIC;
+        s_snapshot.state   = (uint32_t)s_state;
+        s_snapshot.beat_ms = s_decode_beat_ms;
+        s_snapshot.feeds++;
         if (s_state != PLAYER_PLAYING || s_decode_beat_ms == 0) {
             continue;   /* nothing playing / no frame yet: nothing to watch */
         }
@@ -1690,6 +1761,14 @@ void player_set_autopause_on_route_change(bool on)
 
 void player_init(void)
 {
+    /* Survives RTC WDT / brownout / software resets. A PLAYING state here
+     * means the previous run died mid-track without a clean stop. */
+    if (s_snapshot.magic == PLAYER_SNAPSHOT_MAGIC) {
+        ESP_LOGW(TAG, "[BOOT] previous run snapshot: state=%u decode_beat=%u ms, "
+                      "feeds=%u (a PLAYING state means a mid-track freeze)",
+                 (unsigned)s_snapshot.state, (unsigned)s_snapshot.beat_ms,
+                 (unsigned)s_snapshot.feeds);
+    }
     s_state = PLAYER_IDLE;
     s_name[0] = '\0';
     hw_audio_set_route_change_cb(player_on_route_change);

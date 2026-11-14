@@ -354,6 +354,16 @@ static void settings_commit_pending(void)
     if (s_save_pending == 0) {
         return;
     }
+    /* A commit is a flash write: the cache is disabled and BOTH cores (plus
+     * all PSRAM traffic) stall for its duration. Doing that while the decode
+     * task streams through PSRAM-backed buffers can wedge the bus so hard
+     * that even the direct-to-FIFO console stops. Keep the dirty bits;
+     * ui_settings_flush() commits on the first non-playing tick. This gate
+     * also covers ui_settings_flush_force(), which used to bypass the
+     * playback gate for standby / power-down paths. */
+    if (player_state() == PLAYER_PLAYING) {
+        return;
+    }
     if (s_save_pending & SETTINGS_DIRTY_VOLUME) {
         ui_settings_save_volume();
     }
@@ -394,8 +404,10 @@ void ui_settings_flush(void)
 
 void ui_settings_flush_force(void)
 {
-    /* Ignore the debounce AND the playback gate: for a power-down / standby
-     * path that must persist the last change immediately. */
+    /* Ignore the debounce, but NOT the playback gate in
+     * settings_commit_pending(): a power-down / standby path must not trade
+     * a lost setting for a wedged PSRAM bus. The dirty bits stay set and are
+     * committed by the first idle refresh tick. */
     settings_commit_pending();
 }
 void ui_refresh_settings(void)
