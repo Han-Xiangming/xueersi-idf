@@ -520,20 +520,31 @@ static void audio_set_loudness_coeff(uint32_t rate)
 }
 
 /* --- Soft limiter (anti-clipping / small-driver protection) -------------
- * A hot track at v=100 passes 0 dB straight to the DAC and clips. A peak
- * envelope (instant attack, ~100 ms release) drives a gain that drops fast
- * (~0.5 ms) above the threshold and recovers slowly, so transients are
- * handled without pumping. The gain curve is piecewise-linear, so no division
- * runs per sample: below the threshold the limiter is flat 0 dB, above it the
- * gain falls linearly to ~0.9 at full scale.
+ * A hot track at v=100 (especially with a positive master preamp) used to be
+ * hard-clipped to 16-bit by the gain stages BEFORE this limiter, so the
+ * limiter merely scaled an already-square wave: audible fizz plus maximum
+ * D-class current draw. Its old linear curve also had only -0.9 dB of
+ * authority, with LOUD_LIMIT_MIN_Q15 marked "unreachable here".
  *
- * The racetrack unit reaches its Xmax (±0.22 mm) early at high level, so the
- * threshold was pulled down from 30000 to curb the hot peaks sooner. */
-#define LOUD_LIMIT_THRESH     27000  /* peaks above this get tamed (FS=32767) */
-#define LOUD_LIMIT_SLOPE_Q15  18619  /* gain(env=32767) = 0.9 (-0.9 dB) */
-#define LOUD_LIMIT_MIN_Q15    24576  /* gain floor (0.75), unreachable here */
-#define LIM_ATT_Q15           1453   /* gain drop, ~0.5 ms @ 44.1 kHz */
-#define LIM_REL_Q15           32753  /* envelope & gain release, ~100 ms */
+ * The gain stages now keep LIM_HEADROOM of integer headroom instead of
+ * clipping, and this limiter maps the peak envelope onto a hard DAC ceiling:
+ *
+ *     tg = CEIL * 2^15 / env    (one 32-bit divide, only on hot samples)
+ *
+ * Below LOUD_LIMIT_THRESH it is fully transparent (tg = 32768). The envelope
+ * attacks instantly; the gain attacks in ~0.1 ms and releases in ~100 ms.
+ * LIM_REL_Q15 is the envelope DECAY factor, so (32768 - LIM_REL_Q15) is the
+ * release STEP — the old code multiplied the release by 0.9995 and jumped
+ * straight to tg, which made the gain ripple around the target. The final
+ * clamp is the hard ceiling: even the attack transient cannot reach 0 dBFS. */
+#define LOUD_LIMIT_THRESH     24576  /* -2.5 dBFS: transparent below this */
+#define LOUD_LIMIT_CEIL       24576  /* hard ceiling at the DAC / amp input */
+#define LIM_CEIL_TIMES_Q15    (LOUD_LIMIT_CEIL * 32768)  /* 32-bit numerator */
+#define LOUD_LIMIT_MIN_Q15     1024  /* 0.031: absorbs up to +24 dB overload */
+#define LIM_HEADROOM         524288  /* 16x FS: no clipping before the limiter */
+#define LIM_ATT_Q15           8192   /* gain attack alpha 0.25, ~0.1 ms */
+#define LIM_REL_Q15          32753   /* envelope DECAY factor, ~100 ms */
+#define LIM_REL_ALPHA_Q15     (32768 - LIM_REL_Q15)  /* gain release step */
 static int32_t s_lim_env;             /* peak envelope */
 static int32_t s_lim_gain;            /* smoothed limiter gain, Q15 */
 
@@ -1527,39 +1538,46 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
          * multiply: the gain can exceed 1.0 (up to +12 dB). */
         s_track_gain_sm += ((s_track_gain - s_track_gain_sm) * VOL_SMOOTH_A_Q15) >> 15;
         y = (int32_t)(((int64_t)y * s_track_gain_sm) >> 15);
-        if (y > 32767) {
-            y = 32767;
+        /* Keep integer headroom instead of clipping here: the limiter at the
+         * end of this chain is the ONLY place allowed to bound the level. */
+        if (y > LIM_HEADROOM) {
+            y = LIM_HEADROOM;
         }
-        else if (y < -32768) {
-            y = -32768;
+        else if (y < -LIM_HEADROOM) {
+            y = -LIM_HEADROOM;
         }
 
-        /* User master gain (preamp offset, pre-volume; the soft limiter
-         * below still bounds the peaks). Same 64-bit multiply: ±12 dB can
-         * scale by up to ~4x. */
+        /* User master gain (preamp offset, pre-volume). Same 64-bit
+         * multiply: ±12 dB can scale by up to ~4x. */
         s_master_gain_sm += ((s_master_gain - s_master_gain_sm) * VOL_SMOOTH_A_Q15) >> 15;
         y = (int32_t)(((int64_t)y * s_master_gain_sm) >> 15);
-        if (y > 32767) {
-            y = 32767;
+        if (y > LIM_HEADROOM) {
+            y = LIM_HEADROOM;
         }
-        else if (y < -32768) {
-            y = -32768;
+        else if (y < -LIM_HEADROOM) {
+            y = -LIM_HEADROOM;
         }
 
         g += ((g_target - g) * VOL_SMOOTH_A_Q15) >> 15;
-        y = (y * g) >> 15;               /* apply logarithmic volume */
+        /* 64-bit: y can carry LIM_HEADROOM of overload before limiting. */
+        y = (int32_t)(((int64_t)y * g) >> 15);   /* logarithmic volume */
 
-        /* Soft limiter: tame peaks above the threshold */
+        /* Soft limiter on the UNCLIPPED level: tg maps the current peak
+         * envelope exactly onto LOUD_LIMIT_CEIL, so a hot track is turned
+         * down instead of being clipped flat and merely scaled afterwards. */
         int32_t a = (y < 0) ? -y : y;
         if (a > s_lim_env) {
             s_lim_env = a;               /* instant peak attack */
         }
         else {
-            s_lim_env = (s_lim_env * LIM_REL_Q15) >> 15;   /* slow release */
+            s_lim_env = (int32_t)(((int64_t)s_lim_env * LIM_REL_Q15) >> 15);
         }
         int32_t tg = 32768;              /* flat 0 dB below threshold */
         if (s_lim_env > LOUD_LIMIT_THRESH) {
-            tg = 32768 - (((s_lim_env - LOUD_LIMIT_THRESH) * LOUD_LIMIT_SLOPE_Q15) >> 15);
+            tg = LIM_CEIL_TIMES_Q15 / s_lim_env;
+            if (tg > 32768) {
+                tg = 32768;
+            }
             if (tg < LOUD_LIMIT_MIN_Q15) {
                 tg = LOUD_LIMIT_MIN_Q15;
             }
@@ -1568,9 +1586,19 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
             s_lim_gain += ((tg - s_lim_gain) * LIM_ATT_Q15) >> 15;
         }
         else {
-            s_lim_gain += ((tg - s_lim_gain) * LIM_REL_Q15) >> 15;
+            /* Release STEP, not the envelope decay factor: multiplying by
+             * LIM_REL_Q15 (0.9995) here made the gain jump straight to tg. */
+            s_lim_gain += ((tg - s_lim_gain) * LIM_REL_ALPHA_Q15) >> 15;
         }
-        y = (y * s_lim_gain) >> 15;
+        y = (int32_t)(((int64_t)y * s_lim_gain) >> 15);
+        /* Hard ceiling: covers the few samples while the attack is still
+         * falling, so no transient can reach 0 dBFS or wrap on the cast. */
+        if (y > LOUD_LIMIT_CEIL) {
+            y = LOUD_LIMIT_CEIL;
+        }
+        else if (y < -LOUD_LIMIT_CEIL) {
+            y = -LOUD_LIMIT_CEIL;
+        }
         dsp_buf[i] = (int16_t)y;
     }
     s_vol_gain_sm = g;
