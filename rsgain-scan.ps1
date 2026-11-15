@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     扫描 SD 卡曲库并写入 ReplayGain 2.0 分轨标签。
@@ -10,6 +10,9 @@
 
     安全参数写在运行时生成的临时 preset 里（用完即删），不在仓库中
     新增 ini 文件，也不依赖 rsgain 安装目录里的预设内容。
+
+    双击运行（本脚本或 rsgain-scan.bat）时，脚本结束会停在"按 Enter 关闭"
+    的提示上，避免窗口一闪而过看不到汇总；从终端或自动化调用时不阻塞。
 
     每个目录输出 replaygain.csv（-O），脚本末尾汇总最热的曲目、正增益
     曲目、以及被削波保护调整 / 原始峰值过 0 dB 的曲目，便于提前发现
@@ -28,6 +31,12 @@
 .PARAMETER RsgainPath
     显式指定 rsgain.exe 路径。
 
+.PARAMETER Pause
+    结束时总是等待按 Enter，不自动判断启动方式。
+
+.PARAMETER NoPause
+    结束时直接退出，不等待按 Enter（自动化 / 脚本调用时使用）。
+
 .EXAMPLE
     .\rsgain-scan.ps1 D:\Music
     .\rsgain-scan.ps1 D:\Music -Incremental -Threads 2
@@ -42,7 +51,11 @@ param(
     [ValidateRange(1, 32)]
     [int]$Threads = 4,
 
-    [string]$RsgainPath
+    [string]$RsgainPath,
+
+    [switch]$Pause,
+
+    [switch]$NoPause
 )
 
 $ErrorActionPreference = 'Stop'
@@ -51,15 +64,75 @@ function Write-Step([string]$Message) {
     Write-Host $Message -ForegroundColor Cyan
 }
 
+# ---- 结束时的窗口停留 ----------------------------------------------------
+# 双击运行（资源管理器里双击 .bat / .ps1）时，窗口会随脚本结束直接关闭，
+# 看不到汇总结果。判定方式：从当前进程沿父进程链往上找，遇到的第一个
+# "非 shell 类祖先"若是 explorer.exe，说明是用户在资源管理器里双击启动
+# 的 —— 此时停在"按 Enter 关闭"上；从终端 / 自动化调用时不阻塞。
+$script:ShellHosts = @('powershell.exe', 'pwsh.exe', 'cmd.exe', 'conhost.exe',
+                       'bash.exe', 'sh.exe', 'zsh.exe')
+
+function Test-DoubleClicked {
+    try {
+        $all = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
+        $map = @{}
+        foreach ($p in $all) { $map[[int]$p.ProcessId] = $p }
+
+        $cur = $PID
+        for ($i = 0; $i -lt 6; $i++) {
+            $proc = $map[$cur]
+            if (-not $proc) { return $false }
+
+            $parentId = [int]$proc.ParentProcessId
+            if ($parentId -le 4) { return $false }
+            $parent = $map[$parentId]
+            if (-not $parent) { return $false }
+
+            $name = ([string]$parent.Name).ToLowerInvariant()
+            if ($name -eq 'explorer.exe') { return $true }
+            if ($script:ShellHosts -notcontains $name) { return $false }
+
+            $cur = $parentId
+        }
+    } catch {
+        return $false
+    }
+    return $false
+}
+
+function Test-ShouldPause {
+    if ($Pause) { return $true }
+    if ($NoPause) { return $false }
+    return (Test-DoubleClicked)
+}
+
+function Wait-AtEnd {
+    Write-Host ''
+    Write-Step 'All done. Press Enter to close this window.'
+    try { [void](Read-Host) } catch { }
+}
+
 # ---- 定位 rsgain ---------------------------------------------------------
 $exe = $null
 $candidates = @()
 if ($RsgainPath) { $candidates += $RsgainPath }
 $candidates += 'E:\tools\rsgain-3.7-win64\rsgain.exe'
+$candidates += 'D:\tools\rsgain-3.7-win64\rsgain.exe'
+$candidates += "$env:USERPROFILE\scoop\shims\rsgain.exe"
+$candidates += "$env:USERPROFILE\scoop\apps\rsgain\current\rsgain.exe"
 foreach ($candidate in $candidates) {
     if (Test-Path -LiteralPath $candidate -PathType Leaf) {
         $exe = $candidate
         break
+    }
+}
+if (-not $exe) {
+    # 工具目录里再扫一遍（rsgain 可能装在别的版本目录 / 别的盘）
+    foreach ($dir in @('E:\tools', 'D:\tools', "$env:USERPROFILE\scoop\apps")) {
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
+        $hit = Get-ChildItem -LiteralPath $dir -Filter 'rsgain.exe' -Recurse -Depth 3 -ErrorAction SilentlyContinue |
+               Select-Object -First 1
+        if ($hit) { $exe = $hit.FullName; break }
     }
 }
 if (-not $exe) {
@@ -69,6 +142,7 @@ if (-not $exe) {
 if (-not $exe) {
     Write-Host '[ERROR] rsgain not found. Install via: scoop install extras/rsgain' -ForegroundColor Red
     Write-Host '        or pass -RsgainPath <path\to\rsgain.exe>' -ForegroundColor Red
+    if (Test-ShouldPause) { Wait-AtEnd }
     exit 1
 }
 
@@ -78,6 +152,7 @@ if (-not $MusicDir) {
 }
 if (-not (Test-Path -LiteralPath $MusicDir -PathType Container)) {
     Write-Host "[ERROR] folder not found: $MusicDir" -ForegroundColor Red
+    if (Test-ShouldPause) { Wait-AtEnd }
     exit 1
 }
 $MusicDir = (Resolve-Path -LiteralPath $MusicDir).Path
@@ -192,6 +267,10 @@ try {
 }
 finally {
     Remove-Item -LiteralPath $preset -Force -ErrorAction SilentlyContinue
+}
+
+if (Test-ShouldPause) {
+    Wait-AtEnd
 }
 
 exit $exitCode
