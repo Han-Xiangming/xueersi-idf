@@ -51,7 +51,7 @@ dev clean      :: 清理
 
 ### 1.2 PC 端工具脚本
 
-- `rsgain-scan.bat` —— 调用 rsgain 扫描 SD 卡中的 mp3，写入 ReplayGain 2.0 标签。
+- `rsgain-scan.ps1` —— 调用 rsgain 全量重扫 SD 卡中的 mp3，写入 ReplayGain 2.0 标签：目标 -18 LUFS、统一 ID3v2.3、true peak / 峰值上限 -1 dBTP、总是启用削波保护。安全参数由运行时临时 preset 提供（不落盘到仓库），每目录输出 `replaygain.csv`，末尾汇总最热 / 正增益 / 应用增益后峰值逼近 -1 dBTP 的曲目。默认全量重扫以统一外部下载文件自带的旧标签，`-Incremental` 才跳过已有标签；`rsgain-scan.bat` 仅保留为转发 wrapper。
 - `clear-cover.bat` / `clear-cover.ps1` —— 批量清除 mp3 内嵌封面（视频流）并保留全部音频标签：用 ffmpeg 转封装剥离封面流后回写。ReplayGain 等 TXXX 标签在转封装中原样保留，不影响固件按标签做响度归一。
 
 ---

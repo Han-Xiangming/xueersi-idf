@@ -7,8 +7,8 @@
 #      audio stream copy): cover stream dropped, all other ID3 tags kept
 #      (including ReplayGain TXXX), output forced to ID3v2.3.
 #   3. Temp file in the same directory, then atomic replace.
-#   4. Afterwards re-run rsgain-scan.bat as a safety net (-S skips files
-#      that still have ReplayGain tags).
+#   4. Afterwards re-run rsgain-scan.ps1 as a safety net (full rescan by
+#      default; -Incremental keeps the tags that survived the remux).
 #
 # Usage: powershell -ExecutionPolicy Bypass -File clear-cover.ps1 D:\Music
 
@@ -68,4 +68,4 @@ foreach ($f in $files) {
 
 Write-Host ""
 Write-Host ("Done. stripped={0} untouched={1} failed={2}" -f $processed, $skipped, $failed)
-Write-Host "Tip: re-run rsgain-scan.bat afterwards (-S skips still-tagged files)."
+Write-Host "Tip: re-run rsgain-scan.ps1 afterwards (full rescan by default)."
