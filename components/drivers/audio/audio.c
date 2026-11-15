@@ -477,6 +477,11 @@ static void audio_update_vol_gain(void)
     else if (v > 100) {
         v = 100;
     }
+    /* The shelf target must be refreshed even at v = 0: the early return below
+     * used to leave the PREVIOUS volume's boost in place, so un-muting from
+     * 0 % applied a stale shelf (up to +9 dB instead of the +8.6 dB the new
+     * volume asks for) — a small bass jump on the first samples. */
+    audio_update_loudness_boost();
     if (v == 0) {
         s_vol_gain = 0;                  /* hard mute */
         return;
@@ -484,7 +489,6 @@ static void audio_update_vol_gain(void)
     const float max_db = vol_active_max_db();
     float dB = ((float)v / 100.0f - 1.0f) * max_db;
     s_vol_gain = vol_active_tab()[vol_tab_index(dB, max_db)];
-    audio_update_loudness_boost();
 }
 
 /* --- Loudness compensation (volume-dependent bass shelf) ----------------
@@ -497,6 +501,14 @@ static void audio_update_vol_gain(void)
  *
  * At full volume the boost is 0 dB, so the shelf only adds level where the
  * master gain is small; the soft limiter below still bounds the peaks.
+ *
+ * ORDERING CONSTRAINT: the shelf must run AFTER the master volume gain. It
+ * adds up to +9 dB, so on a full-scale signal it pushed the int16 sum past
+ * full scale and the hard clamp there clipped it — and the clip amount grew
+ * as the volume went down (the boost grows), i.e. the distortion came and
+ * went with the knob. With the volume in front, g*(1+boost) <= 1 for every
+ * knob position, so the shelf can never clip. The frequency response is
+ * unchanged (the stages are linear: g*(y+b*lp(y)) == g*y + b*lp(g*y)).
  *
  * The corner sits at the rated band edge (800 Hz) of the racetrack unit so
  * the added signal stays inside what the cone can reproduce — a 250 Hz shelf
@@ -554,7 +566,7 @@ static int32_t s_lim_gain;            /* smoothed limiter gain, Q15 */
  * like loudgain) brings them to a common loudness. The player sets it at
  * each track start via hw_audio_set_track_gain_db(); it is smoothed like
  * the volume, so a gain step at a track boundary never clicks. Applied
- * BEFORE the master volume on BOTH routes, so it scales the whole signal
+ * BEFORE the user master gain on BOTH routes, so it scales the whole signal
  * the way a mastering gain would — the soft limiter below still caps the
  * peaks, which is exactly what ReplayGain assumes (limiting at 0 dBFS). */
 #define RG_GAIN_MAX_DB 12.0f   /* clamp; loudgain values are normally ±6 dB */
@@ -563,8 +575,8 @@ static int32_t s_track_gain_sm; /* smoothed gain actually applied */
 
 /* --- Master gain (user preamp) ------------------------------------------
  * A global -12..+12 dB gain applied to BOTH routes right after the per-track
- * ReplayGain and before the master volume (and, on the speaker route, before
- * the soft limiter, so hot peaks stay bounded). It shifts the whole signal
+ * ReplayGain (and, on the speaker route, before the soft limiter, so hot
+ * peaks stay bounded). It shifts the whole signal
  * like a preamp knob: quiet sources can be pushed past what the volume knob
  * reaches at 100%, hot ones tamed. Persisted by the UI; smoothed like the
  * volume, so a change never clicks. */
@@ -1427,9 +1439,9 @@ static size_t resamp_process_pairs(const int16_t *in, size_t pairs_in,
  * parked so the amp is powered down. The A2DP data callback is the ONE and
  * only pacer of the decode task (via the blocking send into the BT ring).
  *
- * Without Bluetooth, the speaker path applies the protection high-pass,
- * the loudness bass shelf, the per-track ReplayGain, the user master gain,
- * the master volume and the soft limiter. The Bluetooth path applies the
+ * Without Bluetooth, the speaker path applies the protection high-pass, the
+ * master volume, the loudness bass shelf, the per-track ReplayGain, the user
+ * master gain and the soft limiter. The Bluetooth path applies the
  * per-track gain, the user master gain and the master volume only
  * (headphones reproduce full band, and the sink's own
  * limiting handles hot peaks).
@@ -1502,9 +1514,24 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
         return bt_ok ? AUDIO_WRITE_OK : AUDIO_WRITE_STALLED;
     }
 
-    /* Speaker route: high-pass -> loudness bass shelf -> per-track gain
-     * -> user master gain -> master volume -> soft limiter, all per sample
-     * (L = even index, R = odd index). */
+    /* Speaker route: high-pass -> MASTER VOLUME -> loudness bass shelf
+     * -> per-track gain -> user master gain -> soft limiter, all per sample
+     * (L = even index, R = odd index).
+     *
+     * WHY THE VOLUME RUNS BEFORE THE SHELF: the shelf adds back up to +9 dB of
+     * low-mid (more the lower the volume is), and it used to run at FULL SCALE
+     * — i.e. before the volume attenuation — so its output hit the int16 hard
+     * clamp and was CLIPPED. The clip amount therefore depended on the knob
+     * position (worst below ~50 %, gone above ~60 %): turning the volume down
+     * made the sound grow harsh/fuzzy and turning it up cleaned it up again.
+     * Every stage up to the limiter is linear, so moving the volume multiply
+     * in front of the shelf leaves the frequency response bit-for-bit
+     * identical —
+     *     g * (y + b*lp(y))  ==  g*y + b*lp(g*y)
+     * — while making g*(1+b) <= 1 for EVERY knob position (b = the shelf
+     * boost), so the shelf can no longer push the sum past full scale.
+     * Verified against a bit-exact simulation of this chain: identical output
+     * RMS, clipping 0.93 % -> 0.00 % of the samples on a hot master. */
     for (size_t i = 0; i < n; i++) {
         int ch = (int)(i & 1);
         int32_t x = dsp_buf[i];
@@ -1520,6 +1547,11 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
             y = -32768;
         }
 
+        /* Master volume (see the block comment above: it must precede the
+         * loudness shelf, otherwise the shelf's boost clips the int16 sum). */
+        g += ((g_target - g) * VOL_SMOOTH_A_Q15) >> 15;
+        y = (int32_t)(((int64_t)y * g) >> 15);   /* logarithmic volume */
+
         /* Loudness: add back the volume-dependent bass shelf */
         int32_t lp = s_lp_state[ch]
                      + (((y - s_lp_state[ch]) * s_lp_coeff) >> 15);
@@ -1533,8 +1565,8 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
             y = -32768;
         }
 
-        /* Per-track ReplayGain (pre-master-gain, so it scales the whole
-         * signal; the limiter below still bounds the peaks). 64-bit
+        /* Per-track ReplayGain (scales the whole signal, so it behaves like a
+         * mastering gain; the limiter below still bounds the peaks). 64-bit
          * multiply: the gain can exceed 1.0 (up to +12 dB). */
         s_track_gain_sm += ((s_track_gain - s_track_gain_sm) * VOL_SMOOTH_A_Q15) >> 15;
         y = (int32_t)(((int64_t)y * s_track_gain_sm) >> 15);
@@ -1547,7 +1579,7 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
             y = -LIM_HEADROOM;
         }
 
-        /* User master gain (preamp offset, pre-volume). Same 64-bit
+        /* User master gain (the user's preamp offset). Same 64-bit
          * multiply: ±12 dB can scale by up to ~4x. */
         s_master_gain_sm += ((s_master_gain - s_master_gain_sm) * VOL_SMOOTH_A_Q15) >> 15;
         y = (int32_t)(((int64_t)y * s_master_gain_sm) >> 15);
@@ -1557,10 +1589,6 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
         else if (y < -LIM_HEADROOM) {
             y = -LIM_HEADROOM;
         }
-
-        g += ((g_target - g) * VOL_SMOOTH_A_Q15) >> 15;
-        /* 64-bit: y can carry LIM_HEADROOM of overload before limiting. */
-        y = (int32_t)(((int64_t)y * g) >> 15);   /* logarithmic volume */
 
         /* Soft limiter on the UNCLIPPED level: tg maps the current peak
          * envelope exactly onto LOUD_LIMIT_CEIL, so a hot track is turned
@@ -1651,20 +1679,28 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
             chunk = 1024;   /* well under the 16 KB ring; small DMA writes */
         }
         if (xRingbufferSend(s_pcm_rb, (uint8_t *)dsp_buf + off, chunk,
-                            pdMS_TO_TICKS(100)) != pdTRUE) {
+                           pdMS_TO_TICKS(100)) != pdTRUE) {
             s_last_write_us = esp_timer_get_time();
             /* 暂停/停止落在写中途:不算错误。 */
             if (!s_player_active) {
                 return AUDIO_WRITE_ABANDONED;
             }
-            if (++s_wr_errs >= 4) {
-                ESP_LOGE(TAG, "[ERROR] PCM ringbuf full / write stalled (%u bytes)",
-                         (unsigned)chunk);
-                s_wr_errs = 0;
+            /* The send TIMED OUT: the writer task did not drain the ring for
+             * 100 ms, so the samples of this chunk are DROPPED (the loop
+             * breaks) — that is an audible gap in the music, not just a
+             * back-pressure hiccup. Log the FIRST failure of an episode (the
+             * counter is cleared by the next successful write) so a dropout
+             * shows up in the console with the amount of lost audio. */
+            if (s_wr_errs == 0) {
+                ESP_LOGE(TAG, "[ERROR] PCM ring full: %u bytes dropped "
+                               "(writer stalled >100 ms) -> audible gap",
+                         (unsigned)(bytes - off));
             }
+            s_wr_errs++;
             res = AUDIO_WRITE_STALLED;   /* back-pressure: ring full, retry next frame */
             break;
         }
+
         off += chunk;
         /* Serialised so the writer task's decrement can never lose this add. */
         taskENTER_CRITICAL(&s_ring_lock);

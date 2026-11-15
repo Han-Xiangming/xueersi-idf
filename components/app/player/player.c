@@ -61,7 +61,16 @@
  * So retry the same read a few times with a backoff before giving up: a
  * transient resource shortage then costs one hiccup instead of the track. */
 #define TRACK_MAX_READ_RETRIES   3
-#define READ_RETRY_BACKOFF_MS    250
+/* Retry backoff after a transient SD read error. It MUST stay far below the
+ * audio pipeline's stall margin: the speaker path can only absorb a producer
+ * stall of (PCM ring 16 KB ~ 93 ms) + (I2S DMA 12x1024 frames ~ 280 ms)
+ * ~= 370 ms before the DMA starves and the writer emits silence (an audible
+ * dropout). The old 250 ms ate two thirds of that margin on a SINGLE error
+ * (and 750 ms over the three retries -> a guaranteed dropout), so one flaky
+ * sector while the LCD was hammering the shared SPI2 bus was audible as the
+ * music cutting out. 25 ms keeps the three retries at 75 ms total, far inside
+ * the margin, while still giving a genuinely flaky card time to recover. */
+#define READ_RETRY_BACKOFF_MS    25
 /* A track that died only because reads kept failing has not been proven
  * corrupt, so it must not burn the corrupt-file budget (8 strikes) — that
  * turned one memory shortage into "every track fails, playback stops" within

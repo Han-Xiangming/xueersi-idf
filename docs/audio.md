@@ -6,8 +6,8 @@
 
 ```text
 MP3 解码（helix） ──> hw_audio_write_pcm() → 按路由分发
-  ├─ 蓝牙已连接 + 开启 → 音量（~5ms 平滑，全频段）→ bluetooth_audio_write_pcm() → BT 环形缓冲(128KB) → A2DP
-  └─ 喇叭 → 800Hz 保护高通 → 响度低音架 → 音量（平滑）→ 软限幅 → xRingbufferSend() 送 PCM 环形缓冲
+ ├─ 蓝牙已连接 + 开启 → 音量（~5ms 平滑，全频段）→ bluetooth_audio_write_pcm() → BT 环形缓冲(128KB) → A2DP
+ └─ 喇叭 → 800Hz 保护高通 → 音量（平滑）→ 响度低音架 → ReplayGain/主增益 → 软限幅 → xRingbufferSend() 送 PCM 环形缓冲
                                        → DMA writer 任务 → i2s_channel_write() → I2S(MAX98357)
 ```
 
@@ -34,8 +34,10 @@ MP3 解码（helix） ──> hw_audio_write_pcm() → 按路由分发
 ## 3. DSP 链（喇叭路由，逐样本）
 
 ```text
-800Hz 保护高通 → 响度低音架（800Hz，boost 0→+9dB 随音量下降） → 主音量（~5ms 平滑) → 软限幅
+800Hz 保护高通 → 主音量（~5ms 平滑) → 响度低音架（800Hz，boost 0→+9dB 随音量下降） → ReplayGain → 主增益 → 软限幅
 ```
+
+- **顺序约束（响度架必须在主音量之后）**：响度架最多回补 +9 dB，若跑在满刻度上（= 音量衰减之前）其输出会顶破 int16 并被硬钳削波；且补量随音量下降而增大，**削波量随旋钮位置变化**——调小音量时声音发毛/失真、调大后又恢复正常。音量前置后 `g×(1+boost) ≤ 1` 对任意音量成立，架永远不再削波；限幅器之前全是线性环节，**频响逐位不变**（`g×(y+b·lp(y)) ≡ g·y + b·lp(g·y)`）。
 
 - **喇叭保护高通**：板载喇叭为手机跑道型小单元（有效 ~800Hz..8kHz，谐振峰值 850..920Hz）。每声道一阶 DC 阻断高通，截止频率 800Hz（`SPEAKER_HPF_FC_HZ`），Q15 递归系数仅采样率变化时重算：
 

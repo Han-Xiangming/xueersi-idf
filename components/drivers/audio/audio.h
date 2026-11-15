@@ -164,11 +164,11 @@ typedef enum {
 
 /* Stream raw 16-bit stereo PCM (L,R interleaved). `frames` = number of
  * L/R pairs. Used by the MP3 player to output decoded audio. Samples are
- * filtered in place (per-track ReplayGain + user master gain + speaker-
- * protection high-pass + loudness shelf + volume + limiter, see the driver
- * docs) then pushed into the PCM ring buffer via a bounded xRingbufferSend,
- * which paces the caller by back-pressure; the DMA writer task feeds the I2S
- * channel independently. */
+ * filtered in place (speaker-protection high-pass + master volume + loudness
+ * shelf + per-track ReplayGain + user master gain + soft limiter, see the
+ * driver docs) then pushed into the PCM ring buffer via a bounded
+ * xRingbufferSend, which paces the caller by back-pressure; the DMA writer
+ * task feeds the I2S channel independently. */
 audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames);
 
 /* True only after the I2S channel and the DMA writer task are up. Callers
