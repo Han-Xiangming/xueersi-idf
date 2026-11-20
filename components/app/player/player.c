@@ -746,6 +746,129 @@ static bool id3_parse_db(const unsigned char *d, size_t n, float *out)
     return true;
 }
 
+/* Parse ONE ID3v2 frame's payload for ReplayGain tags. `d`/`fsz` are the
+ * frame body and its full declared size; only the first ~128 bytes are ever
+ * needed (TXXX/RVA2 are tiny). `d` must hold min(fsz,128) readable bytes.
+ * Shared by the in-RAM walk (small tags) and the streaming walk (large tags
+ * with embedded covers). */
+static void id3_parse_frame(const unsigned char *fh, const unsigned char *d,
+                            long fsz, float *track_gain, float *album_gain,
+                            bool *has_track, bool *has_album, int version)
+{
+    if (memcmp(fh, "TXXX", 4) == 0) {
+        size_t rd = (fsz < 96) ? (size_t)fsz : 96;
+        if (rd >= 3) {
+            int enc = d[0];
+            size_t dstart = 1;   /* first description byte */
+            if (enc == 1 || enc == 2) {
+                /* UTF-16 with BOM (0xFF 0xFE = LE, 0xFE 0xFF = BE):
+                 * the BOM sits between the encoding byte and the text,
+                 * so the description really starts after it. */
+                if (rd >= 3 && ((d[1] == 0xFF && d[2] == 0xFE) ||
+                                (d[1] == 0xFE && d[2] == 0xFF))) {
+                    dstart = 3;
+                }
+            }
+            size_t de = dstart;   /* description terminator */
+            if (enc == 1 || enc == 2) {
+                while (de + 1 < rd &&
+                       !(d[de] == 0x00 && d[de + 1] == 0x00)) {
+                    de++;
+                }
+            }
+            else {
+                while (de < rd && d[de] != 0x00) {
+                    de++;
+                }
+            }
+            size_t vs = de + ((enc == 1 || enc == 2) ? 2 : 1);
+            if (de > dstart && vs < rd) {
+                if (id3_desc_matches(d + dstart, de - dstart,
+                                     "REPLAYGAIN_TRACK_GAIN")) {
+                    *has_track = id3_parse_db(d + vs, rd - vs, track_gain);
+                }
+                else if (id3_desc_matches(d + dstart, de - dstart,
+                                          "REPLAYGAIN_ALBUM_GAIN")) {
+                    *has_album = id3_parse_db(d + vs, rd - vs, album_gain);
+                }
+            }
+        }
+    }
+    else if (memcmp(fh, "RVA2", 4) == 0) {
+        /* identification (NUL-terminated Latin-1) + channel type byte
+         * (1=right, 2=left, 3=both) + 16-bit signed gain in 0.01 dB
+         * steps + peak field (ignored). */
+        size_t rd = (fsz < 128) ? (size_t)fsz : 128;
+        if (rd >= 6) {
+            size_t idlen = 0;
+            while (idlen < rd && d[idlen] != 0x00) {
+                idlen++;
+            }
+            bool is_track = (idlen == 5 && memcmp(d, "track", 5) == 0);
+            bool is_album  = (idlen == 5 && memcmp(d, "album", 5) == 0);
+            if ((is_track || is_album) && idlen + 4 <= rd) {
+                int chan = d[idlen + 1];
+                int g = (int16_t)(((int)d[idlen + 2] << 8) | d[idlen + 3]);
+                if (chan == 1 || chan == 2 || chan == 3) {
+                    if (is_track) {
+                        *has_track = true;
+                        *track_gain = (float)g / 100.0f;
+                    }
+                    else {
+                        *has_album = true;
+                        *album_gain = (float)g / 100.0f;
+                    }
+                }
+            }
+        }
+    }
+    (void)version;
+}
+
+/* Streaming ReplayGain scan for tags too large to buffer whole (embedded
+ * covers make some tags >800 KB). ReplayGain lives in tiny TXXX/RVA2 frames;
+ * the bulk is an APIC cover we must NOT read into RAM. Walk frames from the
+ * current file position (start of first frame) using forward-only reads:
+ * a 10-byte header, then at most 128 payload bytes for candidate frames, and
+ * an fseek past everything else. Forward seeks are cheap and avoid the
+ * random-read SDSPI hang the old per-frame implementation hit. The caller
+ * re-seeks to the end of the tag afterwards. */
+static void id3_scan_stream(long start, long avail, int version,
+                            float *track_gain, float *album_gain,
+                            bool *has_track, bool *has_album)
+{
+    long pos = 0;   /* bytes consumed from `start` */
+    int frames = 0;
+    while (pos + 10 <= avail && frames++ < 512) {
+        unsigned char fh[10];
+        if (fread(fh, 1, sizeof(fh), s_src.fp) != sizeof(fh)) {
+            break;
+        }
+        long fsz = (version >= 4) ? id3_syncsafe32(fh + 4) : id3_big32(fh + 4);
+        if (fh[0] == 0x00 || fsz <= 0 || fsz > avail - pos - 10) {
+            break;   /* padding / corrupt / extended header: done */
+        }
+        bool candidate = (memcmp(fh, "TXXX", 4) == 0 ||
+                          memcmp(fh, "RVA2", 4) == 0);
+        long next = start + pos + 10 + fsz;   /* absolute pos of next frame */
+        if (candidate) {
+            size_t want = (fsz < 128) ? (size_t)fsz : 128;
+            size_t got = fread(s_id3_tag, 1, want, s_src.fp);
+            if (got > 0) {
+                id3_parse_frame(fh, s_id3_tag, (long)got, track_gain, album_gain,
+                                has_track, has_album, version);
+            }
+        }
+        /* Seek over the frame's unread tail (or a whole APIC cover). Always
+         * forward — no random reads, so no SDSPI/PSRAM hang. */
+        fseek(s_src.fp, next, SEEK_SET);
+        pos += 10 + fsz;
+#if defined(CONFIG_ESP_TASK_WDT_EN)
+        esp_task_wdt_reset();
+#endif
+    }
+}
+
 /* Skip the ID3v2 tag (if any) at the head of the open file past the
  * decoder, and extract ReplayGain metadata into the audio DSP. */
 static void parse_id3v2(void)
@@ -786,20 +909,55 @@ static void parse_id3v2(void)
             return;
         }
     }
-    /* ---- One sequential read, then parse entirely in RAM ----------------
+    if (tag_size <= 0) {
+        fseek(s_src.fp, base + 10, SEEK_SET);
+        hw_audio_set_track_gain_db(0.0f);
+        return;
+    }
+
+    /* ---- Large tags (embedded covers): stream-scan for ReplayGain --------
+     * A cover makes the tag hundreds of KB — far past ID3_TAG_BUF_MAX. The
+     * ReplayGain frames are tiny and live near the tag front, so walk frames
+     * with forward-only seeks: read each 10-byte header, buffer at most 128
+     * bytes of a TXXX/RVA2 frame, seek over APIC/covers without reading them.
+     * This recovers the gain that used to be lost when we skipped the whole
+     * tag (which made hot masters play at 0 dB and sound harsh at high volume).
+     * Only sequential forward movement — no random reads, so no SDSPI hang. */
+    if (tag_size > ID3_TAG_BUF_MAX) {
+        long frame_start = base + 10;
+        if (hdr[5] & 0x40) {   /* extended header: skip before frame walk */
+            unsigned char xh[4];
+            if (fseek(s_src.fp, base + 10, SEEK_SET) == 0 &&
+                fread(xh, 1, 4, s_src.fp) == 4) {
+                long xs = (hdr[3] >= 4) ? id3_syncsafe32(xh) : id3_big32(xh);
+                frame_start += xs;
+            }
+        }
+        if (fseek(s_src.fp, frame_start, SEEK_SET) != 0) {
+            fseek(s_src.fp, base + 10 + tag_size, SEEK_SET);
+            hw_audio_set_track_gain_db(0.0f);
+            return;
+        }
+        float tg = 0.0f, ag = 0.0f;
+        bool ht = false, ha = false;
+        long avail = (base + 10 + tag_size) - frame_start;
+        id3_scan_stream(frame_start, avail, hdr[3], &tg, &ag, &ht, &ha);
+        fseek(s_src.fp, base + 10 + tag_size, SEEK_SET);
+        float gain = ht ? tg : (ha ? ag : 0.0f);
+        ESP_LOGI(TAG, "ID3v2 large tag %ld B: track %.2f dB, album %.2f dB "
+                      "(has_track=%d has_album=%d)",
+                 tag_size, tg, ag, (int)ht, (int)ha);
+        hw_audio_set_track_gain_db(gain);
+        return;
+    }
+
+    /* ---- Small tag: one sequential read, then parse entirely in RAM ------
      * The old frame walk did fseek + short fread per frame (it read only
      * the first 96/128 bytes of TXXX/RVA2 and seeked past the rest): about
      * two dozen non-aligned SDSPI random reads for a tag with 11 frames.
      * On this board that pattern is a known trigger for an SDSPI / PSRAM
      * bus hang, which freezes both cores so completely that even the
      * direct-to-FIFO console stops. A single sequential read removes it. */
-    if (tag_size <= 0 || tag_size > ID3_TAG_BUF_MAX) {
-        ESP_LOGW(TAG, "ID3v2 tag %ld bytes exceeds %d B buffer, skipping",
-                 tag_size, ID3_TAG_BUF_MAX);
-        fseek(s_src.fp, base + 10 + tag_size, SEEK_SET);
-        hw_audio_set_track_gain_db(0.0f);
-        return;
-    }
     if (fseek(s_src.fp, base + 10, SEEK_SET) != 0) {
         hw_audio_set_track_gain_db(0.0f);
         return;
@@ -849,74 +1007,8 @@ static void parse_id3v2(void)
         if (fh[0] == 0x00 || fsz <= 0 || fsz > tag_size - pos - 10) {
             break;   /* padding / corrupt: done */
         }
-        const unsigned char *d = fh + 10;
-        if (memcmp(fh, "TXXX", 4) == 0) {
-            size_t rd = (fsz < 96) ? (size_t)fsz : 96;
-            if (rd >= 3) {
-                int enc = d[0];
-                size_t dstart = 1;   /* first description byte */
-                if (enc == 1 || enc == 2) {
-                    /* UTF-16 with BOM (0xFF 0xFE = LE, 0xFE 0xFF = BE):
-                     * the BOM sits between the encoding byte and the text,
-                     * so the description really starts after it. */
-                    if (rd >= 3 && ((d[1] == 0xFF && d[2] == 0xFE) ||
-                                    (d[1] == 0xFE && d[2] == 0xFF))) {
-                        dstart = 3;
-                    }
-                }
-                size_t de = dstart;   /* description terminator */
-                if (enc == 1 || enc == 2) {
-                    while (de + 1 < rd &&
-                           !(d[de] == 0x00 && d[de + 1] == 0x00)) {
-                        de++;
-                    }
-                }
-                else {
-                    while (de < rd && d[de] != 0x00) {
-                        de++;
-                    }
-                }
-                size_t vs = de + ((enc == 1 || enc == 2) ? 2 : 1);
-                if (de > dstart && vs < rd) {
-                    if (id3_desc_matches(d + dstart, de - dstart,
-                                         "REPLAYGAIN_TRACK_GAIN")) {
-                        has_track = id3_parse_db(d + vs, rd - vs, &track_gain);
-                    }
-                    else if (id3_desc_matches(d + dstart, de - dstart,
-                                              "REPLAYGAIN_ALBUM_GAIN")) {
-                        has_album = id3_parse_db(d + vs, rd - vs, &album_gain);
-                    }
-                }
-            }
-        }
-        else if (memcmp(fh, "RVA2", 4) == 0) {
-            /* identification (NUL-terminated Latin-1) + channel type byte
-             * (1=right, 2=left, 3=both) + 16-bit signed gain in 0.01 dB
-             * steps + peak field (ignored). */
-            size_t rd = (fsz < 128) ? (size_t)fsz : 128;
-            if (rd >= 6) {
-                size_t idlen = 0;
-                while (idlen < rd && d[idlen] != 0x00) {
-                    idlen++;
-                }
-                bool is_track = (idlen == 5 && memcmp(d, "track", 5) == 0);
-                bool is_album  = (idlen == 5 && memcmp(d, "album", 5) == 0);
-                if ((is_track || is_album) && idlen + 4 <= rd) {
-                    int chan = d[idlen + 1];
-                    int g = (int16_t)(((int)d[idlen + 2] << 8) | d[idlen + 3]);
-                    if (chan == 1 || chan == 2 || chan == 3) {
-                        if (is_track) {
-                            has_track = true;
-                            track_gain = (float)g / 100.0f;
-                        }
-                        else {
-                            has_album = true;
-                            album_gain = (float)g / 100.0f;
-                        }
-                    }
-                }
-            }
-        }
+        id3_parse_frame(fh, fh + 10, fsz, &track_gain, &album_gain,
+                        &has_track, &has_album, hdr[3]);
         pos += 10 + fsz;
     }
 
@@ -925,7 +1017,6 @@ static void parse_id3v2(void)
     fseek(s_src.fp, base + 10 + tag_size, SEEK_SET);
     ESP_LOGD(TAG, "ID3v2 tag (%ld bytes, %d frames): track %.2f dB, album %.2f dB",
              tag_size, frames_scanned, track_gain, album_gain);
-    /* ReplayGain 2.0 rule: track gain wins, album gain is the fallback. */
     float gain = has_track ? track_gain : (has_album ? album_gain : 0.0f);
     hw_audio_set_track_gain_db(gain);
 }
