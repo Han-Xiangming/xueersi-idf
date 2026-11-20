@@ -65,6 +65,15 @@ EXT_RAM_BSS_ATTR static char s_src_list[SRC_MAX][MP3_NAME_LEN];  /* folder names
 EXT_RAM_BSS_ATTR static char s_src_path[SRC_MAX][PLAYER_PATH_LEN];/* absolute dir path per entry */
 static int      s_src_count;
 static int      s_src_sel;
+
+/* <ALL> duplicate-name tags. One short first-level directory per track,
+ * rebuilt only when a new playlist snapshot is published (never on every
+ * 16 ms refresh). PSRAM: 256 * 48 bytes, not on the 10 KB LVGL task stack. */
+EXT_RAM_BSS_ATTR static char s_pl_dup_dir[PLAYER_SCAN_MAX][UI_DUP_TAG_MAX];
+static uint32_t s_pl_dup_ver;
+static int      s_pl_dup_count = -1;
+static bool     s_pl_dup_ready;
+
 static player_view_t s_pv = PV_SOURCE;
 static int      s_paint_src_sel = -1;
 static ui_marquee_t s_mp3_mq;
@@ -135,10 +144,52 @@ static void ui_discover_sources(void)
     }
 }
 
+/* Rebuild the per-track directory tags for the current snapshot. Only the
+ * <ALL> source (index 0) can contain the same basename in different folders,
+ * so sub-folder views keep every tag empty and their labels unchanged. */
+static void ui_pl_refresh_dup_tags(void)
+{
+    const uint32_t ver = player_scan_version();
+    const int count = player_scan_count();
+    if (s_pl_dup_ready && s_pl_dup_ver == ver && s_pl_dup_count == count) {
+        return;
+    }
+
+    memset(s_pl_dup_dir, 0, sizeof(s_pl_dup_dir));
+    if (s_src_sel == 0 && count > 1) {
+        for (int i = 0; i < count; i++) {
+            const char *name_i = player_scan_name(i);
+            bool dup = false;
+            for (int j = 0; j < count; j++) {
+                if (i != j && strcasecmp(name_i, player_scan_name(j)) == 0) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) {
+                ui_dup_dir(s_pl_dup_dir[i], sizeof(s_pl_dup_dir[i]),
+                           player_scan_path(i), MUSIC_ROOT);
+            }
+        }
+    }
+    s_pl_dup_ready = true;
+    s_pl_dup_ver = ver;
+    s_pl_dup_count = count;
+}
+
+/* Display label for one track: stripped name, plus "[dir]" only for entries
+ * whose basename is duplicated somewhere else in the current <ALL> list. */
+static void ui_pl_label(int idx, char *dst, size_t dst_size, int max_w)
+{
+    const char *dir = (idx >= 0 && idx < PLAYER_SCAN_MAX) ? s_pl_dup_dir[idx] : "";
+    ui_dup_label(dst, dst_size, max_w, strip_ext(player_scan_name(idx)), dir);
+}
+
 void ui_build_player(lv_obj_t *page)
 {
     s_mp3_sel = 0;
     s_src_sel = 0;
+    s_pl_dup_ready = false;
     s_pv = PV_SOURCE;
     /* Prefer the on-card playlist cache so the list shows instantly; only fall
      * back to a real scan (which rewrites the cache) when no cache exists —
@@ -450,9 +501,11 @@ void ui_player_list_marquee(void)
     if (i < 0 || i >= UI_LIST_ROWS) {
         return;                     /* selected row off-screen */
     }
-    static char out[MP3_NAME_LEN];
-    ui_marquee_step(&s_mp3_mq, out, sizeof(out), LIST_LINE_W,
-                    strip_ext(player_scan_name(s_mp3_sel)));
+    ui_pl_refresh_dup_tags();
+    static char label[UI_DUP_LABEL_MAX];
+    static char out[UI_DUP_LABEL_MAX + LIST_SCROLL_GAP];
+    ui_pl_label(s_mp3_sel, label, sizeof(label), 4096);  /* full text scrolls */
+    ui_marquee_step(&s_mp3_mq, out, sizeof(out), LIST_LINE_W, label);
     ui_theme_text_set(s_ui.pl_list.text[i], out);
 }
 
@@ -493,6 +546,7 @@ void ui_refresh_player(void)
         if (s_mp3_sel >= s_mp3_count) {
             s_mp3_sel = s_mp3_count > 0 ? s_mp3_count - 1 : 0;
         }
+        ui_pl_refresh_dup_tags();
         /* While a (sub)folder load is in flight, s_playlist still holds the
          * previous folder's contents. Suppress drawing it so we don't flash
          * the old list for a frame before the scan publishes the new one. */
@@ -517,29 +571,33 @@ void ui_refresh_player(void)
             int idx = top + i;
             const int sel = (idx == s_mp3_sel);
             if (!loading && idx < s_mp3_count) {
-                /* Static scratch buffer: this runs every UI refresh (16 ms). The
-                 * lvgl task stack is only 10 KB, so a 256-byte stack array here
-                 * overflows it under load (BT+SDSPI IRQs) and corrupts adjacent
+                /* Static scratch buffers: this runs every UI refresh (16 ms).
+                 * The lvgl task stack is only 10 KB, so large stack arrays here
+                 * overflow it under load (BT+SDSPI IRQs) and corrupt adjacent
                  * memory — surfacing as a SPI ISR Guru Meditation. */
-                static char s_pl_name_buf[MP3_NAME_LEN];
+                static char s_pl_name_buf[UI_DUP_LABEL_MAX + LIST_SCROLL_GAP];
+                static char s_pl_src_buf[UI_DUP_LABEL_MAX];
                 if (sel) {
                     /* Selected row scrolls its name if wider than the line — but
                      * only when idle. While playing we freeze a static (clipped)
                      * name to avoid needless redraws and save resources. */
                     if (st == PLAYER_PLAYING) {
                         s_mp3_mq.scrolling = false;
-                        copy_utf8_clipped(s_pl_name_buf, sizeof(s_pl_name_buf),
-                                          strip_ext(player_scan_name(idx)));
+                        ui_pl_label(idx, s_pl_name_buf, sizeof(s_pl_name_buf),
+                                    LIST_LINE_W);
                     }
                     else {
+                        ui_pl_label(idx, s_pl_src_buf, sizeof(s_pl_src_buf), 4096);
                         ui_marquee_step(&s_mp3_mq, s_pl_name_buf,
                                         sizeof(s_pl_name_buf), LIST_LINE_W,
-                                        strip_ext(player_scan_name(idx)));
+                                        s_pl_src_buf);
                     }
                 }
                 else {
-                    copy_utf8_clipped(s_pl_name_buf, sizeof(s_pl_name_buf),
-                                      strip_ext(player_scan_name(idx)));
+                    /* Width-limited label keeps the "[dir]" tag visible via a
+                     * middle ellipsis instead of losing it to tail clipping. */
+                    ui_pl_label(idx, s_pl_name_buf, sizeof(s_pl_name_buf),
+                                LIST_LINE_W);
                     /* Do NOT clear s_mp3_mq.scrolling here: the selected row may
                      * be drawn earlier in this loop, and a later non-selected row
                      * would clobber it to false, freezing the marquee after one
@@ -617,6 +675,7 @@ void ui_player_action(void)
                 return;
             }
             player_load(PL_SRC_FOLDER, s_src_path[s_src_sel]);
+            s_pl_dup_ready = false;    /* new source: tags must be rebuilt */
             s_pv = PV_LIST;
             s_mp3_sel = 0;
             s_paint_mp3_sel = -1;   /* force list repaint */
@@ -733,6 +792,7 @@ void ui_player_notify_sd_change(void)
 {
     if (ui_nav_current() == UI_PAGE_PLAYER) {
         ui_discover_sources();
+        s_pl_dup_ready = false;
         s_paint_src_sel = -1;
         /* Card swapped underneath the live rows: drop the paint shadow. */
         ui_list_invalidate_paint(&s_ui.pl_list);

@@ -17,6 +17,10 @@
  * top-level folder is one selectable "source", like the music player). */
 #define EBOOK_ROOT "/sdcard/eBook"
 
+/* Max books in a published scan list. Shared with the UI so its <ALL>
+ * duplicate-name tag cache is sized from the same bound as the scan buffers. */
+#define EBOOK_LIST_MAX 512
+
 /* Create the scan/count/save tasks and the PSRAM chunk buffers. Call once. */
 void ebook_init(void);
 
@@ -30,6 +34,9 @@ bool ebook_scan_busy(void);
 uint32_t ebook_scan_version(void);     /* bumps when the list is replaced */
 int  ebook_scan_count(void);
 const char *ebook_scan_name(int idx);  /* NUL-terminated, no path */
+/* Full stored path of book `idx` ("" if out of range). Used by the UI to tag
+ * same-named books in <ALL> with their first-level directory. */
+const char *ebook_scan_path(int idx);
 /* Display name of the currently loaded source: "整卡" for the whole tree,
  * else the folder's basename. */
 const char *ebook_current_src_name(void);

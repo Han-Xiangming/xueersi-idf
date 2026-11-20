@@ -68,6 +68,12 @@ typedef enum {
 /* Scratch size: a status-bar "source·track" string is two MP3_NAME_LEN names. */
 #define MQ_SRC_LEN          (MP3_NAME_LEN * 2 + 8)
 
+/* <ALL> duplicate-name disambiguation: a short first-level directory tag is
+ * appended only when the same basename occurs more than once in the recursive
+ * list. Tag/label storage is static (PSRAM in the page files), never stack. */
+#define UI_DUP_TAG_MAX     48
+#define UI_DUP_LABEL_MAX   (MP3_NAME_LEN + UI_DUP_TAG_MAX + 16)
+
 typedef struct {
     int      ofs;           /* current scroll offset, in characters */
     uint32_t at;            /* timestamp of last step (ms) */
@@ -147,6 +153,14 @@ void copy_text(char *dst, size_t dst_size, const char *src);
 void copy_utf8_clipped(char *dst, size_t dst_size, const char *src);
 const char *strip_ext(const char *name);
 int  ui_text_px_width(const char *text);
+/* First-level directory under `root` for a full path, or "根目录" when the
+ * file sits directly in the root. Used to tag same-named files in <ALL>. */
+void ui_dup_dir(char *dst, size_t dst_size, const char *path, const char *root);
+/* Build a display label; when `dir` is non-empty it is appended as "[dir]".
+ * Oversized names are cut at a UTF-8 boundary with a middle ellipsis so the
+ * directory tag stays visible; the caller supplies a UI_DUP_LABEL_MAX buffer. */
+void ui_dup_label(char *dst, size_t dst_size, int max_w,
+                  const char *name, const char *dir);
 bool ui_marquee_step(ui_marquee_t *mq, char *out, size_t out_size,
                      int max_w, const char *name);
 /* Master volume step (shared by the player page and the settings row). */

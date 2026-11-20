@@ -204,6 +204,187 @@ int ui_text_px_width(const char *text)
     return w;
 }
 
+/* --- <ALL> duplicate-name disambiguation ------------------------------- */
+
+static size_t ui_utf8_seq_len(const uint8_t *p)
+{
+    const uint8_t b = *p;
+    if (b < 0x80) {
+        return 1;
+    }
+    if ((b & 0xE0) == 0xC0) {
+        return 2;
+    }
+    if ((b & 0xF0) == 0xE0) {
+        return 3;
+    }
+    if ((b & 0xF8) == 0xF0) {
+        return 4;
+    }
+    return 1;                           /* malformed byte: treat as 1 */
+}
+
+static size_t ui_str_append(char *dst, size_t pos, size_t size, const char *src)
+{
+    if (size == 0 || pos >= size - 1) {
+        return pos;
+    }
+    while (*src != '\0' && pos < size - 1) {
+        dst[pos++] = *src++;
+    }
+    dst[pos] = '\0';
+    return pos;
+}
+
+/* Copy at most `max_w` pixels of a UTF-8 string, never splitting a character. */
+static void ui_utf8_prefix(char *dst, size_t dst_size, const char *src, int max_w)
+{
+    size_t pos = 0;
+    int w = 0;
+    const uint8_t *p = (const uint8_t *)src;
+
+    while (*p != '\0') {
+        const size_t seq = ui_utf8_seq_len(p);
+        const int cw = (*p < 0x80) ? 8 : 16;   /* matches ui_text_px_width() */
+        size_t i = 1;
+        while (i < seq && p[i] != '\0' && ((uint8_t)p[i] & 0xC0) == 0x80) {
+            i++;
+        }
+        if (i < seq || w + cw > max_w || pos + seq + 1 > dst_size) {
+            break;
+        }
+        memcpy(dst + pos, p, seq);
+        pos += seq;
+        w += cw;
+        p += seq;
+    }
+    dst[pos] = '\0';
+}
+
+void ui_dup_dir(char *dst, size_t dst_size, const char *path, const char *root)
+{
+    if (dst == NULL || dst_size == 0) {
+        return;
+    }
+    dst[0] = '\0';
+    if (path == NULL || root == NULL) {
+        return;
+    }
+
+    char tmp[UI_DUP_TAG_MAX];
+    const size_t rlen = strlen(root);
+    const char *rel = NULL;
+    if (strncmp(path, root, rlen) == 0 &&
+        (path[rlen] == '/' || path[rlen] == '\0')) {
+        rel = path + rlen;
+    }
+
+    const char *start = NULL;
+    const char *end = NULL;
+    if (rel != NULL) {
+        while (*rel == '/') {
+            rel++;
+        }
+        end = strchr(rel, '/');
+        if (end == NULL || end == rel || *rel == '\0') {
+            copy_utf8_clipped(dst, dst_size, "根目录");
+            return;
+        }
+        start = rel;
+    }
+    else {
+        /* Root mismatch (stale cache path): fall back to the file's parent. */
+        end = strrchr(path, '/');
+        if (end == NULL || end == path) {
+            copy_utf8_clipped(dst, dst_size, "根目录");
+            return;
+        }
+        start = end + 1;
+        while (start > path && start[-1] != '/') {
+            start--;
+        }
+        if (start == end) {
+            copy_utf8_clipped(dst, dst_size, "根目录");
+            return;
+        }
+        end--;                              /* drop the '/' before the leaf name */
+    }
+
+    size_t n = (size_t)(end - start);
+    if (n >= sizeof(tmp)) {
+        n = sizeof(tmp) - 1;
+    }
+    memcpy(tmp, start, n);
+    tmp[n] = '\0';
+    copy_utf8_clipped(dst, dst_size, tmp);
+}
+
+void ui_dup_label(char *dst, size_t dst_size, int max_w,
+                  const char *name, const char *dir)
+{
+    if (dst == NULL || dst_size == 0) {
+        return;
+    }
+    dst[0] = '\0';
+    if (name == NULL) {
+        name = "";
+    }
+    if (dir == NULL) {
+        dir = "";
+    }
+    if (max_w < 8) {
+        max_w = 8;
+    }
+
+    /* No duplicate -> keep the old display exactly: LVGL's CLIP handles the
+     * width, so we must not switch ordinary long names to middle ellipsis. */
+    if (dir[0] == '\0') {
+        copy_utf8_clipped(dst, dst_size, name);
+        return;
+    }
+
+    char tag[UI_DUP_TAG_MAX + 4];           /* '[' + tag + ']' + NUL */
+    tag[0] = '\0';
+    if (dir[0] != '\0') {
+        char dir_clip[UI_DUP_TAG_MAX];
+        /* Reserve room for brackets, an ellipsis, a gap and a short name tail. */
+        int dir_w = max_w - 16 - 16 - 8 - 16;
+        if (dir_w < 16) {
+            dir_w = 16;
+        }
+        ui_utf8_prefix(dir_clip, sizeof(dir_clip), dir, dir_w);
+        size_t pos = 0;
+        tag[pos++] = '[';
+        pos = ui_str_append(tag, pos, sizeof(tag), dir_clip);
+        tag[pos++] = ']';
+        tag[pos] = '\0';
+    }
+
+    const int tag_w = tag[0] ? ui_text_px_width(tag) : 0;
+    const int gap_w = tag[0] ? 8 : 0;
+    if (ui_text_px_width(name) + gap_w + tag_w <= max_w) {
+        size_t pos = ui_str_append(dst, 0, dst_size, name);
+        if (tag[0] != '\0') {
+            pos = ui_str_append(dst, pos, dst_size, " ");
+            ui_str_append(dst, pos, dst_size, tag);
+        }
+        return;
+    }
+
+    /* Middle ellipsis keeps both the name's head and the directory tag. */
+    int name_w = max_w - gap_w - tag_w - 16;
+    if (name_w < 0) {
+        name_w = 0;
+    }
+    ui_utf8_prefix(dst, dst_size, name, name_w);
+    size_t pos = strlen(dst);
+    pos = ui_str_append(dst, pos, dst_size, "…");
+    if (tag[0] != '\0') {
+        pos = ui_str_append(dst, pos, dst_size, " ");
+        ui_str_append(dst, pos, dst_size, tag);
+    }
+}
+
 /* Advance the marquee for the selected row. Returns true and fills `out` with
  * the shifted string "src[ofs:] + gap + src[0:ofs]" when scrolling; the caller
  * should keep refreshing until it returns false (name fits / finished a loop

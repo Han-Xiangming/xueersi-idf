@@ -459,7 +459,13 @@ static int playlist_entry_cmp(const void *a, const void *b)
     const char *bb = strrchr(pb->path, '/');
     ba = (ba != NULL) ? ba + 1 : pa->path;
     bb = (bb != NULL) ? bb + 1 : pb->path;
-    return strcasecmp(ba, bb);
+    int c = strcasecmp(ba, bb);
+    if (c != 0) {
+        return c;
+    }
+    /* Same basename in different folders: tie-break by full path so the
+     * <ALL> list keeps same-named tracks adjacent and in a stable order. */
+    return strcasecmp(pa->path, pb->path);
 }
 
 /* Publish a filled work buffer as the new live snapshot (atomic pointer

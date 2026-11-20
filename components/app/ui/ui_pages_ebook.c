@@ -69,6 +69,14 @@ EXT_RAM_BSS_ATTR static char s_eb_src_list[SRC_MAX][MP3_NAME_LEN];
 EXT_RAM_BSS_ATTR static char s_eb_src_path[SRC_MAX][PLAYER_PATH_LEN];
 static int      s_eb_src_count;
 static int      s_eb_src_sel;
+
+/* <ALL> duplicate-name tags, mirrored from the player page. PSRAM: 512 * 48
+ * bytes, rebuilt only when a new scan snapshot is published. */
+EXT_RAM_BSS_ATTR static char s_eb_dup_dir[EBOOK_LIST_MAX][UI_DUP_TAG_MAX];
+static uint32_t s_eb_dup_ver;
+static int      s_eb_dup_count = -1;
+static bool     s_eb_dup_ready;
+
 static ebook_view_t s_ebv = EBV_SOURCE;
 static int      s_paint_eb_src_sel = -1;
 static int      s_paint_eb_src_top  = -1;
@@ -120,11 +128,56 @@ static void ui_discover_ebook_sources(void)
     }
 }
 
+/* Rebuild the first-level directory tags for same-named books in <ALL>.
+ * Only source 0 is recursive across folders; a single-folder source cannot
+ * contain two books with the same basename, so its labels stay untouched. */
+static void ui_eb_refresh_dup_tags(void)
+{
+    const uint32_t ver = ebook_scan_version();
+    const int count = ebook_scan_count();
+    if (s_eb_dup_ready && s_eb_dup_ver == ver && s_eb_dup_count == count) {
+        return;
+    }
+
+    memset(s_eb_dup_dir, 0, sizeof(s_eb_dup_dir));
+    if (s_eb_src_sel == 0 && count > 1) {
+        for (int i = 0; i < count; i++) {
+            const char *name_i = ebook_scan_name(i);
+            bool dup = false;
+            for (int j = 0; j < count; j++) {
+                if (i != j && strcasecmp(name_i, ebook_scan_name(j)) == 0) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) {
+                ui_dup_dir(s_eb_dup_dir[i], sizeof(s_eb_dup_dir[i]),
+                           ebook_scan_path(i), EBOOK_ROOT);
+            }
+        }
+    }
+    s_eb_dup_ready = true;
+    s_eb_dup_ver = ver;
+    s_eb_dup_count = count;
+}
+
+/* Book rows keep their existing name (including ".txt"); only duplicated
+ * basenames gain a "[dir]" suffix. */
+static void ui_eb_label(int idx, char *dst, size_t dst_size, int max_w)
+{
+    /* Keep the book list's historical 64-byte name cap for long filenames. */
+    static char name[64];
+    copy_utf8_clipped(name, sizeof(name), ebook_scan_name(idx));
+    const char *dir = (idx >= 0 && idx < EBOOK_LIST_MAX) ? s_eb_dup_dir[idx] : "";
+    ui_dup_label(dst, dst_size, max_w, name, dir);
+}
+
 void ui_build_ebook_list(lv_obj_t *page)
 {
     s_eb_sel = 0;
     s_ebv = EBV_SOURCE;
     s_eb_src_sel = 0;
+    s_eb_dup_ready = false;
     ui_discover_ebook_sources();
 
     /* 6 shared list rows: the ebook source picker and the book list reuse
@@ -231,6 +284,7 @@ void ui_refresh_ebook_list(void)
         if (s_eb_sel >= count && count > 0) {
             s_eb_sel = count - 1;
         }
+        ui_eb_refresh_dup_tags();
         int top = ui_list_top(s_eb_sel, count, UI_LIST_ROWS);
         const bool sel_changed = (s_eb_sel != s_paint_eb_sel);
         /* While a source load is in flight, the engine still publishes the
@@ -241,16 +295,19 @@ void ui_refresh_ebook_list(void)
             int idx = top + i;
             const int sel = (idx == s_eb_sel);
             if (!loading && idx < count) {
-                static char s_eb_name_buf[64];
-                copy_book_name(s_eb_name_buf, sizeof(s_eb_name_buf),
-                               ebook_scan_name(idx));
+                static char s_eb_name_buf[UI_DUP_LABEL_MAX + LIST_SCROLL_GAP];
+                static char s_eb_src_buf[UI_DUP_LABEL_MAX];
                 if (sel) {
-                    /* Selected row scrolls its name if wider than the line. */
+                    /* Selected row scrolls the full name + "[dir]" tag. */
+                    ui_eb_label(idx, s_eb_src_buf, sizeof(s_eb_src_buf), 4096);
                     ui_marquee_step(&s_eb_mq, s_eb_name_buf,
                                     sizeof(s_eb_name_buf), LIST_LINE_W,
-                                    s_eb_name_buf);
+                                    s_eb_src_buf);
                 }
                 else {
+                    /* Width-limited label keeps the directory tag visible. */
+                    ui_eb_label(idx, s_eb_name_buf, sizeof(s_eb_name_buf),
+                                LIST_LINE_W);
                     /* Same as the MP3 list: never clobber s_eb_mq.scrolling from
                      * a non-selected row (would freeze the marquee after one step).
                      * ui_marquee_step() clears it when the selected name fits. */
@@ -341,6 +398,7 @@ void ui_ebook_list_action(void)
                 return;
             }
             ebook_scan_root(s_eb_src_path[s_eb_src_sel]);
+            s_eb_dup_ready = false;    /* new source: tags must be rebuilt */
             s_ebv = EBV_LIST;
             s_eb_sel = 0;
             s_paint_eb_sel = -1;   /* force list repaint */
@@ -584,6 +642,7 @@ void ui_ebook_notify_sd_change(void)
 {
     if (ui_nav_current() == UI_PAGE_EBOOK_LIST) {
         ui_discover_ebook_sources();
+        s_eb_dup_ready = false;
         s_paint_eb_src_sel = -1;
         /* Card swapped underneath the live rows: drop the paint shadow. */
         ui_list_invalidate_paint(&s_ui.eb_list);
@@ -606,9 +665,10 @@ void ui_ebook_list_marquee(void)
     if (i < 0 || i >= UI_LIST_ROWS) {
         return;
     }
-    static char name[64];
-    copy_book_name(name, sizeof(name), ebook_scan_name(s_eb_sel));
-    static char out[64];
+    ui_eb_refresh_dup_tags();
+    static char name[UI_DUP_LABEL_MAX];
+    static char out[UI_DUP_LABEL_MAX + LIST_SCROLL_GAP];
+    ui_eb_label(s_eb_sel, name, sizeof(name), 4096);
     ui_marquee_step(&s_eb_mq, out, sizeof(out), LIST_LINE_W, name);
     ui_theme_text_set(s_ui.eb_list.text[i], out);
 }

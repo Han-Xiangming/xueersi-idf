@@ -28,7 +28,6 @@ static const char *TAG = "ebook";
 /* --- Tuning constants (docs/ebook.md) --- */
 #define EBOOK_NAME_MAX      64           /* book name buffer size */
 #define EBOOK_PATH_MAX      320          /* book path buffer size (matches player) */
-#define EBOOK_LIST_MAX      512          /* max books in the scan list */
 #define EBOOK_CHUNK         (4 * 1024)   /* stream window of the reader */
 #define EBOOK_PAGE_BUF      1024         /* rendered page text buffer */
 #define EBOOK_PAGE_LINES    8            /* lines per page. Body label starts at
@@ -1649,6 +1648,17 @@ const char *ebook_scan_name(int idx)
     }
     portEXIT_CRITICAL(&s_mux);
     return name;
+}
+
+const char *ebook_scan_path(int idx)
+{
+    const char *path = "";
+    portENTER_CRITICAL(&s_mux);
+    if (idx >= 0 && idx < s_scan_count) {
+        path = s_scan_buf[s_scan_active][idx];
+    }
+    portEXIT_CRITICAL(&s_mux);
+    return path;
 }
 
 const char *ebook_current_src_name(void)
