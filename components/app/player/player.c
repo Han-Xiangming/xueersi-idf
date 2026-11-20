@@ -1623,13 +1623,15 @@ static void decode_loop(void)
                  * frames. Health is still observable via the [TIMING] line.) */
             }
 
-            ESP_LOGI(TAG, "track ended: frames=%u (~%u ms est.), %s",
+            ESP_LOGI(TAG,
+                     "track ended: frames=%u (~%u ms est.), %s, pending=%u B",
                      (unsigned)frame_cnt,
                      s_dbg_rate ? (unsigned)((uint64_t)frame_cnt * 1152 /
                                              s_dbg_rate * 1000) : 0,
                      s_stop_req ? "stopped by user"
                                 : s_track_errored ? "aborted (error)"
-                                                  : "reached EOF");
+                                                  : "reached EOF",
+                     (unsigned)hw_audio_pending());
             /* 单曲循环也走显式 index：直接用当前曲目 index 重播，与 list-loop /
              * 随机 共用 decide_next_index + player_play_index 的连播路径，三种模式
              * 行为一致。s_index 现在恒为待播曲目的显式下标，可安全按 index 重开
@@ -1724,7 +1726,11 @@ static void decode_loop(void)
          * start on top of the previous tail. Waiting for the audio to actually
          * finish makes the boundary perceptible AND lets the UI mark the track
          * as ended coherently. */
+        ESP_LOGI(TAG, "[DRAINDBG] natural-end drain begin: pending=%u B playing=%d",
+                 (unsigned)hw_audio_pending(), (int)hw_audio_is_playing());
         hw_audio_drain_blocking();
+        ESP_LOGI(TAG, "[DRAINDBG] natural-end drain done: pending=%u B playing=%d",
+                 (unsigned)hw_audio_pending(), (int)hw_audio_is_playing());
         const int cnt = s_playlist->count;
         const int next = decide_next_index(s_repeat, s_index, cnt);
         if (next < 0) {

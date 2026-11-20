@@ -221,6 +221,17 @@ static volatile size_t s_ring_bytes;
  * never lose an update. */
 static portMUX_TYPE s_ring_lock = portMUX_INITIALIZER_UNLOCKED;
 
+/* Diagnostic-only consumer state. These used to be static locals inside the
+ * writer task; they live at file scope only so the producer's "PCM ring full"
+ * path can log what the writer/DMA side was doing. No audio behavior changes. */
+static uint32_t s_w_chunks;       /* real-PCM chunks handed to DMA */
+static uint32_t s_sil_chunks;     /* silence chunks emitted */
+static uint32_t s_drop_inactive;  /* real PCM dropped because !active */
+static int32_t  s_post_peak;      /* peak of POST-DSP PCM sent to DMA */
+static volatile int64_t s_last_ring_pull_us;
+static volatile int64_t s_last_real_dma_us;
+static volatile int64_t s_last_flush_done_us;
+
 /* --- Speaker-protection high-pass filter -------------------------------
  * The on-board driver is a small phone racetrack speaker (usable ~800 Hz..8 kHz,
  * Fs ≈ 880 Hz, Xmax ±0.22 mm). A 1st-order DC-blocking high-pass is inserted before
@@ -953,10 +964,6 @@ static void i2s_writer_task(void *arg)
     /* Silence fill lives in s_seam_silence (file scope) and is applied via
      * i2s_seam_rearm() at the seam/park; see that helper. */
     size_t written = 0;
-    static uint32_t s_w_chunks = 0;     /* real-PCM chunks handed to DMA */
-    static uint32_t s_sil_chunks = 0;   /* silence chunks emitted */
-    static uint32_t s_drop_inactive = 0;/* real PCM dropped because !active */
-    static int32_t  s_post_peak = 0;    /* peak of POST-DSP PCM sent to DMA */
     /* Real underrun counter: incremented ONLY when the writer wanted PCM but
      * the ring was empty while playback was active (the branch below that
      * feeds silence to keep BCLK alive). This is the honest audible-gap
@@ -1004,6 +1011,22 @@ static void i2s_writer_task(void *arg)
              * reset. See i2s_seam_rearm() for details. */
             s_flush_req = false;
             s_flush_fill = false;
+            int64_t flush_done_us = esp_timer_get_time();
+            int64_t last_dma_us;
+            taskENTER_CRITICAL(&s_ring_lock);
+            s_last_flush_done_us = flush_done_us;
+            last_dma_us = s_last_real_dma_us;
+            taskEXIT_CRITICAL(&s_ring_lock);
+            ESP_LOGW(TAG,
+                     "[SEAMDBG] flush done: active=%d parked=%d route=%d dis=%d "
+                     "ring=%u w=%u sil=%u drop=%u post=%d last_dma_age=%lld ms",
+                     (int)s_player_active, (int)s_parked, (int)s_route,
+                     (int)s_i2s_disabled, (unsigned)s_ring_bytes,
+                     (unsigned)s_w_chunks, (unsigned)s_sil_chunks,
+                     (unsigned)s_drop_inactive, (int)s_post_peak,
+                     (long long)(last_dma_us
+                                 ? (flush_done_us - last_dma_us) / 1000
+                                 : -1));
             if (s_flush_done != NULL) {
                 xSemaphoreGive(s_flush_done);   /* unblock the waiting caller */
             }
@@ -1054,7 +1077,9 @@ static void i2s_writer_task(void *arg)
         uint8_t *item = (uint8_t *)xRingbufferReceive(s_pcm_rb, &written,
                                                        pdMS_TO_TICKS(20));
         if (item != NULL) {
+            int64_t pull_us = esp_timer_get_time();
             taskENTER_CRITICAL(&s_ring_lock);
+            s_last_ring_pull_us = pull_us;
             if (written <= s_ring_bytes) {
                 s_ring_bytes -= written;
             } else {
@@ -1084,6 +1109,11 @@ static void i2s_writer_task(void *arg)
                 i2s_write_bounded(item, written);
                 vRingbufferReturnItem(s_pcm_rb, item);
                 s_w_chunks++;
+                int64_t dma_us = esp_timer_get_time();
+                taskENTER_CRITICAL(&s_ring_lock);
+                s_last_real_dma_us = dma_us;
+                s_last_ring_pull_us = dma_us;
+                taskEXIT_CRITICAL(&s_ring_lock);
                 if (s_diag_first) {
                     ESP_LOGW(TAG,
                              "[SEAMDIAG] first real PCM -> DMA: post_peak=%d "
@@ -1864,6 +1894,34 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
                 ESP_LOGE(TAG, "[ERROR] PCM ring full: %u bytes dropped "
                                "(writer stalled >100 ms) -> audible gap",
                          (unsigned)(bytes - off));
+                size_t ring_dbg;
+                int64_t now_dbg = esp_timer_get_time();
+                int64_t last_pull_us, last_dma_us, last_seam_us;
+                bool parked_dbg, disabled_dbg;
+                audio_route_t route_dbg;
+                taskENTER_CRITICAL(&s_ring_lock);
+                ring_dbg = s_ring_bytes;
+                last_pull_us = s_last_ring_pull_us;
+                last_dma_us = s_last_real_dma_us;
+                last_seam_us = s_last_flush_done_us;
+                parked_dbg = s_parked;
+                disabled_dbg = s_i2s_disabled;
+                route_dbg = s_route;
+                taskEXIT_CRITICAL(&s_ring_lock);
+                ESP_LOGW(TAG,
+                         "[RINGFULLDBG] ring=%u/%u parked=%d dis=%d route=%d "
+                         "w=%u sil=%u drop=%u pull_age=%lld ms dma_age=%lld ms "
+                         "seam_age=%lld ms",
+                         (unsigned)ring_dbg, (unsigned)PCM_RING_BYTES,
+                         (int)parked_dbg, (int)disabled_dbg, (int)route_dbg,
+                         (unsigned)s_w_chunks, (unsigned)s_sil_chunks,
+                         (unsigned)s_drop_inactive,
+                         (long long)(last_pull_us
+                                     ? (now_dbg - last_pull_us) / 1000 : -1),
+                         (long long)(last_dma_us
+                                     ? (now_dbg - last_dma_us) / 1000 : -1),
+                         (long long)(last_seam_us
+                                     ? (now_dbg - last_seam_us) / 1000 : -1));
             }
             s_wr_errs++;
             res = AUDIO_WRITE_STALLED;   /* back-pressure: ring full, retry next frame */
