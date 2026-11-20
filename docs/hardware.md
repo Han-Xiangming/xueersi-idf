@@ -84,4 +84,6 @@ esp_log_level_set("BT_L2CAP", WARN)     降噪（BT 拥塞回调日志泛滥，�
 
 `lvgl_task`：`ui_create` → `lv_refr_now` → 等待 LCD 首帧 flush 完成后 `hw_lcd_display_on()` 点亮背光（避免开机白屏）；随后 ~60Hz 循环：每 `UI_REFRESH_PERIOD_MS=16ms` 调 `ui_refresh()`，`lv_timer_handler()` 延迟钳制在 1~16ms（`LVGL_TASK_MIN/MAX_DELAY_MS`）。
 
-核分配：Core 0 承载 MP3 解码、BT 控制器/协议栈与系统任务；Core 1 承载 `lvgl`(7) 与 `i2s_wr`(6) 两条应用实时链路；其余后台任务不绑核。详见 `docs/player.md` §1。
+核分配：Core 0 承载 MP3 解码、BT 控制器/协议栈与系统任务；Core 1 承载 `lvgl`(7) 与 `i2s_wr`(8) 两条应用实时链路；其余后台任务不绑核。
+
+- **`i2s_wr` 必须高于 `lvgl`（8 > 7）**：二者同在 Core 1。若 `i2s_wr`(6) 低于 `lvgl`(7)，调音量触发的全页重绘 + 同步 SPI 刷屏会抢占 writer 超过 PCM ring 的 ~93 ms 裕量，解码侧 `xRingbufferSend()` 超时丢样本，串口报 `PCM ring full: N bytes dropped (writer stalled >100 ms)`、听感为断流卡顿。与 `ui.h` §任务优先级里记录的旧故障（LVGL 高于 consumer 导致 I2S underrun）同源；解码任务已移至 Core 0，writer 也曾漏改，现已一并提到 8。详见 `docs/player.md` §1。

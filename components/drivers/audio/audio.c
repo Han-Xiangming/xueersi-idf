@@ -53,9 +53,16 @@ static const char *TAG = "hw_audio";
 #define AUDIO_2PI           6.2831853f
 
 /* I2S DMA ring: 12 descriptors x 1024 frames (x 4 bytes/frame, 16-bit
- * stereo) = 48 KB of buffering (~280 ms at 44.1 kHz). One descriptor-sized
- * zero chunk per descriptor is enough to silence the whole ring. */
+ * stereo) = 48 KB of buffering (~280 ms at 44.1 kHz). */
 #define I2S_DMA_DESC_NUM    12
+
+/* Seam re-arm silence prime. Flooding the whole 48 KB ring synchronously in
+ * the writer task held it ~280 ms — past the 16 KB / ~93 ms PCM ring slack —
+ * so the decoder's xRingbufferSend() timed out and dropped PCM ("PCM ring
+ * full: N bytes dropped") at every track seam. disable+enable already
+ * re-initialises the i2s_std descriptor queue, so 2 KB (~12 ms) suffices to
+ * flush stale samples ahead of the DMA pointer. */
+#define SEAM_SILENCE_PRIME_BYTES (2U * 1024U)
 
 /* Time for the DMA to flush its in-flight descriptors (~48 KB at 44.1 kHz
  * stereo ≈ 280 ms) after the PCM ring has drained. The writer waits this out
@@ -66,16 +73,16 @@ static const char *TAG = "hw_audio";
  * playback by ~300 ms with no completion signal). */
 #define I2S_DMA_DRAIN_MS    350
 
-/* PCM ring between the DSP (decode task) and the DMA writer task: 16 KB
- * (~93 ms at 44.1 kHz stereo). Sizing rationale: measured 4 KB SD reads cost
- * ~25-30 ms (3-5x the theoretical 10 MHz time) and stretch past 50 ms while a
- * background playlist scan hammers the same SPI2 bus, so this ring is the only
- * buffer in front of the ~279 ms DMA ring — total producer-stall budget is
- * ~372 ms, enough to absorb one SD read retry backoff (250 ms) on top of a
- * slow read. Enlarging it costs pipeline latency one-for-one (track-end
- * drain, pause / stop tail); 32 KB (~186 ms) is a one-line bump if 16 KB ever
- * proves short. */
-#define PCM_RING_BYTES       (16 * 1024)
+/* PCM ring between the DSP (decode task) and the DMA writer task: 32 KB
+ * (~186 ms at 44.1 kHz stereo). Sizing rationale: the 48 kHz -> 44.1 kHz
+ * resample path runs the producer at ~25 ms/frame against a 24 ms frame budget,
+ * so SD-read jitter (measured 4 KB reads ~25-30 ms, >50 ms under SPI2
+ * contention) used to drain the 16 KB / 93 ms ring and make the writer feed
+ * silence mid-song ("[AUDIO] I2S underrun: ring empty while playing"). 32 KB
+ * doubles the jitter absorption. This ring is the only buffer in front of the
+ * ~279 ms DMA ring; cost is pipeline latency one-for-one on track-end drain /
+ * pause / stop tail (+93 ms), which the seam flush already waits out. */
+#define PCM_RING_BYTES       (32 * 1024)
 
 /* A dedicated DMA writer task owns the actual I2S write, so there is no manual
  * write timeout / IO mutex here: hw_audio_write_pcm() blocks on the ring buffer
@@ -124,7 +131,7 @@ static bool              s_diag_arm   = false;
 static bool              s_diag_first = false;
 static volatile bool s_ready;
 static uint32_t s_rate = AUDIO_DEFAULT_RATE;
-/* File-scope silence chunk used to flood / re-arm the DMA descriptor ring
+/* File-scope silence chunk used to prime / re-arm the DMA descriptor ring
  * across a track seam and at park. Must be reachable from i2s_seam_rearm(). */
 static int16_t s_seam_silence[256 * 2];
 
@@ -213,15 +220,6 @@ static volatile size_t s_ring_bytes;
  * and the writer task (decrement) so the non-atomic read-modify-write can
  * never lose an update. */
 static portMUX_TYPE s_ring_lock = portMUX_INITIALIZER_UNLOCKED;
-
-/* Underflow diagnostics: the gap between consecutive speaker-path writes
- * (the decode time) must stay well under the DMA drain time, otherwise the
- * DMA runs dry between frames and the amp reproduces repeated fragments /
- * its noise floor. s_last_write_us = end of the previous write (0 = idle
- * since); a gap > 30 ms is logged at WARN at most once per second. */
-static int64_t s_last_write_us;
-static int64_t s_last_gap_log_us;
-static uint32_t s_gap_count;
 
 /* --- Speaker-protection high-pass filter -------------------------------
  * The on-board driver is a small phone racetrack speaker (usable ~800 Hz..8 kHz,
@@ -425,7 +423,6 @@ static void audio_apply_route(audio_route_t route)
     audio_update_vol_gain();
     audio_dsp_reset();
     s_vol_gain_sm = s_vol_gain;   /* no fade-in on route switch */
-    s_last_write_us = 0;
     ESP_LOGI(TAG, "audio route -> %s (vol %u%%)",
              audio_route_is_bt() ? "bluetooth" : "speaker", (unsigned)s_volume);
     /* Notify AFTER the route is fully applied. This runs on the switching
@@ -581,10 +578,34 @@ static void audio_set_loudness_coeff(uint32_t rate)
 #define DRC_TAB_SIZE        (DRC_TAB_STEPS * DRC_TAB_OCTAVES)  /* 320 */
 
 /* DRC gain curves, Q15. Index = (msb<<4)|frac of the peak envelope,
- * 16 steps/octave over env 1..524288 (LIM_HEADROOM). Entries below
- * DRC_TAB_OFF_* are exactly 0 dB and are omitted (handled by a guard). */
-#define DRC_TAB_OFF_LOW  178  /* T=-20dBFS R=4:1 K=6dB */
-static const int16_t s_drc_gain_low[142] = {
+ * 16 steps/octave over env 1..524288 (LIM_HEADROOM). Each table is the full
+ * 320 entries: indices below the band threshold are exactly 0 dB (32768).
+ * Storing the 0 dB prefix explicitly removes the per-sample `idx < off` branch
+ * and the compact-table offset arithmetic from the hot DSP loop. Bit-exact
+ * against the old compact+guard form (verified by simulation). */
+#define DRC_TAB_OFF_LOW  178  /* T=-20dBFS R=4:1 K=6dB (0 dB prefix length) */
+static const int16_t s_drc_gain_low[320] = {
+    /* T=-20dBFS R=4:1 K=6dB.
+       [0..177] 0 dB; [178..] curve; tail mirrors the old
+       zero-filled array tail for bit-exactness. */
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
     32760, 32673, 32499, 32253, 31946, 31589, 31191, 30758, 30298, 29817,
     29318, 28807, 28286, 27759, 26963, 25902, 24859, 23896, 23017, 22209,
     21464, 20776, 20136, 19541, 18986, 18465, 17977, 17518, 17086, 16677,
@@ -598,11 +619,36 @@ static const int16_t s_drc_gain_low[142] = {
     8231, 8231, 8231, 8231, 8231, 8231, 8231, 8231, 8231, 8231,
     8231, 8231, 8231, 8231, 8231, 8231, 8231, 8231, 8231, 8231,
     8231, 8231, 8231, 8231, 8231, 8231, 8231, 8231, 8231, 8231,
-    8231, 8231,
+    8231, 8231, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0,
 };
 
-#define DRC_TAB_OFF_HIGH 215  /* T=-6dBFS R=3:1 K=6dB */
-static const int16_t s_drc_gain_high[105] = {
+static const int16_t s_drc_gain_high[320] = {
+    /* T=-6dBFS R=3:1 K=6dB.
+       [0..214] 0 dB; [215..] curve; tail mirrors the old
+       zero-filled array tail for bit-exactness. */
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768, 32768,
+    32768, 32768, 32768, 32768, 32768,
     32749, 32677, 32556, 32393, 32193, 31962, 31703, 31420, 31117, 30632,
     29938, 29208, 28454, 27688, 26916, 26147, 25400, 24704, 24054, 23445,
     22873, 22335, 21827, 21348, 20893, 20255, 19476, 18768, 18121, 17526,
@@ -632,6 +678,33 @@ static inline int drc_gain_index(int32_t env)
     int frac = (msb >= 4) ? (int)((v >> (msb - 4)) & 0xF)
                           : (int)((v << (4 - msb)) & 0xF);
     return (msb << 4) | frac;
+}
+
+/* Process one DRC band and return its gain-scaled sample. `b` is always a
+ * compile-time constant (0/1) at the call sites, so the compiler folds the
+ * table/env/gain selects and inlines this into two straight-line paths — no
+ * loop, no `idx < off` guard, no compact-table offset arithmetic. Bit-exact
+ * against the old in-loop form (full-table simulation verified). */
+static inline int32_t drc_apply_band(int b, int32_t in, int ch)
+{
+    int32_t a = (in < 0) ? -in : in;
+    int32_t *env = &s_drc_env[b][ch];
+    if (a > *env) {
+        *env = a;                       /* instant peak attack */
+    }
+    else {
+        *env = (int32_t)(((int64_t)*env * DRC_ENV_REL_Q15) >> 15);
+    }
+    int32_t idx = drc_gain_index(*env);
+    int32_t tg = (b == 0) ? s_drc_gain_low[idx] : s_drc_gain_high[idx];
+    int32_t *g = &s_drc_gain[b][ch];
+    if (tg < *g) {
+        *g += ((tg - *g) * DRC_ATT_Q15) >> 15;
+    }
+    else {
+        *g += ((tg - *g) * DRC_REL_Q15) >> 15;
+    }
+    return (int32_t)(((int64_t)in * *g) >> 15);
 }
 
 /* Recompute the crossover low-pass coefficient for a new (fixed I2S) rate. */
@@ -777,9 +850,8 @@ void hw_audio_set_player_active(bool active)
          * removes the "余音" of the previous track — by the time the next track
          * starts (a button press later) the ring is silent.
          *
-         * The underrun bookkeeping is reset so the deliberate idle gap is not
-         * counted as a write gap. */
-        s_last_write_us = 0;
+         * The writer's real-underrun counter needs no reset here: an inactive
+         * player takes the mute branch, not the ring-empty branch. */
         ESP_LOGD(TAG, "player inactive: I2S left running (auto_clear silence)");
     }
 }
@@ -801,7 +873,6 @@ void hw_audio_park(void)
     if (s_i2s_task != NULL) {
         xTaskNotifyGive(s_i2s_task);
     }
-    s_last_write_us = 0;
     ESP_LOGD(TAG, "I2S parked (writer paused)");
 }
 
@@ -843,8 +914,10 @@ static bool i2s_write_bounded(const void *data, size_t len)
  * cleanly re-initialises the descriptor queue: this is the standard i2s_std
  * restart path, and the architecture comment's "enable() doesn't refill the
  * credit queue" caveat applied to the OLD ADF I2S driver, NOT the current
- * i2s_std one. A silence refill follows so any stale descriptor ahead of the
- * DMA pointer is overwritten before the next track starts. */
+ * i2s_std one. Only a SHORT silence prime follows (see
+ * SEAM_SILENCE_PRIME_BYTES): disable+enable resets the descriptor queue, so a
+ * full-ring flood is unnecessary and — by stalling the writer past the PCM
+ * ring's slack — caused the track-seam dropout. */
 static void i2s_seam_rearm(void)
 {
     if (s_i2s_chan == NULL || s_i2s_disabled) {
@@ -860,14 +933,14 @@ static void i2s_seam_rearm(void)
         return;
     }
     size_t filled = 0;
-    const size_t ring_bytes = (size_t)I2S_DMA_DESC_NUM * 1024U * 4U;
-    while (filled < ring_bytes) {
+    while (filled < SEAM_SILENCE_PRIME_BYTES) {
         if (!i2s_write_bounded(s_seam_silence, sizeof(s_seam_silence))) {
             break;
         }
         filled += sizeof(s_seam_silence);
     }
-    ESP_LOGW(TAG, "[AUDIO] seam re-arm: channel reset + silence refilled");
+    ESP_LOGW(TAG, "[AUDIO] seam re-arm: channel reset + %u B silence prime",
+             (unsigned)filled);
 }
 
 /* Create the I2S output with ESP-IDF's i2s_std — no ADF. Codec-less: the
@@ -884,6 +957,14 @@ static void i2s_writer_task(void *arg)
     static uint32_t s_sil_chunks = 0;   /* silence chunks emitted */
     static uint32_t s_drop_inactive = 0;/* real PCM dropped because !active */
     static int32_t  s_post_peak = 0;    /* peak of POST-DSP PCM sent to DMA */
+    /* Real underrun counter: incremented ONLY when the writer wanted PCM but
+     * the ring was empty while playback was active (the branch below that
+     * feeds silence to keep BCLK alive). This is the honest audible-gap
+     * signal. The old producer-side "I2S write gap" merely timed two
+     * hw_audio_write_pcm() calls (SD read + decode) and false-alarmed on a
+     * slow-but-adequate 4 KB read on 48 kHz tracks. */
+    static uint32_t s_underruns = 0;
+    static int64_t  s_underrun_log_us = 0;
     for (;;) {
         if (s_flush_req) {
             /* Drop the queued PCM so the next track starts clean. The channel is
@@ -956,14 +1037,15 @@ static void i2s_writer_task(void *arg)
                 vRingbufferReturnItem(s_pcm_rb, pit);   /* dropped, not played */
             }
             vTaskDelay(pdMS_TO_TICKS(I2S_DMA_DRAIN_MS));
-            /* Reset + overwrite the DMA descriptor ring at park. i2s_seam_rearm()
+            /* Reset + prime the DMA descriptor ring at park. i2s_seam_rearm()
              * does a disable+enable (which re-initialises the descriptor queue on
-             * the i2s_std driver) and then floods silence, erasing any
-             * previous-track PCM left in descriptors AHEAD of the DMA pointer so
-             * it cannot leak as "上一首残音". The channel is then left RUNNING but
-             * this task blocks below, so the DMA idles and BCLK stops — the amp
-             * powers down. (The old comment warning that disable() "wedges the
-             * out-link" referred to the ADF I2S driver, not i2s_std.) */
+             * the i2s_std driver) followed by a SHORT silence prime. The pending
+             * PCM was already dropped and I2S_DMA_DRAIN_MS waited out the DMA
+             * tail above, so no previous-track audio survives to leak as
+             * "上一首残音". The channel is then left RUNNING but this task blocks
+             * below, so the DMA idles and BCLK stops — the amp powers down. (The
+             * old comment warning that disable() "wedges the out-link" referred
+             * to the ADF I2S driver, not i2s_std.) */
             i2s_seam_rearm();
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  /* wait for resume / flush */
             continue;
@@ -1011,6 +1093,22 @@ static void i2s_writer_task(void *arg)
                 }
             }
         } else {
+            /* Ring empty but playback active: the DMA is about to run dry and
+             * this silence chunk is exactly what fills the gap — a REAL
+             * underrun. (Mute drops and park/seam primes take other branches
+             * and are deliberately not counted.) Log the first underrun of
+             * an episode with the ring's fill level; at most once per second. */
+            if (s_player_active) {
+                s_underruns++;
+                int64_t now_us = esp_timer_get_time();
+                if (now_us - s_underrun_log_us > 1000000) {
+                    ESP_LOGW(TAG,
+                             "[AUDIO] I2S underrun: ring empty while playing, "
+                             "%u silence chunks fed to DMA (real audio gap)",
+                             (unsigned)s_underruns);
+                    s_underrun_log_us = now_us;
+                }
+            }
             i2s_write_bounded(s_seam_silence, sizeof(s_seam_silence));
             s_sil_chunks++;
         }
@@ -1078,12 +1176,21 @@ static esp_err_t audio_create_channel(void)
     /* Pin to Core 1: this is the final real-time link (PCM ring -> I2S DMA).
      * An unpinned task can be scheduled on Core 0, where the Bluetooth
      * controller+stack run at higher priority and starve it during heavy BT
-     * traffic, causing I2S underruns (clicks/dropouts). Core 1 hosts the app:
-     * priority 6 keeps it below lvgl (7), the only app task on this core that
-     * outranks it. The decode task (8) is pinned to Core 0, so its higher
-     * priority number cannot preempt anything on Core 1. */
+     * traffic, causing I2S underruns (clicks/dropouts).
+     *
+     * PRIORITY 8, ABOVE lvgl (7) on this SAME core — this is the fix for the
+     * "PCM ring full: N bytes dropped (writer stalled >100 ms)" log and the
+     * audible gap while ramping the volume: turning the volume key forced a
+     * full LVGL page repaint + synchronous SPI flush at prio 7, which
+     * preempted this writer at prio 6 for longer than the ring's ~93 ms of
+     * slack, so the decode task's xRingbufferSend() timed out and dropped PCM.
+     * ui.h:27-34 records the identical earlier failure with LVGL above the
+     * real-time consumer on a shared core; the decode task was moved to Core 0
+     * but this writer was left below LVGL on Core 1. Raise it so the DMA feed
+     * always wins over a cosmetic redraw. Priority 8 matches the decode task,
+     * which lives on Core 0, so the two never contend for the same CPU. */
     BaseType_t tr = xTaskCreatePinnedToCore(i2s_writer_task, "i2s_wr", 4096,
-                                            NULL, 6, &s_i2s_task, 1);
+                                            NULL, 8, &s_i2s_task, 1);
     if (tr != pdPASS) {
         ESP_LOGE(TAG, "[AUDIO] i2s writer task create failed");
         vRingbufferDelete(s_pcm_rb);
@@ -1417,12 +1524,9 @@ void hw_audio_set_sample_rate(uint32_t sample_rate_hz)
  * zeroes each descriptor once the DMA has transmitted it, so as the ring
  * drains the old pass's tail is replaced by silence on its own, and the new
  * pass is written straight behind it. No stop/start, no chirp, no wedge.
- *
- * The underrun bookkeeping is reset so the deliberate seam pause is not
- * flagged as an I2S write gap. Call from the task that owns PCM writes. */
+ * Call from the task that owns PCM writes. */
 void hw_audio_pipeline_flush(void)
 {
-    s_last_write_us = 0;
     if (s_route == AUDIO_ROUTE_BT) {
         bluetooth_audio_flush_pcm_ring();
         return;
@@ -1466,7 +1570,6 @@ void hw_audio_pipeline_flush(void)
  * must not bleed into the next song. Synchronous. */
 void hw_audio_pipeline_switch(void)
 {
-    s_last_write_us = 0;
     if (s_route == AUDIO_ROUTE_BT) {
         bluetooth_audio_flush_pcm_ring();
         return;
@@ -1696,31 +1799,9 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
         s_drc_lp[ch] = lo;
         int32_t hi = y - lo;
 
-        int32_t mixed = 0;
-        const int32_t band_in[2] = { lo, hi };
-        for (int b = 0; b < 2; b++) {
-            int32_t a = (band_in[b] < 0) ? -band_in[b] : band_in[b];
-            int32_t *env = &s_drc_env[b][ch];
-            if (a > *env) {
-                *env = a;                 /* instant peak attack */
-            }
-            else {
-                *env = (int32_t)(((int64_t)*env * DRC_ENV_REL_Q15) >> 15);
-            }
-            int32_t idx = drc_gain_index(*env);
-            int32_t off = (b == 0) ? DRC_TAB_OFF_LOW : DRC_TAB_OFF_HIGH;
-            int32_t tg = (idx < off) ? 32768
-                                     : (b == 0 ? s_drc_gain_low[idx - off]
-                                               : s_drc_gain_high[idx - off]);
-            int32_t *g = &s_drc_gain[b][ch];
-            if (tg < *g) {
-                *g += ((tg - *g) * DRC_ATT_Q15) >> 15;
-            }
-            else {
-                *g += ((tg - *g) * DRC_REL_Q15) >> 15;
-            }
-            mixed += (int32_t)(((int64_t)band_in[b] * *g) >> 15);
-        }
+        /* Full-table, unrolled DRC (bit-exact vs the old compact+guard loop). */
+        int32_t mixed = drc_apply_band(0, lo, ch)
+                      + drc_apply_band(1, hi, ch);
 
         /* Hard ceiling: the final line of defence after the two band gains
          * recombine, so no transient can reach 0 dBFS at the amp input. */
@@ -1737,25 +1818,10 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
 
     size_t bytes = dsp_frames * 4;
 
-    /* Underflow diagnostics: the gap between consecutive speaker-path writes
-     * (the decode time) must stay well under the DMA drain time, otherwise the
-     * DMA runs dry between frames. s_last_write_us = end of previous write
-     * (0 = idle since); a gap > 30 ms is logged at WARN at most once/sec. */
-    if (s_i2s_chan != NULL) {
-        int64_t now_us = esp_timer_get_time();
-        if (s_last_write_us != 0) {
-            int64_t gap_ms = (now_us - s_last_write_us) / 1000;
-            if (gap_ms > 30) {
-                s_gap_count++;
-                if (now_us - s_last_gap_log_us > 1000000) {
-                    ESP_LOGW(TAG, "I2S write gap %lld ms (DMA underrun risk), "
-                                  "total gaps %u",
-                             (long long)gap_ms, (unsigned)s_gap_count);
-                    s_last_gap_log_us = now_us;
-                }
-            }
-        }
-    }
+    /* Underrun diagnostics now live in the writer task: it is the only place
+     * that actually knows the ring ran dry (see s_underruns there). Timing
+     * the gap between producer calls only measured SD read + decode latency
+     * and false-alarmed on slow-but-adequate reads, so it was removed. */
 
     /* 频道已在 init 时 enable;这里只把已重采样+DSP 后的 PCM 写入 ringbuf,
        由独立的 DMA writer 任务喂 I2S。无 enable/预热/reconfig/互斥锁。
@@ -1784,7 +1850,6 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
         }
         if (xRingbufferSend(s_pcm_rb, (uint8_t *)dsp_buf + off, chunk,
                            pdMS_TO_TICKS(100)) != pdTRUE) {
-            s_last_write_us = esp_timer_get_time();
             /* 暂停/停止落在写中途:不算错误。 */
             if (!s_player_active) {
                 return AUDIO_WRITE_ABANDONED;
@@ -1811,7 +1876,6 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
         s_ring_bytes += chunk;   /* account for queued audio (end-of-track detection) */
         taskEXIT_CRITICAL(&s_ring_lock);
     }
-    s_last_write_us = esp_timer_get_time();
     /* 暂停/停止落在写中途:不算错误。 */
     if (!s_player_active) {
         return AUDIO_WRITE_ABANDONED;

@@ -36,7 +36,13 @@
  * In that shared-core setup key events and the synchronous render stayed
  * responsive because the decode task blocked on I2S DMA back-pressure for most
  * of each frame. Today the two tasks run on separate cores and do not contend
- * for the same CPU at all. */
+ * for the same CPU at all.
+ *
+ * IMPORTANT: this 7 is BELOW the i2s_wr DMA writer (8), which shares Core 1
+ * with lvgl. A volume-key repaint at 7 must NOT preempt the writer that feeds
+ * the I2S DMA — doing so used to stall it past the PCM ring's ~93 ms slack,
+ * drop PCM and sound like a dropout while ramping the volume. Keep lvgl below
+ * 8. */
 #define LVGL_TASK_PRIORITY          7
 #define LVGL_TASK_MIN_DELAY_MS      1
 #define LVGL_TASK_MAX_DELAY_MS      16
