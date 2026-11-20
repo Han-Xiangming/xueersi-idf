@@ -84,6 +84,14 @@ static const char *TAG = "hw_audio";
  * pause / stop tail (+93 ms), which the seam flush already waits out. */
 #define PCM_RING_BYTES       (32 * 1024)
 
+/* The BYTEBUF ring coalesces consecutive 1 KB producer chunks into one large
+ * item. If the writer receives 16~26 KB at once, i2s_channel_write() blocks for
+ * the real-time duration of that audio (~90~137 ms) and cannot return the item
+ * to the ring, so the producer's 100 ms xRingbufferSend() times out even though
+ * s_ring_bytes says the ring is mostly free. Cap each writer pull to one
+ * 44.1 kHz stereo DMA descriptor (~23 ms) so the item is returned promptly. */
+#define PCM_WRITER_CHUNK_MAX (4 * 1024)
+
 /* A dedicated DMA writer task owns the actual I2S write, so there is no manual
  * write timeout / IO mutex here: hw_audio_write_pcm() blocks on the ring buffer
  * (xRingbufferSend) and the writer task feeds the i2s_std DMA independently. */
@@ -197,6 +205,16 @@ static uint32_t s_wr_errs;
 /* Consecutive timed-out i2s_channel_write()s (bounds the ERROR rate). Surfaces
  * a wedged DMA as a logged stall instead of a silent portMAX_DELAY freeze. */
 static uint32_t s_wr_stalls;
+
+/* Diagnostic-only I2S write timing. With the writer capped at one DMA
+ * descriptor (~23 ms at 44.1 kHz), only log writes clearly above that. Nothing
+ * here changes the write timeout or retry behavior. */
+#define I2S_SLOW_WRITE_US      30000
+static uint32_t s_i2s_write_fails;
+static uint32_t s_i2s_slow_writes;
+static volatile int64_t s_last_i2s_write_dur_us;
+static int64_t s_i2s_fail_log_us;
+static int64_t s_i2s_slow_log_us;
 
 /* Bytes currently sitting in the PCM ring: pushed by hw_audio_write_pcm(),
  * pulled by the writer task. This is how much decoded audio is still queued
@@ -904,15 +922,47 @@ bool hw_audio_is_ready(void)
 static bool i2s_write_bounded(const void *data, size_t len)
 {
     size_t w = 0;
-    esp_err_t rc = i2s_channel_write(s_i2s_chan, data, len, &w, pdMS_TO_TICKS(50));
+    int64_t t0 = esp_timer_get_time();
+    esp_err_t rc = i2s_channel_write(s_i2s_chan, data, len, &w,
+                                     pdMS_TO_TICKS(50));
+    int64_t dur_us = esp_timer_get_time() - t0;
+    int64_t now_us = t0 + dur_us;
+
+    taskENTER_CRITICAL(&s_ring_lock);
+    s_last_i2s_write_dur_us = dur_us;
+    taskEXIT_CRITICAL(&s_ring_lock);
+
     if (rc == ESP_OK) {
         s_wr_stalls = 0;
+        if (dur_us > I2S_SLOW_WRITE_US || w < len) {
+            s_i2s_slow_writes++;
+            if (now_us - s_i2s_slow_log_us > 1000000) {
+                ESP_LOGW(TAG,
+                         "[WRDBG] slow i2s write: len=%u written=%u dur=%lld us "
+                         "fails=%u slow=%u",
+                         (unsigned)len, (unsigned)w, (long long)dur_us,
+                         (unsigned)s_i2s_write_fails,
+                         (unsigned)s_i2s_slow_writes);
+                s_i2s_slow_log_us = now_us;
+            }
+        }
         return true;
     }
+
+    s_i2s_write_fails++;
     if (++s_wr_stalls >= 8) {
         ESP_LOGE(TAG, "[ERROR] i2s_channel_write stalled (rc=%d): DMA wedged?",
                  (int)rc);
         s_wr_stalls = 0;
+    }
+    if (s_i2s_write_fails <= 3 || now_us - s_i2s_fail_log_us > 1000000) {
+        ESP_LOGE(TAG,
+                 "[WRDBG] i2s write fail: len=%u written=%u rc=%d dur=%lld us "
+                 "fails=%u slow=%u stalls=%u",
+                 (unsigned)len, (unsigned)w, (int)rc, (long long)dur_us,
+                 (unsigned)s_i2s_write_fails, (unsigned)s_i2s_slow_writes,
+                 (unsigned)s_wr_stalls);
+        s_i2s_fail_log_us = now_us;
     }
     return false;
 }
@@ -1074,8 +1124,9 @@ static void i2s_writer_task(void *arg)
             continue;
         }
         /* Pull PCM from the ring; on underrun, emit silence to keep BCLK alive. */
-        uint8_t *item = (uint8_t *)xRingbufferReceive(s_pcm_rb, &written,
-                                                       pdMS_TO_TICKS(20));
+        uint8_t *item = (uint8_t *)xRingbufferReceiveUpTo(
+                            s_pcm_rb, &written, pdMS_TO_TICKS(20),
+                            PCM_WRITER_CHUNK_MAX);
         if (item != NULL) {
             int64_t pull_us = esp_timer_get_time();
             taskENTER_CRITICAL(&s_ring_lock);
@@ -1896,7 +1947,8 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
                          (unsigned)(bytes - off));
                 size_t ring_dbg;
                 int64_t now_dbg = esp_timer_get_time();
-                int64_t last_pull_us, last_dma_us, last_seam_us;
+                int64_t last_pull_us, last_dma_us, last_seam_us, last_wr_dur_us;
+                uint32_t wr_fail_dbg, slow_wr_dbg;
                 bool parked_dbg, disabled_dbg;
                 audio_route_t route_dbg;
                 taskENTER_CRITICAL(&s_ring_lock);
@@ -1904,6 +1956,9 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
                 last_pull_us = s_last_ring_pull_us;
                 last_dma_us = s_last_real_dma_us;
                 last_seam_us = s_last_flush_done_us;
+                last_wr_dur_us = s_last_i2s_write_dur_us;
+                wr_fail_dbg = s_i2s_write_fails;
+                slow_wr_dbg = s_i2s_slow_writes;
                 parked_dbg = s_parked;
                 disabled_dbg = s_i2s_disabled;
                 route_dbg = s_route;
@@ -1911,7 +1966,8 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
                 ESP_LOGW(TAG,
                          "[RINGFULLDBG] ring=%u/%u parked=%d dis=%d route=%d "
                          "w=%u sil=%u drop=%u pull_age=%lld ms dma_age=%lld ms "
-                         "seam_age=%lld ms",
+                         "seam_age=%lld ms last_wr_dur=%lld us wr_fail=%u "
+                         "slow_wr=%u",
                          (unsigned)ring_dbg, (unsigned)PCM_RING_BYTES,
                          (int)parked_dbg, (int)disabled_dbg, (int)route_dbg,
                          (unsigned)s_w_chunks, (unsigned)s_sil_chunks,
@@ -1921,7 +1977,9 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
                          (long long)(last_dma_us
                                      ? (now_dbg - last_dma_us) / 1000 : -1),
                          (long long)(last_seam_us
-                                     ? (now_dbg - last_seam_us) / 1000 : -1));
+                                     ? (now_dbg - last_seam_us) / 1000 : -1),
+                         (long long)last_wr_dur_us,
+                         (unsigned)wr_fail_dbg, (unsigned)slow_wr_dbg);
             }
             s_wr_errs++;
             res = AUDIO_WRITE_STALLED;   /* back-pressure: ring full, retry next frame */
