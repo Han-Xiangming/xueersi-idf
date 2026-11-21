@@ -73,6 +73,7 @@ typedef enum {
  * list. Tag/label storage is static (PSRAM in the page files), never stack. */
 #define UI_DUP_TAG_MAX     48
 #define UI_DUP_LABEL_MAX   (MP3_NAME_LEN + UI_DUP_TAG_MAX + 16)
+#define UI_DUP_MQ_OUT_MAX  (UI_DUP_LABEL_MAX + LIST_SCROLL_GAP + UI_DUP_TAG_MAX + 8)
 
 typedef struct {
     int      ofs;           /* current scroll offset, in characters */
@@ -161,6 +162,10 @@ void ui_dup_dir(char *dst, size_t dst_size, const char *path, const char *root);
  * directory tag stays visible; the caller supplies a UI_DUP_LABEL_MAX buffer. */
 void ui_dup_label(char *dst, size_t dst_size, int max_w,
                   const char *name, const char *dir);
+/* Marquee the NAME only; "[dir]" is appended as a fixed suffix and never
+ * scrolls. `out` should be a UI_DUP_MQ_OUT_MAX buffer. */
+void ui_dup_marquee_label(ui_marquee_t *mq, char *out, size_t out_size,
+                          int max_w, const char *name, const char *dir);
 bool ui_marquee_step(ui_marquee_t *mq, char *out, size_t out_size,
                      int max_w, const char *name);
 /* Master volume step (shared by the player page and the settings row). */

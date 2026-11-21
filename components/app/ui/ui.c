@@ -385,6 +385,62 @@ void ui_dup_label(char *dst, size_t dst_size, int max_w,
     }
 }
 
+/* Selected-row marquee for duplicate-tagged files: only the name scrolls.
+ * The directory tag is built once and appended after every marquee frame, so
+ * its pixels never shift with the scroll offset. */
+void ui_dup_marquee_label(ui_marquee_t *mq, char *out, size_t out_size,
+                          int max_w, const char *name, const char *dir)
+{
+    if (mq == NULL || out == NULL || out_size == 0) {
+        return;
+    }
+    if (name == NULL) {
+        name = "";
+    }
+    if (dir == NULL) {
+        dir = "";
+    }
+    if (max_w < 8) {
+        max_w = 8;
+    }
+    out[0] = '\0';
+
+    char tag[UI_DUP_TAG_MAX + 4];
+    tag[0] = '\0';
+    if (dir[0] != '\0') {
+        char dir_clip[UI_DUP_TAG_MAX];
+        /* Reserve brackets, a gap and at least one short name cell. */
+        int dir_w = max_w - 16 - 8 - 16;
+        if (dir_w < 16) {
+            dir_w = 16;
+        }
+        ui_utf8_prefix(dir_clip, sizeof(dir_clip), dir, dir_w);
+        size_t pos = 0;
+        tag[pos++] = '[';
+        pos = ui_str_append(tag, pos, sizeof(tag), dir_clip);
+        tag[pos++] = ']';
+        tag[pos] = '\0';
+    }
+
+    const int tag_w = tag[0] ? ui_text_px_width(tag) : 0;
+    const int gap_w = tag[0] ? 8 : 0;
+    int name_w = max_w - tag_w - gap_w;
+    if (name_w < 8) {
+        name_w = 8;
+    }
+    /* Leave room for the fixed " [dir]" suffix before handing `out` to the
+     * raw marquee, which always NUL-terminates within its out_size. */
+    const size_t reserve = tag[0] ? strlen(tag) + 1 : 0;
+    size_t room = (out_size > reserve + 1) ? out_size - reserve : 1;
+    ui_marquee_step(mq, out, room, name_w, name);
+
+    size_t pos = strnlen(out, out_size);
+    if (tag[0] != '\0') {
+        pos = ui_str_append(out, pos, out_size, " ");
+        ui_str_append(out, pos, out_size, tag);
+    }
+}
+
 /* Advance the marquee for the selected row. Returns true and fills `out` with
  * the shifted string "src[ofs:] + gap + src[0:ofs]" when scrolling; the caller
  * should keep refreshing until it returns false (name fits / finished a loop

@@ -161,15 +161,24 @@ static void ui_eb_refresh_dup_tags(void)
     s_eb_dup_count = count;
 }
 
+/* Keep the book list's historical 64-byte name cap for long filenames. */
+static const char *ui_eb_name(int idx)
+{
+    static char name[64];
+    copy_utf8_clipped(name, sizeof(name), ebook_scan_name(idx));
+    return name;
+}
+
+static const char *ui_eb_dir(int idx)
+{
+    return (idx >= 0 && idx < EBOOK_LIST_MAX) ? s_eb_dup_dir[idx] : "";
+}
+
 /* Book rows keep their existing name (including ".txt"); only duplicated
  * basenames gain a "[dir]" suffix. */
 static void ui_eb_label(int idx, char *dst, size_t dst_size, int max_w)
 {
-    /* Keep the book list's historical 64-byte name cap for long filenames. */
-    static char name[64];
-    copy_utf8_clipped(name, sizeof(name), ebook_scan_name(idx));
-    const char *dir = (idx >= 0 && idx < EBOOK_LIST_MAX) ? s_eb_dup_dir[idx] : "";
-    ui_dup_label(dst, dst_size, max_w, name, dir);
+    ui_dup_label(dst, dst_size, max_w, ui_eb_name(idx), ui_eb_dir(idx));
 }
 
 void ui_build_ebook_list(lv_obj_t *page)
@@ -295,14 +304,12 @@ void ui_refresh_ebook_list(void)
             int idx = top + i;
             const int sel = (idx == s_eb_sel);
             if (!loading && idx < count) {
-                static char s_eb_name_buf[UI_DUP_LABEL_MAX + LIST_SCROLL_GAP];
-                static char s_eb_src_buf[UI_DUP_LABEL_MAX];
+                static char s_eb_name_buf[UI_DUP_MQ_OUT_MAX];
                 if (sel) {
-                    /* Selected row scrolls the full name + "[dir]" tag. */
-                    ui_eb_label(idx, s_eb_src_buf, sizeof(s_eb_src_buf), 4096);
-                    ui_marquee_step(&s_eb_mq, s_eb_name_buf,
-                                    sizeof(s_eb_name_buf), LIST_LINE_W,
-                                    s_eb_src_buf);
+                    /* Only the filename scrolls; "[dir]" stays pinned. */
+                    ui_dup_marquee_label(&s_eb_mq, s_eb_name_buf,
+                                         sizeof(s_eb_name_buf), LIST_LINE_W,
+                                         ui_eb_name(idx), ui_eb_dir(idx));
                 }
                 else {
                     /* Width-limited label keeps the directory tag visible. */
@@ -666,9 +673,8 @@ void ui_ebook_list_marquee(void)
         return;
     }
     ui_eb_refresh_dup_tags();
-    static char name[UI_DUP_LABEL_MAX];
-    static char out[UI_DUP_LABEL_MAX + LIST_SCROLL_GAP];
-    ui_eb_label(s_eb_sel, name, sizeof(name), 4096);
-    ui_marquee_step(&s_eb_mq, out, sizeof(out), LIST_LINE_W, name);
+    static char out[UI_DUP_MQ_OUT_MAX];
+    ui_dup_marquee_label(&s_eb_mq, out, sizeof(out), LIST_LINE_W,
+                         ui_eb_name(s_eb_sel), ui_eb_dir(s_eb_sel));
     ui_theme_text_set(s_ui.eb_list.text[i], out);
 }

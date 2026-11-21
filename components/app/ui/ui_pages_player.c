@@ -177,12 +177,17 @@ static void ui_pl_refresh_dup_tags(void)
     s_pl_dup_count = count;
 }
 
+static const char *ui_pl_dir(int idx)
+{
+    return (idx >= 0 && idx < PLAYER_SCAN_MAX) ? s_pl_dup_dir[idx] : "";
+}
+
 /* Display label for one track: stripped name, plus "[dir]" only for entries
  * whose basename is duplicated somewhere else in the current <ALL> list. */
 static void ui_pl_label(int idx, char *dst, size_t dst_size, int max_w)
 {
-    const char *dir = (idx >= 0 && idx < PLAYER_SCAN_MAX) ? s_pl_dup_dir[idx] : "";
-    ui_dup_label(dst, dst_size, max_w, strip_ext(player_scan_name(idx)), dir);
+    ui_dup_label(dst, dst_size, max_w, strip_ext(player_scan_name(idx)),
+                 ui_pl_dir(idx));
 }
 
 void ui_build_player(lv_obj_t *page)
@@ -502,10 +507,10 @@ void ui_player_list_marquee(void)
         return;                     /* selected row off-screen */
     }
     ui_pl_refresh_dup_tags();
-    static char label[UI_DUP_LABEL_MAX];
-    static char out[UI_DUP_LABEL_MAX + LIST_SCROLL_GAP];
-    ui_pl_label(s_mp3_sel, label, sizeof(label), 4096);  /* full text scrolls */
-    ui_marquee_step(&s_mp3_mq, out, sizeof(out), LIST_LINE_W, label);
+    static char out[UI_DUP_MQ_OUT_MAX];
+    ui_dup_marquee_label(&s_mp3_mq, out, sizeof(out), LIST_LINE_W,
+                         strip_ext(player_scan_name(s_mp3_sel)),
+                         ui_pl_dir(s_mp3_sel));
     ui_theme_text_set(s_ui.pl_list.text[i], out);
 }
 
@@ -575,8 +580,7 @@ void ui_refresh_player(void)
                  * The lvgl task stack is only 10 KB, so large stack arrays here
                  * overflow it under load (BT+SDSPI IRQs) and corrupt adjacent
                  * memory — surfacing as a SPI ISR Guru Meditation. */
-                static char s_pl_name_buf[UI_DUP_LABEL_MAX + LIST_SCROLL_GAP];
-                static char s_pl_src_buf[UI_DUP_LABEL_MAX];
+                static char s_pl_name_buf[UI_DUP_MQ_OUT_MAX];
                 if (sel) {
                     /* Selected row scrolls its name if wider than the line — but
                      * only when idle. While playing we freeze a static (clipped)
@@ -587,10 +591,11 @@ void ui_refresh_player(void)
                                     LIST_LINE_W);
                     }
                     else {
-                        ui_pl_label(idx, s_pl_src_buf, sizeof(s_pl_src_buf), 4096);
-                        ui_marquee_step(&s_mp3_mq, s_pl_name_buf,
-                                        sizeof(s_pl_name_buf), LIST_LINE_W,
-                                        s_pl_src_buf);
+                        /* Only the filename scrolls; "[dir]" stays pinned. */
+                        ui_dup_marquee_label(&s_mp3_mq, s_pl_name_buf,
+                                             sizeof(s_pl_name_buf), LIST_LINE_W,
+                                             strip_ext(player_scan_name(idx)),
+                                             ui_pl_dir(idx));
                     }
                 }
                 else {
