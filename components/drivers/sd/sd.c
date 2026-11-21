@@ -39,6 +39,11 @@ static const char *TAG = "hw_sd";
  * clamps the tail chunk of a request to the remaining block count. */
 #define SD_DMA_BUF_BYTES         2048
 #define SD_DMA_MAX_CHUNK_BLOCKS  4
+/* Probe/retry cadence for the hotplug poller (see hw_sd_poll). A removed card
+ * needs two consecutive failed status probes before we tear FATFS down, so a
+ * single transient SDSPI hiccup cannot eject a healthy card. */
+#define SD_POLL_RETRY_MS         1000
+#define SD_STATUS_FAIL_LIMIT     2
 
 static sdmmc_card_t *s_sd_card;
 static void *s_sd_dma_buf;
@@ -46,12 +51,16 @@ static bool s_mounted;
 static char s_name[24];
 static uint32_t s_mb;
 static esp_err_t s_last_err = ESP_ERR_NOT_FOUND;
+static uint32_t s_generation;
+static uint8_t s_status_fails;
+static TickType_t s_last_try_tick;
+static hw_sd_pre_unmount_cb_t s_pre_unmount_cb;
 
 /* Attach the bounce buffer to the mounted card. Best effort: on failure the
  * driver keeps using per-access temporary buffers, i.e. the old behaviour. */
 static void sd_attach_dma_buf(void)
 {
-    if (s_sd_card == NULL || s_sd_dma_buf != NULL) {
+    if (s_sd_card == NULL) {
         return;
     }
 
@@ -60,28 +69,34 @@ static void sd_attach_dma_buf(void)
         return;
     }
 
-    void *buf = heap_caps_aligned_alloc(4, SD_DMA_BUF_BYTES, MALLOC_CAP_DMA);
-    if (buf == NULL) {
-        ESP_LOGW(TAG, "no internal DMA memory for the %d B bounce buffer; "
-                      "unaligned sector I/O will allocate per access",
-                 SD_DMA_BUF_BYTES);
-        return;
+    /* The buffer is owned by this module, not by the card: keep it across
+     * unmount/remount so a swap does not need a fresh DMA allocation (which
+     * is exactly the allocation that used to fail under BT load). Re-attach
+     * it to EVERY newly mounted card. */
+    if (s_sd_dma_buf == NULL) {
+        s_sd_dma_buf = heap_caps_aligned_alloc(4, SD_DMA_BUF_BYTES,
+                                               MALLOC_CAP_DMA);
+        if (s_sd_dma_buf == NULL) {
+            ESP_LOGW(TAG, "no internal DMA memory for the %d B bounce buffer; "
+                          "unaligned sector I/O will allocate per access",
+                     SD_DMA_BUF_BYTES);
+            return;
+        }
     }
 
-    size_t blocks = heap_caps_get_allocated_size(buf) / sector;
+    size_t blocks = heap_caps_get_allocated_size(s_sd_dma_buf) / sector;
     if (blocks > SD_DMA_MAX_CHUNK_BLOCKS) {
         blocks = SD_DMA_MAX_CHUNK_BLOCKS;
     }
     if (blocks == 0) {
-        free(buf);
         return;
     }
 
-    s_sd_dma_buf                   = buf;
-    s_sd_card->host.dma_aligned_buffer = buf;
+    s_sd_card->host.dma_aligned_buffer = s_sd_dma_buf;
     s_sd_card->host.unaligned_multi_block_rw_max_chunk_size = blocks;
     ESP_LOGI(TAG, "SD bounce buffer: %u B internal DMA, %u sector(s) per chunk",
-             (unsigned)heap_caps_get_allocated_size(buf), (unsigned)blocks);
+             (unsigned)heap_caps_get_allocated_size(s_sd_dma_buf),
+             (unsigned)blocks);
 }
 
 void hw_sd_try_mount(void)
@@ -89,6 +104,7 @@ void hw_sd_try_mount(void)
     if (s_mounted) {
         return;
     }
+    s_last_try_tick = xTaskGetTickCount();
 
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     host.slot = LCD_HOST;
@@ -109,6 +125,7 @@ void hw_sd_try_mount(void)
      * FATFS table limit. */
     mount_config.max_files = 8;
 
+    const esp_err_t prev_err = s_last_err;
     s_last_err = esp_vfs_fat_sdspi_mount("/sdcard",
                                          &host,
                                          &slot_config,
@@ -116,7 +133,8 @@ void hw_sd_try_mount(void)
                                          &s_sd_card);
     if (s_last_err == ESP_OK && s_sd_card) {
         s_mounted = true;
-        s_last_err = ESP_OK;
+        s_status_fails = 0;
+        s_generation++;
         sd_attach_dma_buf();
         memset(s_name, 0, sizeof(s_name));
         memcpy(s_name,
@@ -131,8 +149,75 @@ void hw_sd_try_mount(void)
         memset(s_name, 0, sizeof(s_name));
         memcpy(s_name, "NO CARD", sizeof("NO CARD"));
         s_mb = 0;
-        ESP_LOGE(TAG, "SD mount failed: %s", esp_err_to_name(s_last_err));
+        /* The poller retries once a second; only log when the reason
+         * changes so an empty slot does not flood the console. */
+        if (prev_err != s_last_err) {
+            ESP_LOGW(TAG, "SD mount failed: %s", esp_err_to_name(s_last_err));
+        }
     }
+}
+
+void hw_sd_unmount(void)
+{
+    if (!s_mounted || s_sd_card == NULL) {
+        return;
+    }
+
+    ESP_LOGW(TAG, "SD card lost: releasing handles before unmount");
+    if (s_pre_unmount_cb != NULL) {
+        s_pre_unmount_cb();
+    }
+
+    const esp_err_t err = esp_vfs_fat_sdcard_unmount("/sdcard", s_sd_card);
+    s_mounted = false;
+    s_sd_card = NULL;                       /* freed by unmount */
+    s_status_fails = 0;
+    s_last_err = err;
+    s_generation++;
+    memset(s_name, 0, sizeof(s_name));
+    memcpy(s_name, "NO CARD", sizeof("NO CARD"));
+    s_mb = 0;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SD unmount failed: %s", esp_err_to_name(err));
+    }
+}
+
+void hw_sd_poll(void)
+{
+    if (s_mounted) {
+        if (s_sd_card == NULL) {
+            hw_sd_unmount();
+            return;
+        }
+        /* sdmmc_get_status() is the only cheap "is the card still there"
+         * probe available without a card-detect pin. Require two consecutive
+         * failures before tearing down FATFS. */
+        if (sdmmc_get_status(s_sd_card) == ESP_OK) {
+            s_status_fails = 0;
+        }
+        else if (++s_status_fails >= SD_STATUS_FAIL_LIMIT) {
+            ESP_LOGW(TAG, "SD status probe failed %u times",
+                     (unsigned)s_status_fails);
+            hw_sd_unmount();
+        }
+        return;
+    }
+
+    if (xTaskGetTickCount() - s_last_try_tick <
+        pdMS_TO_TICKS(SD_POLL_RETRY_MS)) {
+        return;
+    }
+    hw_sd_try_mount();
+}
+
+void hw_sd_set_pre_unmount_cb(hw_sd_pre_unmount_cb_t cb)
+{
+    s_pre_unmount_cb = cb;
+}
+
+uint32_t hw_sd_generation(void)
+{
+    return s_generation;
 }
 
 bool hw_sd_is_mounted(void)

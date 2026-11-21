@@ -74,7 +74,8 @@ bluetooth_audio_set_avrc_volume_cb(cb);   /* 绝对音量 0..127，应用侧按�
 ```
 
 - 音量映射：AVRCP 满刻度 0..127 → `hw_audio_set_avrc_volume()` 按满刻度查蓝牙路由 0.1dB 表（每步 ≈ 0.09dB，满量程 12dB），写蓝牙槽位并更新百分比视图；本地按键步进同为 1dB（见 `docs/audio.md` §2）。
-- main.c 回调：PLAY 仅当**已暂停**时恢复；PAUSE 仅当**播放中**时暂停；STOP 停止；NEXT/PREV 忽略（播放器无列表导航，仅记日志）。
+- TG 初始化后必须调用 `esp_avrc_tg_set_psth_cmd_filter()` 声明支持的媒体键（PLAY/PAUSE/STOP/FORWARD/BACKWARD/FAST_FORWARD/REWIND）。Bluedroid 默认对所有 passthrough 回复 `NOT IMPLEMENTED`，不设置过滤器时 `ESP_AVRC_TG_PASSTHROUGH_CMD_EVT` 根本不会到达应用回调，表现为遥控器按键完全无反应。
+- main.c 回调：PLAY 仅当**已暂停**时恢复；PAUSE 仅当**播放中**时暂停；STOP 停止；NEXT/PREV 投递到队列，由 LVGL 任务调用 `player_next()/player_prev()` 切歌（空闲时忽略），避免在 BT 任务里直接改播放器索引状态。
 
 ## 6. 与其它模块接口
 

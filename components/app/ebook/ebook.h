@@ -30,6 +30,12 @@ void ebook_scan_start(void);
  * EBOOK_ROOT, or EBOOK_ROOT itself for the whole tree). Requests merge:
  * a scan landing while another runs is re-done. */
 void ebook_scan_root(const char *dir);
+/* Hotplug support: release all SD handles held by the reader, its background
+ * page-count task and the directory scan before FATFS is unmounted (bounded
+ * wait, ~1.5 s). Call ebook_notify_sd_remount() after a new card is mounted
+ * so subsequent opens/scans are allowed again. */
+void ebook_sd_release(void);
+void ebook_notify_sd_remount(void);
 bool ebook_scan_busy(void);
 uint32_t ebook_scan_version(void);     /* bumps when the list is replaced */
 int  ebook_scan_count(void);

@@ -35,6 +35,9 @@
  * stripped by the PC-side clear-cover.ps1, so real tags are a few KB; a
  * larger tag is skipped with ONE seek rather than walked frame by frame. */
 #define ID3_TAG_BUF_MAX (32 * 1024)
+/* Upper bound on how long player_sd_release() waits for the decode/scan
+ * tasks to close their /sdcard handles during a card swap. */
+#define SD_RELEASE_WAIT_MS 1500
 
 /* Consecutive decode failures that mark a track corrupt. Resyncing garbage
  * one byte at a time is O(n^2) on a bad region; past this cap the track is
@@ -231,6 +234,13 @@ RTC_NOINIT_ATTR static player_snapshot_t s_snapshot;
  * only the player task and the UI task touch it, and only via player_play.) */
 static volatile bool s_in_decode_loop;
 
+/* SD hotplug teardown (LVGL task sets, decode/scan tasks observe). While
+ * s_sd_released is set no new FATFS handle may be opened and ongoing walks
+ * abort; s_track_fp_open mirrors s_src.fp so the unmount caller can wait for
+ * the decode task to actually fclose() it. Both are reset on remount. */
+static volatile bool s_sd_released;
+static volatile bool s_track_fp_open;
+
 /* Abstract data source: a file on the SD card. */
 typedef struct {
     FILE *fp;
@@ -303,8 +313,8 @@ static playlist_t *volatile s_playlist = &s_pl_a;
 
 static int s_scan_count;          /* mirrored from s_playlist->count for the compat shell */
 static uint32_t s_scan_version;   /* mirrored from s_playlist->version */
-static bool s_scan_busy;
-static bool s_scan_pending;
+static volatile bool s_scan_busy;
+static volatile bool s_scan_pending;
 static TaskHandle_t s_scan_task;
 static TaskHandle_t s_watch_task;   /* decode-stall watchdog (see player_watch_task) */
 
@@ -363,6 +373,9 @@ static uint32_t playlist_source_sig_dir(const char *dir, int depth)
     }
     struct dirent *e;
     while ((e = readdir(d)) != NULL) {
+        if (s_sd_released) {        /* card is being torn down */
+            break;
+        }
         if (e->d_name[0] == '.') {   /* skip ".", "..", hidden */
             continue;
         }
@@ -495,6 +508,9 @@ static int playlist_collect_dir(playlist_t *work, int n, const char *dir,
     }
     struct dirent *e;
     while ((e = readdir(d)) != NULL && n < PLAYER_SCAN_MAX) {
+        if (s_sd_released) {        /* card is being torn down */
+            break;
+        }
         const char *fn = e->d_name;
         if (fn[0] == '.') {                 /* skip ".", "..", hidden */
             continue;
@@ -534,6 +550,9 @@ static char s_src_name[MP3_NAME_LEN];
 
 static void player_load_folder(const char *root)
 {
+    if (s_sd_released) {
+        return;                     /* never publish a half-walked list */
+    }
     playlist_t *work = (s_playlist == &s_pl_a) ? &s_pl_b : &s_pl_a;
     int n = playlist_collect_dir(work, 0, root, 0);
     /* readdir/stat order is arbitrary across directories; sort by name so the
@@ -589,6 +608,9 @@ static void scan_task(void *arg)
     (void)arg;
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (s_sd_released) {
+            continue;               /* card gone: drop the request */
+        }
         s_scan_busy = true;
         do {
             s_scan_pending = false;
@@ -607,7 +629,7 @@ static void scan_task(void *arg)
             } else {
                 player_load_folder(s_load_root);
             }
-        } while (s_scan_pending);   /* a request landed mid-load: redo */
+        } while (s_scan_pending && !s_sd_released);  /* redo, unless card gone */
         s_scan_busy = false;
     }
 }
@@ -1045,17 +1067,22 @@ static bool open_track(void)
      * fopen()/MP3InitDecoder() started failing — the "单曲循环" failure. */
     close_track();
 
+    if (s_sd_released) {
+        return false;               /* card is being unmounted */
+    }
     s_src.fp = fopen(s_path, "rb");
     if (s_src.fp == NULL) {
         ESP_LOGE(TAG, "open %s failed", s_path);
         return false;
     }
+    s_track_fp_open = true;
 
     s_dec = MP3InitDecoder();
     if (s_dec == NULL) {
         ESP_LOGE(TAG, "MP3InitDecoder failed");
         fclose(s_src.fp);
         s_src.fp = NULL;
+        s_track_fp_open = false;
         return false;
     }
     parse_id3v2();   /* skip the tag past the decoder + pick up ReplayGain */
@@ -1091,6 +1118,7 @@ static void close_track(void)
     if (s_src.fp != NULL) {
         fclose(s_src.fp);
         s_src.fp = NULL;
+        s_track_fp_open = false;
     }
     /* Deliberately NOT parking the I2S channel here: a track switch (next/
      * prev, or list auto-advance) must not stop and restart the clock, or
@@ -2112,6 +2140,33 @@ void player_notify_sd_remount(void)
      * repeated calls just keep the epoch ahead of s_loaded_sd_epoch until the
      * next successful whole-card publish. */
     s_sd_epoch++;
+    /* A new card is live: allow track opens and scans again. A pending scan
+     * request from the teardown window is deliberately kept so the new card
+     * gets re-scanned by the background task. */
+    s_sd_released = false;
+    s_track_fp_open = false;
+}
+
+void player_sd_release(void)
+{
+    /* Order matters: set the gate BEFORE stopping, so a decode loop already
+     * in its reload block cannot open another file after we start waiting. */
+    s_sd_released = true;
+    player_stop();
+
+    const TickType_t deadline =
+        xTaskGetTickCount() + pdMS_TO_TICKS(SD_RELEASE_WAIT_MS);
+    while ((s_track_fp_open || s_scan_busy) &&
+           xTaskGetTickCount() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (s_track_fp_open || s_scan_busy) {
+        ESP_LOGW(TAG, "SD release timed out (fp=%u scan=%u); unmounting anyway",
+                 (unsigned)s_track_fp_open, (unsigned)s_scan_busy);
+    }
+    else {
+        ESP_LOGI(TAG, "SD handles released");
+    }
 }
 
 player_state_t player_state(void)
@@ -2237,6 +2292,9 @@ void player_play_index(int i)
 
 void player_play_index_ex(int i, bool soft)
 {
+    if (s_sd_released) {
+        return;                     /* card teardown in progress */
+    }
     if (i < 0 || i >= player_scan_count()) {
         return;
     }

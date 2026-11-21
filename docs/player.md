@@ -63,12 +63,13 @@ FATFS 目录遍历在 SDSPI 上耗时数十 ms，故列表由**独立扫描任�
   - `PLAYER_REPEAT_ALL`（列表循环，默认）：切到列表下一首，末尾回绕到第一首；当前曲目不在列表（`s_index < 0`）或列表为空时停止。
   - `PLAYER_REPEAT_ONE`（单曲循环）：按当前曲目路径从头重播，不依赖播放列表。实现为**原地重绕**（`rewind_track()`）：`fseek` 回文件头 → 重建 helix 解码器（`MP3FreeDecoder` + `MP3InitDecoder`，避免第二遍复用残留的 bit-reservoir/VBR/重同步状态）→ 复位游标与看门狗 → 重新跳过 ID3v2 标签并拾取 ReplayGain → 重武装 I2S 管线。整个过程不停 I2S 时钟、不重开文件，循环**无缝**；重绕失败（seek/解码器重建失败）则落入错误路径自动切下一首，损坏文件不会死循环。
   - `PLAYER_REPEAT_RANDOM`（随机播放）：播放一个随机条目，列表多于一首时绝不重复刚结束的那首；列表仅一首时退化到该首。手动"下一曲"同样走随机（绝不重复当前），"上一曲"保持顺序以便用户随时回退。模式决策集中在 `decide_next_index()`，自然结束与手动切歌共用同一份逻辑，不会分叉。
-- 手动导航：`player_play()` / `player_play_index()` / `player_next()` / `player_prev()` 均可从 UI 或蓝牙页触发切歌；AVRCP 的 NEXT/PREV 回调在 main.c 中被忽略（仅记日志，播放器无远端列表同步）。
+- 手动导航：`player_play()` / `player_play_index()` / `player_next()` / `player_prev()` 均可从 UI 触发切歌。AVRCP NEXT/PREV 在 Bluedroid 任务里只投递一个方向值到长度 4 的队列，由 LVGL 任务取出后调用同一对 API（不在 BT 任务里碰播放器的非 volatile 索引状态）；空闲按键忽略。播放页每次刷新会把列表光标同步到 `player_current_index()`，所以遥控器切歌时高亮会跟着走。
 
 ## 5. 与其它模块的接口
 
 ```text
-main.c:       player_init()（创建任务）；AVRCP PLAY/PAUSE/STOP → player_toggle/stop
+main.c:       player_init()（创建任务）；AVRCP PLAY/PAUSE/STOP → player_toggle/stop；
+              NEXT/PREV → 队列 → LVGL 任务 → player_next/prev
 ui.c:         播放器页构建/轮询时读 player_scan_count/name/version；按键 → player_play/toggle/stop
 audio.c:      hw_audio_set_sample_rate() 随 MP3 采样率热重配（不停通道，走 SpeexDSP 软重采样）；
               PCM 经 DSP 后入 16KB ringbuf，由独立 i2s_wr 任务（优先级 6，绑 Core 1）写 I2S DMA；

@@ -558,6 +558,39 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
     }
 }
 
+/* Bluedroid's AVRCP Target answers EVERY passthrough command with "NOT
+ * IMPLEMENTED" by default (BTA_AV_RC_PASS_RSP_CODE), which means the CT never
+ * even delivers media keys to avrc_tg_cb(). Declare the keys we actually
+ * handle right after TG init, otherwise PLAY/PAUSE/NEXT/PREV all look
+ * "disconnected" from the application's point of view. */
+static void avrc_tg_accept_media_keys(void)
+{
+    esp_avrc_psth_bit_mask_t cmd_set = {0};
+    static const esp_avrc_pt_cmd_t keys[] = {
+        ESP_AVRC_PT_CMD_PLAY,
+        ESP_AVRC_PT_CMD_PAUSE,
+        ESP_AVRC_PT_CMD_STOP,
+        ESP_AVRC_PT_CMD_FORWARD,
+        ESP_AVRC_PT_CMD_FAST_FORWARD,
+        ESP_AVRC_PT_CMD_BACKWARD,
+        ESP_AVRC_PT_CMD_REWIND,
+    };
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET,
+                                         &cmd_set, keys[i]);
+    }
+    const esp_err_t err = esp_avrc_tg_set_psth_cmd_filter(
+        ESP_AVRC_PSTH_FILTER_SUPPORTED_CMD, &cmd_set);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "AVRC passthrough filter: %d media keys accepted",
+                 (int)(sizeof(keys) / sizeof(keys[0])));
+    }
+    else {
+        ESP_LOGE(TAG, "AVRC passthrough filter failed: %s",
+                 esp_err_to_name(err));
+    }
+}
+
 /* AVRCP Target callback: a connected CT (headset/speaker media keys) sends
  * passthrough commands and absolute volume here. Bluedroid auto-ACKs those, so
  * we only act on them. Only the PRESSED key-state is interesting (RELEASED is
@@ -867,6 +900,7 @@ void bluetooth_audio_enable(void)
         s_enabling = false;
         return;
     }
+    avrc_tg_accept_media_keys();
 
     /* Register the AVRCP Controller role so we can mirror our own volume to
      * the sink (bluetooth_audio_set_sink_volume). The CT channel is brought

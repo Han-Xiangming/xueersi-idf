@@ -162,6 +162,12 @@ void player_rescan(void);
  * scan task. Call this from the SD hotplug handler. */
 void player_notify_sd_remount(void);
 
+/* Called from the SD hotplug handler BEFORE FATFS is unmounted. Stops
+ * playback, blocks new track opens/scans, and waits (bounded, ~1.5 s) for the
+ * decode and scan tasks to release their /sdcard FILE handles. Returns once
+ * it is safe to unmount, or after the timeout with a warning logged. */
+void player_sd_release(void);
+
 /* True if a readable playlist cache exists on the SD card right now. The UI
  * uses this to label the refresh affordance ("有缓存" vs "无缓存"). */
 bool player_cache_exists(void);

@@ -14,6 +14,7 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "buttons.h"
 #include "audio.h"
@@ -32,8 +33,18 @@
 
 /* LVGL UI refresh cadence in the main loop (milliseconds). */
 #define UI_REFRESH_PERIOD_MS        16
+/* SD hotplug probe / mount-retry cadence (milliseconds). */
+#define SD_HOTPLUG_POLL_MS          1000
 
 static const char *TAG = "xiaomiao_dash";
+
+/* AVRCP NEXT/PREV are delivered on the Bluedroid task. Queue them to the
+ * LVGL task instead of calling player_next/prev() there: the player's index
+ * bookkeeping is written by the UI/decode tasks, and this keeps all manual
+ * navigation in one execution context (the existing list cursor auto-follow
+ * in ui_pages_player.c then works without extra synchronisation). */
+#define AVRC_NAV_QUEUE_LEN 4
+static QueueHandle_t s_avrc_nav_q;
 
 /* --- Non-blocking console log sink --------------------------------------
  * The default console path (VFS -> uart driver) can BLOCK the caller for a
@@ -119,11 +130,18 @@ static void xiaomiao_avrc_cmd(bt_avrc_cmd_t cmd)
         player_stop();
         break;
     case BT_AVRC_CMD_NEXT:
-    case BT_AVRC_CMD_PREV:
-        /* The current player has no playlist navigation; ignore for now. */
-        ESP_LOGI(TAG, "AVRCP %s (no playlist navigation)",
-                 cmd == BT_AVRC_CMD_NEXT ? "NEXT" : "PREV");
+    case BT_AVRC_CMD_PREV: {
+        const int8_t dir = (cmd == BT_AVRC_CMD_NEXT) ? 1 : -1;
+        if (s_avrc_nav_q == NULL) {
+            ESP_LOGE(TAG, "AVRCP nav queue is NULL");
+            break;
+        }
+        if (xQueueSend(s_avrc_nav_q, &dir, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "AVRCP %s dropped (nav queue full)",
+                     dir > 0 ? "NEXT" : "PREV");
+        }
         break;
+    }
     }
 }
 
@@ -149,12 +167,25 @@ static uint8_t xiaomiao_bt_volume_snapshot(void)
     return hw_audio_get_bt_volume();
 }
 
-
+/* SD hotplug teardown, run on the LVGL task from hw_sd_poll() just before
+ * FATFS is unmounted. Order matters: save the reader position while the card
+ * may still answer, then block new handle opens, then close the reader, then
+ * wait for the player's decode/scan tasks. All UI-side ebook/player calls
+ * happen on this same task, so no extra locking is needed. */
+static void xiaomiao_sd_pre_unmount(void)
+{
+    ESP_LOGW(TAG, "SD hotplug: releasing card handles");
+    ebook_progress_flush();
+    ebook_sd_release();
+    ebook_close();
+    player_sd_release();
+}
 
 static void lvgl_task(void *arg)
 {
     lv_group_t *group = (lv_group_t *)arg;
     uint32_t last_update_ms = 0;
+    uint32_t last_sd_poll_ms = 0;
     bool was_standby = false;           /* edge detect for standby entry */
 
     ESP_LOGI(TAG, "Start Xiaomiao hardware dashboard");
@@ -166,6 +197,30 @@ static void lvgl_task(void *arg)
     hw_lcd_display_on();
 
     while (true) {
+        /* Drain AVRCP media-key navigation on the UI task (see queue above).
+         * Idle presses are ignored, matching the player-page key handler. */
+        int8_t nav;
+        while (s_avrc_nav_q != NULL &&
+               xQueueReceive(s_avrc_nav_q, &nav, 0) == pdTRUE) {
+            if (player_state() == PLAYER_IDLE) {
+                continue;
+            }
+            if (nav > 0) {
+                player_next();
+            }
+            else {
+                player_prev();
+            }
+        }
+
+        /* SD hotplug: retry a missing card / probe a mounted one. This may
+         * briefly block on SDSPI and, on card loss, runs the pre-unmount
+         * callback that closes player/reader handles — hence on this task. */
+        if (lv_tick_elaps(last_sd_poll_ms) >= SD_HOTPLUG_POLL_MS) {
+            last_sd_poll_ms = lv_tick_get();
+            hw_sd_poll();
+        }
+
         if (lv_tick_elaps(last_update_ms) >= UI_REFRESH_PERIOD_MS) {
             last_update_ms = lv_tick_get();
             ui_refresh();
@@ -248,6 +303,12 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(nvs_err);
 
+    /* Must exist before any AVRCP callback can fire. */
+    s_avrc_nav_q = xQueueCreate(AVRC_NAV_QUEUE_LEN, sizeof(int8_t));
+    if (s_avrc_nav_q == NULL) {
+        ESP_LOGE(TAG, "AVRCP nav queue creation failed");
+    }
+
     hw_buttons_init();
     hw_lcd_init();
     hw_audio_init();
@@ -257,6 +318,7 @@ void app_main(void)
     bluetooth_audio_set_avrc_volume_cb(xiaomiao_avrc_volume);
     bluetooth_audio_set_avrc_sync_vol_cb(xiaomiao_bt_volume_snapshot);
     hw_audio_set_bt_volume_change_cb(xiaomiao_bt_volume_changed);
+    hw_sd_set_pre_unmount_cb(xiaomiao_sd_pre_unmount);
     hw_sd_try_mount();
     player_init();
     ebook_init();

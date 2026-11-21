@@ -97,6 +97,7 @@ static bool            s_ext_bt_conn;
 static bool            s_ext_bt_scan;
 static uint8_t         s_ext_bt_retry;     /* last seen auto-retry count */
 static bool            s_ext_sd_mounted;
+static uint32_t        s_ext_sd_gen;      /* SD mount/unmount generation */
 static uint32_t        s_ext_scan_ver;    /* player's MP3 list refresh */
 static player_state_t  s_ext_pl_state = PLAYER_IDLE;
 static char            s_ext_pl_name[MP3_NAME_LEN];
@@ -813,14 +814,23 @@ static bool ui_external_changed(void)
         changed = true;
     }
 
-    /* SD mount can change without UI input (card removed / inserted). */
+    /* SD mount can change without UI input (card removed / inserted). The
+     * generation also catches a remove+insert that completed between two UI
+     * refreshes, which a plain mounted/not-mounted comparison would miss. */
     bool mnt = hw_sd_is_mounted();
-    if (mnt != s_ext_sd_mounted) {
+    uint32_t gen = hw_sd_generation();
+    if (mnt != s_ext_sd_mounted || gen != s_ext_sd_gen) {
         s_ext_sd_mounted = mnt;
-        player_notify_sd_remount();   /* card changed: invalidate old snapshot */
-        player_scan_with_cache();   /* prefer cache; scan only if absent */
+        s_ext_sd_gen = gen;
+        if (mnt) {
+            /* Only a NEW card may start scans / open files again. On removal
+             * the teardown gates set by *_sd_release() stay closed. */
+            player_notify_sd_remount();
+            ebook_notify_sd_remount();
+            player_scan_with_cache();   /* prefer cache; scan only if absent */
+        }
         /* Let the pages re-discover their sources / reload the current list.
-         * Must run after player_scan_with_cache() so the "scan in flight"
+         * Must run after the remount notifications so the "scan in flight"
          * guard sees the real state. */
         ui_player_notify_sd_change();
         ui_ebook_notify_sd_change();

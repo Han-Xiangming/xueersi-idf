@@ -26,6 +26,10 @@
 static const char *TAG = "ebook";
 
 /* --- Tuning constants (docs/ebook.md) --- */
+/* Bounded wait in ebook_sd_release() for the scan/count tasks to drop their
+ * /sdcard handles during a card swap. */
+#define SD_RELEASE_WAIT_MS  1500
+
 #define EBOOK_NAME_MAX      64           /* book name buffer size */
 #define EBOOK_PATH_MAX      320          /* book path buffer size (matches player) */
 #define EBOOK_CHUNK         (4 * 1024)   /* stream window of the reader */
@@ -253,9 +257,12 @@ static uint32_t s_open_gen;              /* bump on open/close: invalidate count
 
 static int s_scan_active;                /* index of the published list */
 static int s_scan_count;
-static bool s_scan_busy;
-static bool s_scan_pending;              /* a load request landed mid-scan: redo */
+static volatile bool s_scan_busy;
+static volatile bool s_scan_pending;     /* a load request landed mid-scan: redo */
 static uint32_t s_scan_ver;
+/* SD hotplug teardown gate (LVGL task writes, scan/count tasks read). */
+static volatile bool s_sd_released;
+static volatile bool s_count_busy;
 
 /* The directory the next/last scan walks. Defaults to the whole eBook tree
  * (EBOOK_ROOT). Set by ebook_scan_root(); read by ebook_scan_task. */
@@ -881,7 +888,7 @@ static int scan_dir(char paths[][EBOOK_PATH_MAX], int max, const char *dir,
     DIR *d = opendir(dir);
     if (d != NULL) {
         struct dirent *e;
-        while ((e = readdir(d)) != NULL && n < max) {
+        while ((e = readdir(d)) != NULL && n < max && !s_sd_released) {
             const char *fn = e->d_name;
             if (fn[0] == '.') {              /* skip ".", "..", hidden */
                 continue;
@@ -916,6 +923,9 @@ static void ebook_scan_task(void *arg)
     (void)arg;
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (s_sd_released) {
+            continue;               /* card gone: drop the request */
+        }
         portENTER_CRITICAL(&s_mux);
         s_scan_busy = true;
         portEXIT_CRITICAL(&s_mux);
@@ -955,7 +965,7 @@ static void ebook_scan_task(void *arg)
             s_scan_ver++;
             portEXIT_CRITICAL(&s_mux);
             ESP_LOGI(TAG, "scan '%s' done: %d book(s)", s_load_root, n);
-        } while (s_scan_pending);   /* a request landed mid-scan: redo */
+        } while (s_scan_pending && !s_sd_released);  /* redo, unless card gone */
         portENTER_CRITICAL(&s_mux);
         s_scan_busy = false;
         portEXIT_CRITICAL(&s_mux);
@@ -969,6 +979,10 @@ static void ebook_count_task(void *arg)
     (void)arg;
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (s_sd_released) {
+            continue;               /* card gone: drop the request */
+        }
+        s_count_busy = true;
         book_src_t src;
         uint32_t gen;
         portENTER_CRITICAL(&s_mux);
@@ -977,6 +991,7 @@ static void ebook_count_task(void *arg)
         portEXIT_CRITICAL(&s_mux);
 
         if (src.size == 0 || src.path[0] == '\0') {
+            s_count_busy = false;
             continue;
         }
 
@@ -987,17 +1002,21 @@ static void ebook_count_task(void *arg)
         r.fp = fopen(src.path, "rb");
         if (r.fp == NULL) {
             portENTER_CRITICAL(&s_mux);
-            if (gen == s_open_gen) {
+            if (gen == s_open_gen && !s_sd_released) {
                 s_page_count = 0;
                 s_count_ver++;
             }
             portEXIT_CRITICAL(&s_mux);
+            s_count_busy = false;
             continue;
         }
 
         uint32_t pages = 0;
         size_t off = 0;
         for (;;) {
+            if (s_sd_released) {
+                break;                     /* card being unmounted */
+            }
             if (off >= src.size) {
                 break;                     /* normal end of walk */
             }
@@ -1024,6 +1043,10 @@ static void ebook_count_task(void *arg)
             off = next;
         }
         fclose(r.fp);
+        s_count_busy = false;
+        if (s_sd_released) {
+            continue;                       /* do not publish/save on a dead card */
+        }
         ESP_LOGI(TAG, "count done: %u page(s)", (unsigned)pages);
 
         bool published = false;
@@ -1666,6 +1689,40 @@ const char *ebook_current_src_name(void)
     return s_src_name;
 }
 
+void ebook_sd_release(void)
+{
+    /* Set the gate first, then wake both background tasks so a blocked
+     * ulTaskNotifyTake() returns and sees it. */
+    s_sd_released = true;
+    if (s_scan_task != NULL) {
+        xTaskNotifyGive(s_scan_task);
+    }
+    if (s_count_task != NULL) {
+        xTaskNotifyGive(s_count_task);
+    }
+
+    const TickType_t deadline =
+        xTaskGetTickCount() + pdMS_TO_TICKS(SD_RELEASE_WAIT_MS);
+    while ((s_scan_busy || s_count_busy) &&
+           xTaskGetTickCount() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (s_scan_busy || s_count_busy) {
+        ESP_LOGW(TAG, "SD release timed out (scan=%u count=%u); unmounting anyway",
+                 (unsigned)s_scan_busy, (unsigned)s_count_busy);
+    }
+    else {
+        ESP_LOGI(TAG, "SD handles released");
+    }
+}
+
+void ebook_notify_sd_remount(void)
+{
+    /* New card: let the UI's follow-up scan/open calls through again. */
+    s_sd_released = false;
+    s_count_busy = false;
+}
+
 void ebook_close(void)
 {
     if (s_reader.fp != NULL) {
@@ -1676,16 +1733,20 @@ void ebook_close(void)
          * progress_save() delegates to components/ebook_progress, which
          * serializes against its own background save and concurrent loads.
          * Both no-op when the book has no fp. */
-        progress_arm();
-        progress_save();
+        if (!s_sd_released) {
+            progress_arm();
+            progress_save();
+        }
         fclose(s_reader.fp);
         s_reader.fp = NULL;
         /* Persist the page map (best-effort) as a fallback for the case where
          * the count task had not finished publishing when this book was closed;
          * if it had, this just re-writes an identical cache. Must run before the
          * mutex reset below, while s_is_open / s_table_valid still describe the
-         * current book. */
-        ebook_pag_save();
+         * current book. Skipped during SD teardown: the card is already gone. */
+        if (!s_sd_released) {
+            ebook_pag_save();
+        }
     }
     s_save_pending = false;
     s_flip_since_save = 0;
