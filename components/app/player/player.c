@@ -313,6 +313,7 @@ static playlist_t *volatile s_playlist = &s_pl_a;
 
 static int s_scan_count;          /* mirrored from s_playlist->count for the compat shell */
 static uint32_t s_scan_version;   /* mirrored from s_playlist->version */
+static bool s_scan_truncated;     /* mirrored from s_playlist->truncated */
 static volatile bool s_scan_busy;
 static volatile bool s_scan_pending;
 static TaskHandle_t s_scan_task;
@@ -483,23 +484,31 @@ static int playlist_entry_cmp(const void *a, const void *b)
 
 /* Publish a filled work buffer as the new live snapshot (atomic pointer
  * swap). `work` must be one of s_pl_a / s_pl_b NOT currently live. */
-static void playlist_publish(playlist_t *work, int n, playlist_src_t src)
+static void playlist_publish(playlist_t *work, int n, playlist_src_t src,
+                             bool truncated)
 {
     work->count = n;
+    work->truncated = truncated;
     work->src = src;
     work->version = s_scan_version + 1;   /* monotonic; UI sees a fresh list */
     s_playlist = work;                    /* atomic swap: readers now see it */
     s_scan_count = n;
     s_scan_version = work->version;
+    s_scan_truncated = truncated;         /* mirrored for the compat shell */
 }
 
 /* Recursively collect .mp3 files under `dir` into `work`, in-place. `depth`
  * bounds recursion so a pathological symlink/cycle can't overflow the stack.
  * Returns the running total; stops early once PLAYER_SCAN_MAX is reached. */
 static int playlist_collect_dir(playlist_t *work, int n, const char *dir,
-                                int depth)
+                                int depth, int *overflow)
 {
-    if (depth > 16 || n >= PLAYER_SCAN_MAX) {
+    /* Keep walking even at the cap so `overflow` counts what was left out;
+     * a plain early return used to clip large cards with no user-visible hint. */
+    if (depth > 16) {
+        if (n >= PLAYER_SCAN_MAX && overflow != NULL) {
+            (*overflow)++;
+        }
         return n;
     }
     DIR *d = opendir(dir);
@@ -507,7 +516,7 @@ static int playlist_collect_dir(playlist_t *work, int n, const char *dir,
         return n;
     }
     struct dirent *e;
-    while ((e = readdir(d)) != NULL && n < PLAYER_SCAN_MAX) {
+    while ((e = readdir(d)) != NULL) {
         if (s_sd_released) {        /* card is being torn down */
             break;
         }
@@ -526,13 +535,17 @@ static int playlist_collect_dir(playlist_t *work, int n, const char *dir,
             continue;
         }
         if (S_ISDIR(st.st_mode)) {
-            n = playlist_collect_dir(work, n, child, depth + 1);
+            n = playlist_collect_dir(work, n, child, depth + 1, overflow);
         } else if (S_ISREG(st.st_mode)) {
             int len = (int)strlen(fn);
             if (len > 4 && strcasecmp(fn + len - 4, ".mp3") == 0) {
-                snprintf(work->items[n].path, sizeof(work->items[n].path),
-                         "%s", child);
-                n++;
+                if (n < PLAYER_SCAN_MAX) {
+                    snprintf(work->items[n].path, sizeof(work->items[n].path),
+                             "%s", child);
+                    n++;
+                } else if (overflow != NULL) {
+                    (*overflow)++;          /* beyond cap: count, don't store */
+                }
             }
         }
     }
@@ -540,12 +553,12 @@ static int playlist_collect_dir(playlist_t *work, int n, const char *dir,
     return n;
 }
 
-/* Load the playlist from a folder source: a recursive scan of the WHOLE SD
- * card. Fills the idle buffer and publishes it. A future playlist-file source
+/* Load the playlist from a folder source: a recursive scan of PLAYER_ROOT.
+ * Fills the idle buffer and publishes it. A future playlist-file source
  * would fill the SAME entry array (keeping file order) and call
  * playlist_publish() — the playback layer is unchanged. */
-/* Name of the source currently loaded, for the UI. "整卡" when the root is
- * the whole card, else the folder's basename. */
+/* Name of the source currently loaded, for the UI. "全部音乐" when the root
+ * is /sdcard/Music, else the folder's basename. */
 static char s_src_name[MP3_NAME_LEN];
 
 static void player_load_folder(const char *root)
@@ -554,7 +567,8 @@ static void player_load_folder(const char *root)
         return;                     /* never publish a half-walked list */
     }
     playlist_t *work = (s_playlist == &s_pl_a) ? &s_pl_b : &s_pl_a;
-    int n = playlist_collect_dir(work, 0, root, 0);
+    int overflow = 0;
+    int n = playlist_collect_dir(work, 0, root, 0, &overflow);
     /* readdir/stat order is arbitrary across directories; sort by name so the
      * list is stable across reloads. Folder source only — a playlist-file
      * source keeps its file order and would skip this sort. */
@@ -562,20 +576,20 @@ static void player_load_folder(const char *root)
         qsort(work->items, (size_t)n, sizeof(playlist_entry_t),
               playlist_entry_cmp);
     }
-    /* Remember the display name: the whole-Music source -> "整卡", else the
-     * selected sub-folder's basename. Bounded copy so GCC's
+    /* Remember the display name: the /sdcard/Music source -> "全部音乐", else
+     * the selected sub-folder's basename. Bounded copy so GCC's
      * -Wformat-truncation stays quiet (root can be up to PLAYER_PATH_LEN
      * bytes; FATFS leaf names cap at 255). */
     const char *b = strrchr(root, '/');
     const char *base = (b != NULL) ? b + 1 : root;
     if (strcasecmp(base, "Music") == 0) {
-        snprintf(s_src_name, sizeof(s_src_name), "整卡");
+        snprintf(s_src_name, sizeof(s_src_name), "全部音乐");
     } else {
         size_t blen = strnlen(base, MP3_NAME_LEN - 1);
         memcpy(s_src_name, base, blen);
         s_src_name[blen] = '\0';
     }
-    playlist_publish(work, n, PL_SRC_FOLDER);
+    playlist_publish(work, n, PL_SRC_FOLDER, overflow > 0);
     /* Remember what we just published: the whole-card list only when the
      * scan root was the card root (drives the whole-card cache reuse). */
     s_pub_is_whole_card = (strcmp(root, PLAYER_ROOT) == 0);
@@ -586,7 +600,7 @@ static void player_load_folder(const char *root)
     }
     /* The on-card cache represents the WHOLE-CARD list only. A sub-folder
      * browse must NOT overwrite it, or the next player entry (which always
-     * loads the cache as "整卡") would show the wrong list. Persist the
+     * loads the cache as "全部音乐") would show the wrong list. Persist the
      * cache solely when scanning the whole card. */
     if (strcmp(root, PLAYER_ROOT) == 0) {
         playlist_cache_write(work);
@@ -672,6 +686,11 @@ uint32_t player_scan_version(void)
 int player_scan_count(void)
 {
     return s_scan_count;
+}
+
+bool player_scan_truncated(void)
+{
+    return s_scan_truncated;
 }
 
 const char *player_scan_name(int i)
@@ -2076,9 +2095,12 @@ static int playlist_load_from_cache(playlist_t *work)
         return 0;
     }
     /* Cache order is the sorted order captured at write time; no re-sort.
-     * Publish as the whole-card folder source. */
-    snprintf(s_src_name, sizeof(s_src_name), "整卡");
-    playlist_publish(work, n, PL_SRC_FOLDER);
+     * Publish as the whole-Music source. A cache by definition holds only the
+     * entries that were written (already capped at PLAYER_SCAN_MAX), so its
+     * truncated flag follows what was stamped into the cache file at write
+     * time — for now the cache never stores the overflow count, so false. */
+    snprintf(s_src_name, sizeof(s_src_name), "全部音乐");
+    playlist_publish(work, n, PL_SRC_FOLDER, false);
     s_pub_is_whole_card = true;
     s_loaded_sd_epoch = s_sd_epoch;   /* cache mirrors the current card */
     ESP_LOGI(TAG, "loaded %d entries from cache %s", n, PLAYER_CACHE_FILE);

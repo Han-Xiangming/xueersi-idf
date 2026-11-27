@@ -257,6 +257,7 @@ static uint32_t s_open_gen;              /* bump on open/close: invalidate count
 
 static int s_scan_active;                /* index of the published list */
 static int s_scan_count;
+static bool s_scan_truncated;            /* >EBOOK_LIST_MAX .txt files found */
 static volatile bool s_scan_busy;
 static volatile bool s_scan_pending;     /* a load request landed mid-scan: redo */
 static uint32_t s_scan_ver;
@@ -268,7 +269,7 @@ static volatile bool s_count_busy;
  * (EBOOK_ROOT). Set by ebook_scan_root(); read by ebook_scan_task. */
 static char s_load_root[EBOOK_PATH_MAX] = EBOOK_ROOT;
 
-/* Display name of the currently loaded source: "整卡" for the whole tree,
+/* Display name of the currently loaded source: "全部书籍" for the whole tree,
  * else the folder's basename. Mirrors the player's s_src_name. */
 static char s_src_name[EBOOK_NAME_MAX];
 
@@ -879,16 +880,18 @@ static int name_cmp(const void *a, const void *b)
  * stack (mirrors the player's scan, components/app/player/player.c). Returns
  * the running total; stops early once `max` is reached. */
 static int scan_dir(char paths[][EBOOK_PATH_MAX], int max, const char *dir,
-                    int depth)
+                    int depth, int *overflow)
 {
-    if (depth > 16 || max <= 0) {
+    if (depth > 16) {
         return 0;
     }
     int n = 0;
     DIR *d = opendir(dir);
     if (d != NULL) {
         struct dirent *e;
-        while ((e = readdir(d)) != NULL && n < max && !s_sd_released) {
+        /* Keep walking past the cap so `overflow` counts the books we leave
+         * out — a 600-book card used to look identical to a 512-book one. */
+        while ((e = readdir(d)) != NULL && !s_sd_released) {
             const char *fn = e->d_name;
             if (fn[0] == '.') {              /* skip ".", "..", hidden */
                 continue;
@@ -904,12 +907,19 @@ static int scan_dir(char paths[][EBOOK_PATH_MAX], int max, const char *dir,
                 continue;
             }
             if (S_ISDIR(st.st_mode)) {
-                n += scan_dir(paths + n, max - n, child, depth + 1);
+                /* Only hand the remaining capacity to recursion; the overflow
+                 * counter is shared so books in deep folders are counted too. */
+                n += scan_dir(paths + n, (n < max) ? max - n : 0, child,
+                              depth + 1, overflow);
             } else if (S_ISREG(st.st_mode)) {
                 int len = (int)strlen(fn);
                 if (len > 4 && strcasecmp(fn + len - 4, ".txt") == 0) {
-                    snprintf(paths[n], EBOOK_PATH_MAX, "%s", child);
-                    n++;
+                    if (n < max) {
+                        snprintf(paths[n], EBOOK_PATH_MAX, "%s", child);
+                        n++;
+                    } else if (overflow != NULL) {
+                        (*overflow)++;
+                    }
                 }
             }
         }
@@ -938,8 +948,9 @@ static void ebook_scan_task(void *arg)
             active = s_scan_active;
             portEXIT_CRITICAL(&s_mux);
             int work = 1 - active;           /* fill the inactive buffer */
+            int overflow = 0;
             int n = scan_dir(s_scan_buf[work], EBOOK_LIST_MAX,
-                             s_load_root, 0);
+                             s_load_root, 0, &overflow);
             /* readdir/stat order is arbitrary across directories; sort so the
              * list is stable across rescans: file-name length first (shortest
              * at the top), then lexicographic by name (mirrors the player's
@@ -947,12 +958,12 @@ static void ebook_scan_task(void *arg)
             if (n > 1) {
                 qsort(s_scan_buf[work], (size_t)n, EBOOK_PATH_MAX, name_cmp);
             }
-            /* Source display name: "整卡" for the whole tree, else the folder
-             * basename (mirrors player_load_folder). */
+            /* Source display name: "全部书籍" for the whole /sdcard/eBook tree
+             * (not the whole SD card), else the folder basename. */
             const char *b = strrchr(s_load_root, '/');
             const char *base = (b != NULL) ? b + 1 : s_load_root;
             if (strcasecmp(base, "eBook") == 0) {
-                snprintf(s_src_name, sizeof(s_src_name), "整卡");
+                snprintf(s_src_name, sizeof(s_src_name), "全部书籍");
             }
             else {
                 size_t blen = strnlen(base, sizeof(s_src_name) - 1);
@@ -962,6 +973,7 @@ static void ebook_scan_task(void *arg)
             portENTER_CRITICAL(&s_mux);
             s_scan_active = work;
             s_scan_count = n;
+            s_scan_truncated = (overflow > 0);
             s_scan_ver++;
             portEXIT_CRITICAL(&s_mux);
             ESP_LOGI(TAG, "scan '%s' done: %d book(s)", s_load_root, n);
@@ -1659,6 +1671,15 @@ int ebook_scan_count(void)
     return c;
 }
 
+bool ebook_scan_truncated(void)
+{
+    bool t;
+    portENTER_CRITICAL(&s_mux);
+    t = s_scan_truncated;
+    portEXIT_CRITICAL(&s_mux);
+    return t;
+}
+
 const char *ebook_scan_name(int idx)
 {
     const char *name = "";
@@ -1800,9 +1821,22 @@ bool ebook_open(int idx)
         ebook_close();
         return false;
     }
-    fseeko(fp, 0, SEEK_END);
-    src.size = (size_t)ftello(fp);
-    fseeko(fp, 0, SEEK_SET);
+    /* Check every seek/tell: a -1 from an unseekable or corrupt file used to
+     * cast to a huge size_t, which let the page walker run far past EOF. */
+    if (fseeko(fp, 0, SEEK_END) != 0) {
+        ESP_LOGE(TAG, "seek end failed '%s'", src.path);
+        fclose(fp);
+        ebook_close();
+        return false;
+    }
+    off_t size = ftello(fp);
+    if (size < 0 || fseeko(fp, 0, SEEK_SET) != 0) {
+        ESP_LOGE(TAG, "size/rewind failed '%s'", src.path);
+        fclose(fp);
+        ebook_close();
+        return false;
+    }
+    src.size = (size_t)size;
     s_reader.fp = fp;                /* reader is UI-task-private */
     s_reader.base = 0;
     s_reader.len = 0;

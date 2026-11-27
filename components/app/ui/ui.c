@@ -1297,6 +1297,9 @@ void ui_create(lv_group_t *group)
      * clear of x >= 250 in the title row (status label is capped at width
      * 238 for this reason). */
     const lv_color_t bat_color = lv_color_hex(0x00FFFF); /* cyan */
+    /* Right edge of the title row is reserved for the gauge: status labels
+     * cap at width 238 so they never reach x=250. Shared here so a screen
+     * width change only needs one edit. */
     const int base_x = 250;
     const int base_y = 2;                       /* top of the percent text */
     const int icon_h = 12;                      /* battery body height */

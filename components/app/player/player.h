@@ -123,6 +123,10 @@ typedef struct {
 typedef struct {
     playlist_entry_t items[PLAYER_SCAN_MAX];
     int count;
+    bool truncated;               /* true when the card held more than
+                                   * PLAYER_SCAN_MAX .mp3 files; the UI shows
+                                   * a "只显示前 N 首" hint instead of silently
+                                   * hiding the rest. */
     uint32_t version;             /* bumped on every (re)load; UI polls this */
     playlist_src_t src;           /* which source produced this snapshot */
 } playlist_t;
@@ -173,7 +177,7 @@ void player_sd_release(void);
 bool player_cache_exists(void);
 
 /* Human-readable name of the source currently loaded, for the UI (e.g.
- * "整卡" for the whole card, or the folder's basename). "" if none. */
+ * "全部音乐" for the /sdcard/Music source, or the folder's basename). "" if none. */
 const char *player_current_src_name(void);
 
 /* True while a load is running or queued. */
@@ -184,6 +188,10 @@ uint32_t player_scan_version(void);
 
 /* Number of tracks in the last completed load. */
 int player_scan_count(void);
+
+/* True when the last scan hit PLAYER_SCAN_MAX and more .mp3 files existed.
+ * The UI shows a "只显示前 N 首" hint so a large card is not silently clipped. */
+bool player_scan_truncated(void);
 
 /* Name of track `i` from the last completed load ("" if out of range). */
 const char *player_scan_name(int i);

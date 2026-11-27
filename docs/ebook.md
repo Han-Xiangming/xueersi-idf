@@ -76,7 +76,8 @@ bool ebook_scan_busy(void);
 uint32_t ebook_scan_version(void);         /* 列表版本号，UI 轮询用 */
 int  ebook_scan_count(void);
 const char *ebook_scan_name(int idx);
-const char *ebook_current_src_name(void);  /* 当前来源名："整卡"或子文件夹名 */
+bool ebook_scan_truncated(void);           /* 扫描到上限时仍有更多书为 true */
+const char *ebook_current_src_name(void);  /* 当前来源名："全部书籍"或子文件夹名 */
 
 bool ebook_open(int idx);                  /* 打开第 idx 本书（自动续读） */
 void ebook_close(void);                    /* 关闭（同步保存当前进度） */
@@ -249,8 +250,8 @@ slot = { fp(8) path_h(4) off(4) seq(4) ctx[16] name[32] pct(1) flags(1) crc(2) }
 ```
 
 - 来源 = `<ALL>`（整个 `/sdcard/eBook` 树，递归）+ `/sdcard/eBook` 下每个顶层子文件夹（各为一个来源，SD 热插拔/重进页面时重新发现，同 `ui_discover_sources`）；
-- 进入某来源后后台递归扫描该目录（不区分大小写，同播放器：stat 判定目录并下钻，深度 ≤16，跳过隐藏项），收集全部 `.txt`（最多 512 本，超出截断）；qsort 排序 = 先按文件名长度（短在前）再按文件名忽略大小写字典序（strcasecmp），文件名相同（不同子目录同名书）按完整路径兜底，跨扫描稳定；
-- 状态行显示当前来源名（`<ALL>` 显示为"整卡"）+ 书目数，如 `[四大名著] 4 本`；扫描中显示"扫描中..."；
+- 进入某来源后后台递归扫描该目录（不区分大小写，同播放器：stat 判定目录并下钻，深度 ≤16，跳过隐藏项），收集全部 `.txt`（最多 512 本；超出时仍继续统计数量并让 UI 显示「仅前 N 本」提示）；qsort 排序 = 先按文件名长度（短在前）再按文件名忽略大小写字典序（strcasecmp），文件名相同（不同子目录同名书）按完整路径兜底，跨扫描稳定；
+- 状态行显示当前来源名（`<ALL>` 显示为"全部书籍"）+ 书目数，如 `[四大名著] 4 本`；扫描中显示"扫描中..."；
 - 列表显示名去路径（仅文件名）；最多显示 6 行，滚动窗口同 MP3 列表；
 - B：书目视图返回来源选择（同播放器曲目列表），来源选择再按 B 回主菜单；
 - 打开失败提示"打开失败"；打开成功进入阅读页，书名（去扩展名）先捕获到 `s_eb_open_name`，后续扫描不改变标题。

@@ -246,78 +246,64 @@ void ui_settings_load(void)
     nvs_close(h);
 }
 
-static void ui_settings_save_volume(void)
+/* One NVS write transaction, with every return checked. Callers keep their
+ * dirty bit when this fails so a transient flash error is retried on the next
+ * idle tick instead of silently losing the setting. */
+static esp_err_t ui_nvs_set_i32(const char *key, int32_t value)
 {
     nvs_handle_t h;
-    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_i32(h, UI_NVS_VOLUME, (int32_t)hw_audio_get_speaker_volume());
-        nvs_set_i32(h, UI_NVS_VOLBT, (int32_t)hw_audio_get_bt_volume());
-        nvs_commit(h);
-        nvs_close(h);
+    esp_err_t err = nvs_open(UI_NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
     }
+    err = nvs_set_i32(h, key, value);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);   /* nvs_close returns void; open/set/commit are the failures */
+    return err;
 }
 
-static void ui_settings_save_gain(void)
+static esp_err_t ui_settings_save_volume(void)
 {
-    nvs_handle_t h;
-    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        /* dB x10, rounded (the UI always sets whole dB, so this is exact). */
-        float db = hw_audio_get_master_gain_db();
-        nvs_set_i32(h, UI_NVS_GAIN,
-                    (int32_t)(db * 10.0f + (db >= 0.0f ? 0.5f : -0.5f)));
-        nvs_commit(h);
-        nvs_close(h);
-    }
+    esp_err_t err = ui_nvs_set_i32(UI_NVS_VOLUME,
+                                   (int32_t)hw_audio_get_speaker_volume());
+    esp_err_t err_bt = ui_nvs_set_i32(UI_NVS_VOLBT,
+                                      (int32_t)hw_audio_get_bt_volume());
+    return (err != ESP_OK) ? err : err_bt;
 }
 
-static void ui_settings_save_backlight(void)
+static esp_err_t ui_settings_save_gain(void)
 {
-    nvs_handle_t h;
-    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_i32(h, UI_NVS_BACKL, (int32_t)s_backlight);
-        nvs_commit(h);
-        nvs_close(h);
-    }
+    /* dB x10, rounded (the UI always sets whole dB, so this is exact). */
+    float db = hw_audio_get_master_gain_db();
+    return ui_nvs_set_i32(UI_NVS_GAIN,
+                          (int32_t)(db * 10.0f + (db >= 0.0f ? 0.5f : -0.5f)));
 }
 
-static void ui_settings_save_standby(void)
+static esp_err_t ui_settings_save_backlight(void)
 {
-    nvs_handle_t h;
-    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_i32(h, UI_NVS_STBY, (int32_t)s_standby_opt);
-        nvs_commit(h);
-        nvs_close(h);
-    }
+    return ui_nvs_set_i32(UI_NVS_BACKL, (int32_t)s_backlight);
 }
 
-static void ui_settings_save_autopause(void)
+static esp_err_t ui_settings_save_standby(void)
 {
-    nvs_handle_t h;
-    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_i32(h, UI_NVS_AUTOPAUSE, s_autopause_route ? 1 : 0);
-        nvs_commit(h);
-        nvs_close(h);
-    }
+    return ui_nvs_set_i32(UI_NVS_STBY, (int32_t)s_standby_opt);
 }
 
-static void ui_settings_save_repeat(void)
+static esp_err_t ui_settings_save_autopause(void)
 {
-    nvs_handle_t h;
-    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_i32(h, UI_NVS_REPEAT, (int32_t)player_repeat_mode());
-        nvs_commit(h);
-        nvs_close(h);
-    }
+    return ui_nvs_set_i32(UI_NVS_AUTOPAUSE, s_autopause_route ? 1 : 0);
 }
 
-static void ui_settings_save_bt_bitpool(void)
+static esp_err_t ui_settings_save_repeat(void)
 {
-    nvs_handle_t h;
-    if (nvs_open(UI_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_i32(h, UI_NVS_BT_BITPOOL, (int32_t)s_bt_bitpool_preset);
-        nvs_commit(h);
-        nvs_close(h);
-    }
+    return ui_nvs_set_i32(UI_NVS_REPEAT, (int32_t)player_repeat_mode());
+}
+
+static esp_err_t ui_settings_save_bt_bitpool(void)
+{
+    return ui_nvs_set_i32(UI_NVS_BT_BITPOOL, (int32_t)s_bt_bitpool_preset);
 }
 
 /* Debounced persistence: a setting change only marks a dirty bit and arms a
@@ -361,31 +347,49 @@ static void settings_commit_pending(void)
      * ui_settings_flush() commits on the first non-playing tick. This gate
      * also covers ui_settings_flush_force(), which used to bypass the
      * playback gate for standby / power-down paths. */
+    /* PAUSED releases the I2S bus (hw_audio_set_player_active(false) in
+     * player_pause), so a flash write there is safe — allow it. Only PLAYING
+     * holds the gate: that is when the decode task streams through PSRAM and
+     * a cache-off write can wedge the bus. Without this, settings changed
+     * during a long playback session were never persisted until full stop. */
     if (player_state() == PLAYER_PLAYING) {
         return;
     }
-    if (s_save_pending & SETTINGS_DIRTY_VOLUME) {
-        ui_settings_save_volume();
+    /* Clear ONLY the bits whose write succeeded. A failed NVS write keeps its
+     * bit set so the next idle tick retries; previously every bit was cleared
+     * unconditionally and a transient flash error lost the setting silently. */
+    if ((s_save_pending & SETTINGS_DIRTY_VOLUME) &&
+        ui_settings_save_volume() == ESP_OK) {
+        s_save_pending &= ~SETTINGS_DIRTY_VOLUME;
     }
-    if (s_save_pending & SETTINGS_DIRTY_GAIN) {
-        ui_settings_save_gain();
+    if ((s_save_pending & SETTINGS_DIRTY_GAIN) &&
+        ui_settings_save_gain() == ESP_OK) {
+        s_save_pending &= ~SETTINGS_DIRTY_GAIN;
     }
-    if (s_save_pending & SETTINGS_DIRTY_BACKL) {
-        ui_settings_save_backlight();
+    if ((s_save_pending & SETTINGS_DIRTY_BACKL) &&
+        ui_settings_save_backlight() == ESP_OK) {
+        s_save_pending &= ~SETTINGS_DIRTY_BACKL;
     }
-    if (s_save_pending & SETTINGS_DIRTY_STBY) {
-        ui_settings_save_standby();
+    if ((s_save_pending & SETTINGS_DIRTY_STBY) &&
+        ui_settings_save_standby() == ESP_OK) {
+        s_save_pending &= ~SETTINGS_DIRTY_STBY;
     }
-    if (s_save_pending & SETTINGS_DIRTY_AUTOPAUSE) {
-        ui_settings_save_autopause();
+    if ((s_save_pending & SETTINGS_DIRTY_AUTOPAUSE) &&
+        ui_settings_save_autopause() == ESP_OK) {
+        s_save_pending &= ~SETTINGS_DIRTY_AUTOPAUSE;
     }
-    if (s_save_pending & SETTINGS_DIRTY_REPEAT) {
-        ui_settings_save_repeat();
+    if ((s_save_pending & SETTINGS_DIRTY_REPEAT) &&
+        ui_settings_save_repeat() == ESP_OK) {
+        s_save_pending &= ~SETTINGS_DIRTY_REPEAT;
     }
-    if (s_save_pending & SETTINGS_DIRTY_BT_BITPOOL) {
-        ui_settings_save_bt_bitpool();
+    if ((s_save_pending & SETTINGS_DIRTY_BT_BITPOOL) &&
+        ui_settings_save_bt_bitpool() == ESP_OK) {
+        s_save_pending &= ~SETTINGS_DIRTY_BT_BITPOOL;
     }
-    s_save_pending = 0;
+    if (s_save_pending != 0) {
+        ESP_LOGW("ui_settings", "NVS commit failed, %u setting(s) will retry",
+                 (unsigned)__builtin_popcount(s_save_pending));
+    }
 }
 
 void ui_settings_flush(void)
@@ -397,7 +401,7 @@ void ui_settings_flush(void)
         return;
     }
     if (player_state() == PLAYER_PLAYING) {
-        return;   /* keep dirty; the next idle tick commits it */
+        return;   /* keep dirty; the next paused/idle tick commits it */
     }
     settings_commit_pending();
 }

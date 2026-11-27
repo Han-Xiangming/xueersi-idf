@@ -283,7 +283,10 @@ static void battery_sample_int(bool forced)
 
 void hw_battery_sample(void)
 {
-    battery_sample_int(false);
+    /* This is the UI's on-demand refresh (settings page). Pass forced=true so
+     * the display value updates even mid-playback — matches the header's
+     * contract; the periodic task calls battery_sample_int(false) itself. */
+    battery_sample_int(true);
 }
 
 void hw_battery_set_load_comp_mv(uint16_t comp_mv_per_100pct)

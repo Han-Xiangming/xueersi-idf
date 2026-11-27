@@ -67,3 +67,8 @@ void ui_create(lv_group_t *group);
 
 /* Periodic UI refresh (called from the main loop). */
 void ui_refresh(void);
+
+/* Flush any debounced settings immediately (still defers while audio is
+ * PLAYING to protect the I2S/PSRAM path). Called by main on the standby edge
+ * so settings survive a power-off after the user stops interacting. */
+void ui_settings_flush_force(void);

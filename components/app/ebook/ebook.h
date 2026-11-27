@@ -39,11 +39,14 @@ void ebook_notify_sd_remount(void);
 bool ebook_scan_busy(void);
 uint32_t ebook_scan_version(void);     /* bumps when the list is replaced */
 int  ebook_scan_count(void);
+/* True when the last scan hit EBOOK_LIST_MAX and more .txt files existed.
+ * The UI adds a "只显示前 N 本" hint so a large card is not silently clipped. */
+bool ebook_scan_truncated(void);
 const char *ebook_scan_name(int idx);  /* NUL-terminated, no path */
 /* Full stored path of book `idx` ("" if out of range). Used by the UI to tag
  * same-named books in <ALL> with their first-level directory. */
 const char *ebook_scan_path(int idx);
-/* Display name of the currently loaded source: "整卡" for the whole tree,
+/* Display name of the currently loaded source: "全部书籍" for the whole tree,
  * else the folder's basename. */
 const char *ebook_current_src_name(void);
 

@@ -189,7 +189,8 @@ void ui_settings_mark_dirty(uint32_t which);
 /* ---- Page: settings ---- */
 void ui_settings_load(void);
 void ui_settings_flush(void);
-/* Immediate commit, ignoring the debounce and the playback gate. */
+/* Immediate commit, ignoring the debounce but STILL respecting the playback
+ * gate (a cache-off flash write during I2S streaming can wedge PSRAM). */
 void ui_settings_flush_force(void);
 void ui_build_settings(lv_obj_t *page);
 void ui_refresh_settings(void);

@@ -59,10 +59,15 @@ static QueueHandle_t s_avrc_nav_q;
  * recovers, screen still alive" crashes. */
 #define XM_LOG_BUF      512
 #define XM_TX_SPIN_MAX  2000   /* ~µs-scale bounded spin per byte */
+static portMUX_TYPE s_log_tx_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static int IRAM_ATTR xm_console_vprintf(const char *fmt, va_list ap)
 {
-    static char buf[XM_LOG_BUF];
+    /* Stack-local, not static: esp_log_set_vprintf() is called from LVGL,
+     * decode, BT and scan tasks concurrently. A shared static buffer let two
+     * log lines interleave mid-format; a per-call buffer costs 512 bytes of
+     * stack (safe on every task here) and needs no lock in this IRAM hook. */
+    char buf[XM_LOG_BUF];
     int n = vsnprintf(buf, sizeof(buf), fmt, ap);
     if (n < 0) {
         return 0;
@@ -70,17 +75,28 @@ static int IRAM_ATTR xm_console_vprintf(const char *fmt, va_list ap)
     if (n > (int)sizeof(buf) - 1) {
         n = (int)sizeof(buf) - 1;
     }
+    /* Serialise the FIFO write so two tasks cannot interleave bytes from
+     * different lines. The spin is bounded (XM_TX_SPIN_MAX), so the critical
+     * section cannot hang; it only disables interrupts for a few µs per byte
+     * on a healthy UART. TX-wedge path exits through the single exit below. */
     uart_dev_t *hw = UART_LL_GET_HW(UART_NUM_0);
+    int sent = n;
+    portENTER_CRITICAL_SAFE(&s_log_tx_mux);
     for (int i = 0; i < n; i++) {
         int spins = 0;
         while (uart_ll_get_txfifo_len(hw) == 0) {
             if (++spins >= XM_TX_SPIN_MAX) {
-                return i;   /* TX wedged: drop the rest of the line */
+                sent = i;   /* TX wedged: drop the rest of the line */
+                break;
             }
+        }
+        if (spins >= XM_TX_SPIN_MAX) {
+            break;
         }
         uart_ll_write_txfifo(hw, (const uint8_t *)&buf[i], 1);
     }
-    return n;
+    portEXIT_CRITICAL_SAFE(&s_log_tx_mux);
+    return sent;
 }
 
 /* --- Last-resort RTC watchdog -------------------------------------------
@@ -241,6 +257,11 @@ static void lvgl_task(void *arg)
         const bool standby_now = hw_lcd_is_standby_active();
         if (standby_now && !was_standby) {
             ebook_progress_flush();
+            /* Commit any debounced UI settings too. The playback gate inside
+             * ui_settings_flush_force() still defers while audio is playing;
+             * on entering standby the user has stopped interacting, so a
+             * paused/idle session gets its settings flushed before power-off. */
+            ui_settings_flush_force();
         }
         was_standby = standby_now;
 

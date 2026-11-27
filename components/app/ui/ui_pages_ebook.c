@@ -341,8 +341,13 @@ void ui_refresh_ebook_list(void)
         }
         else {
             char buf[80];
-            snprintf(buf, sizeof(buf), "[%s] %d 本",
-                     ebook_current_src_name(), count);
+            if (ebook_scan_truncated()) {
+                snprintf(buf, sizeof(buf), "[%s] %d 本+ (超出上限)",
+                         ebook_current_src_name(), count);
+            } else {
+                snprintf(buf, sizeof(buf), "[%s] %d 本",
+                         ebook_current_src_name(), count);
+            }
             ui_theme_text_set(s_ui.eb_status, buf);
         }
         ui_set_hint(UI_STR_HINT_EBOOK_OPEN);

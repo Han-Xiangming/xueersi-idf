@@ -13,7 +13,7 @@ player.c
   ├─ mp3_player（16KB 栈，优先级 8，绑 Core 0）
   │    解码循环：读文件 → helix 解码 → hw_audio_write_pcm()（带背压）
   ├─ mp3_scan（4KB 栈，优先级 4，不绑核）
-  │    后台扫描 /sdcard/Music 的 .mp3 → 双缓冲快照发布曲目列表
+  │    后台扫描 PLAYER_ROOT(/sdcard) 的 .mp3 → 双缓冲快照发布曲目列表
   ├─ mp3_watch（4KB 栈，优先级 2，不绑核）
   │    解码停顿看门狗 + 喂 RTC WDT
   └─ 状态机       IDLE / PLAYING / PAUSED
@@ -29,10 +29,11 @@ FATFS 目录遍历在 SDSPI 上耗时数十 ms，故列表由**独立扫描任�
 
 | API | 说明 |
 | ---- | ---- |
-| `player_scan_start()` | 请求后台扫描 `/sdcard/Music` 的 `.mp3`（忽略大小写）；扫描进行中的请求合并为一次后续扫描 |
+| `player_scan_start()` | 请求后台扫描 `PLAYER_ROOT`（即 `/sdcard`）的 `.mp3`（忽略大小写）；UI 来源页另外把 `/sdcard/Music` 子树作为便捷入口；扫描进行中的请求合并为一次后续扫描 |
 | `player_scan_busy()` | 扫描中或已排队 |
 | `player_scan_version()` | 每次完成扫描递增；UI 轮询以检测新列表 |
 | `player_scan_count()` | 最近一次扫描的曲目数（最多 256 首，`PLAYER_SCAN_MAX`） |
+| `player_scan_truncated()` | 扫描到上限时仍有更多 `.mp3` 则为 true；UI 显示「仅前 N 首」提示 |
 | `player_scan_name(i)` | 第 i 首曲目名（越界返回 ""） |
 
 - 扫描结果按 `strcasecmp` 排序（qsort），跨扫描稳定；双缓冲快照发布：先填工作区 → 复制到活动数组 → bump 版本。

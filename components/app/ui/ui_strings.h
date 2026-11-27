@@ -5,10 +5,7 @@
  * All user-facing text lives here so wording can be tuned in one place and,
  * later, swapped for another language (the macros are the i18n seam). Keep the
  * values short to fit the 320 px screen at 16 px font.
- *
- * NOTE: Bluetooth-related strings (e.g. the "蓝牙" setting row, "关/开/已连接"
- * status, "蓝牙开/关", "扫描中...", the BT page hint) are intentionally NOT
- * here yet — left as literals in ui.c until the BT UI is revisited. */
+ * Bluetooth strings are centralised in the BT section below. */
 
 /* --- Settings menu labels --- */
 #define UI_STR_SET_VOL        "音量"
@@ -68,3 +65,26 @@
 #define UI_STR_HINT_SEEK_PAUSE "←→ 切歌  ↑↓ 音量  A 继续  Select 循环"
 #define UI_STR_HINT_SEEK_IDLE  "←→ 切歌  ↑↓ 选择  A 播放  Select 循环"
 #define UI_STR_HINT_EBOOK_OPEN "↑↓ 选择  A 打开  B 返回"
+
+/* --- Bluetooth page (centralised from ui_pages_bt.c literals) --- */
+#define UI_STR_BT_LABEL      "蓝牙"
+#define UI_STR_BT_POWER_ON   "蓝牙开"
+#define UI_STR_BT_POWER_OFF  "蓝牙关"
+#define UI_STR_BT_OFF        "蓝牙已关闭"
+#define UI_STR_BT_ON         "开"
+#define UI_STR_BT_SWITCH_OFF "关"
+#define UI_STR_BT_SCAN       "扫描中..."
+#define UI_STR_BT_CONNECTED  "已连接"
+#define UI_STR_BT_PAIRING    "配对中"
+#define UI_STR_BT_PAIRFAIL   "配对失败"
+#define UI_STR_BT_NODATA     "无设备"
+#define UI_STR_BT_DEVICES    "个设备"
+#define UI_STR_BT_PAIRCODE   "配对码"
+#define UI_STR_BT_RETRY      "重试中"
+#define UI_STR_BT_OFF_HINT   "A开关 B返回"
+#define UI_STR_BT_ON_HINT    "↑↓选 A开关/连接 Select扫描 B返回"
+#define UI_STR_BT_CONN_HINT  "A断开 B返回"
+#define UI_STR_BT_PAIR_HINT  "配对中... B返回"
+#define UI_STR_BT_LINK_HINT  "连接中... B返回"
+#define UI_STR_BT_FAIL_HINT  "A重试 B返回"
+#define UI_STR_BT_SCAN_HINT  "Select扫描 B返回"

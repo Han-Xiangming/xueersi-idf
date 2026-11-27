@@ -58,6 +58,14 @@ typedef enum {
     PV_LIST,         /* browsing/playing the loaded playlist */
 } player_view_t;
 
+/* Floating playback panel geometry. Kept here (not in ui_theme.h) because it
+ * is panel-internal layout, shared only by build and the button-row maths —
+ * previously 296 appeared twice as a literal and could drift. */
+#define UI_PANEL_X       12
+#define UI_PANEL_Y       64
+#define UI_PANEL_W       296
+#define UI_PANEL_H       136
+
 #define SRC_MAX 128
 /* UI-only source list data (~72 KB): keep it in external PSRAM (EXT_RAM_BSS)
  * so it does not compete with the Bluetooth stack for internal DRAM. */
@@ -65,6 +73,7 @@ EXT_RAM_BSS_ATTR static char s_src_list[SRC_MAX][MP3_NAME_LEN];  /* folder names
 EXT_RAM_BSS_ATTR static char s_src_path[SRC_MAX][PLAYER_PATH_LEN];/* absolute dir path per entry */
 static int      s_src_count;
 static int      s_src_sel;
+static bool     s_src_truncated;   /* >SRC_MAX-1 top-level folders were found */
 
 /* <ALL> duplicate-name tags. One short first-level directory per track,
  * rebuilt only when a new playlist snapshot is published (never on every
@@ -115,10 +124,11 @@ static void ui_discover_sources(void)
     s_src_list[0][0] = '\0';                 /* empty name => render as "<ALL>" */
     snprintf(s_src_path[0], sizeof(s_src_path[0]), "%s", MUSIC_ROOT);
 
+    s_src_truncated = false;
     DIR *d = opendir(MUSIC_ROOT);
     if (d != NULL) {
         struct dirent *e;
-        while ((e = readdir(d)) != NULL && s_src_count < SRC_MAX - 1) {
+        while ((e = readdir(d)) != NULL) {
             const char *fn = e->d_name;
             if (fn[0] == '.') {
                 continue;
@@ -128,6 +138,10 @@ static void ui_discover_sources(void)
             struct stat st;
             if (stat(child, &st) != 0 || !S_ISDIR(st.st_mode)) {
                 continue;                    /* only sub-directories are sources */
+            }
+            if (s_src_count >= SRC_MAX - 1) {
+                s_src_truncated = true;      /* counted but not stored */
+                continue;
             }
             int idx = s_src_count + 1;
             /* snprintf (not strncpy) so the buffer is always NUL-terminated and
@@ -287,8 +301,8 @@ void ui_player_build_panel(void)
 {
     lv_obj_t *panel = lv_obj_create(lv_screen_active());
     lv_obj_remove_style_all(panel);
-    lv_obj_set_pos(panel, 12, 64);
-    lv_obj_set_size(panel, 296, 136);
+    lv_obj_set_pos(panel, UI_PANEL_X, UI_PANEL_Y);
+    lv_obj_set_size(panel, UI_PANEL_W, UI_PANEL_H);
     lv_obj_set_style_bg_color(panel, lv_color_hex(UI_COLOR_SURFACE), 0);
     lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(panel, lv_color_hex(UI_COLOR_LINE), 0);
@@ -332,11 +346,10 @@ void ui_player_build_panel(void)
     int s_panel_x[PLAYER_PANEL_NBTN];
     {
         const int gap = 12;
-        /* Panel width from the literal set above (296): lv_obj_get_width()
-         * would return the laid-out coords box, which is still empty at
-         * build time (the panel is created before the first layout pass),
-         * pushing the whole row off the panel's left edge. */
-        const int pw = 296;
+        /* Use the declared panel width: lv_obj_get_width() would return the
+         * laid-out coords box, still empty at build time (the panel is created
+         * before the first layout pass), pushing the row off the left edge. */
+        const int pw = UI_PANEL_W;
         int total = 0;
         for (int i = 0; i < PLAYER_PANEL_NBTN; i++) {
             total += ui_label_width_px(s_panel_labels[i]);
@@ -539,7 +552,8 @@ void ui_refresh_player(void)
                 s_paint_mp3_top = top;
             }
             ui_theme_text_set(s_ui.status, "--");
-            ui_pl_prog(UI_STR_SEL_MUSIC, false);
+            ui_pl_prog(s_src_truncated ? "目录过多,仅显示前127个"
+                                       : UI_STR_SEL_MUSIC, false);
             ui_set_hint(UI_STR_HINT_NAV);
             return;
         }
@@ -635,13 +649,22 @@ void ui_refresh_player(void)
                 ui_pl_prog(UI_STR_LOADING, false);
             }
             else {
-                const char *idle_msg = s_mp3_count
-                             ? (player_repeat_mode() == PLAYER_REPEAT_ONE
-                                ? "循环:单曲"
-                                : player_repeat_mode() == PLAYER_REPEAT_RANDOM
-                                      ? "循环:随机" : "循环:列表")
-                             : "无MP3文件";
-                ui_pl_prog(idle_msg, false);
+                /* A card larger than PLAYER_SCAN_MAX is silently clipped
+                 * otherwise: surface it on the wide progress line so users
+                 * know why a known track is missing from the list. */
+                if (player_scan_truncated()) {
+                    char buf[40];
+                    snprintf(buf, sizeof(buf), "仅前 %d 首(更多)", s_mp3_count);
+                    ui_pl_prog(buf, false);
+                } else {
+                    const char *idle_msg = s_mp3_count
+                                 ? (player_repeat_mode() == PLAYER_REPEAT_ONE
+                                    ? "循环:单曲"
+                                    : player_repeat_mode() == PLAYER_REPEAT_RANDOM
+                                          ? "循环:随机" : "循环:列表")
+                                 : "无MP3文件";
+                    ui_pl_prog(idle_msg, false);
+                }
             }
         }
         else {

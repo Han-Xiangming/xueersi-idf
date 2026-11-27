@@ -84,11 +84,10 @@ void ui_build_bt(lv_obj_t *page)
 
     ui_list_create(&s_ui.bt_list, page, UI_LIST_ROWS, UI_LIST_FIRST_Y, UI_ROW_H_LIST);
 
-    s_ui.bt_status = ui_theme_label(page, s_bt_on ? "扫描中..." : "蓝牙已关闭",
+    s_ui.bt_status = ui_theme_label(page, s_bt_on ? UI_STR_BT_SCAN : UI_STR_BT_OFF,
                                     196, UI_COLOR_TEXT_DIM, LV_TEXT_ALIGN_CENTER);
     s_ui.hint = ui_theme_label(page,
-                     s_bt_on ? "↑↓选 A开关/连接 Select扫描 B返回"
-                             : "A开关 B返回",
+                     s_bt_on ? UI_STR_BT_ON_HINT : UI_STR_BT_OFF_HINT,
                      UI_LEGEND_Y, UI_COLOR_TEXT_DIM, LV_TEXT_ALIGN_CENTER);
 }
 
@@ -105,7 +104,8 @@ void ui_refresh_bt(void)
         /* Row 0 is the pinned master switch; below it live the device rows. */
         {
             static char sw[32];
-            snprintf(sw, sizeof(sw), "蓝牙     %s", s_bt_on ? "开" : "关");
+            snprintf(sw, sizeof(sw), UI_STR_BT_LABEL "     %s",
+                     s_bt_on ? UI_STR_BT_ON : UI_STR_BT_SWITCH_OFF);
             ui_list_row(&s_ui.bt_list, 0, 0, 1, sw, (s_bt_sel == 0), false);
         }
 
@@ -114,8 +114,8 @@ void ui_refresh_bt(void)
             for (int i = 1; i < UI_LIST_ROWS; i++) {
                 ui_list_row(&s_ui.bt_list, i, -1, 0, "", false, true);
             }
-            ui_theme_text_set(s_ui.bt_status, "蓝牙已关闭");
-            ui_set_hint("A开关 B返回");
+            ui_theme_text_set(s_ui.bt_status, UI_STR_BT_OFF);
+            ui_set_hint(UI_STR_BT_OFF_HINT);
             return;
         }
 
@@ -167,10 +167,11 @@ void ui_refresh_bt(void)
 
         if (bluetooth_audio_is_connected()) {
             char st[28];
-            snprintf(st, sizeof(st), "已连接 %s", bluetooth_audio_peer_name());
+            snprintf(st, sizeof(st), UI_STR_BT_CONNECTED " %s",
+                     bluetooth_audio_peer_name());
             st[27] = '\0';
             ui_theme_text_set(s_ui.bt_status, st);
-            ui_set_hint("A断开 B返回");
+            ui_set_hint(UI_STR_BT_CONN_HINT);
             /* Connected sink takes over output: explicitly flip the route so
              * decoded audio goes to Bluetooth instead of the speaker. */
             hw_audio_set_route(AUDIO_ROUTE_BT);
@@ -180,49 +181,53 @@ void ui_refresh_bt(void)
              * non-conforming peer forced numeric comparison (informational). */
             char st[28];
             if (bluetooth_audio_passkey() != 0) {
-                snprintf(st, sizeof(st), "配对码 %06u", (unsigned)bluetooth_audio_passkey());
+                snprintf(st, sizeof(st), UI_STR_BT_PAIRCODE " %06u",
+                         (unsigned)bluetooth_audio_passkey());
             } else {
-                snprintf(st, sizeof(st), "配对中 %s", bluetooth_audio_peer_name());
+                snprintf(st, sizeof(st), UI_STR_BT_PAIRING " %s",
+                         bluetooth_audio_peer_name());
             }
             st[27] = '\0';
             ui_theme_text_set(s_ui.bt_status, st);
-            ui_set_hint("配对中... B返回");
+            ui_set_hint(UI_STR_BT_PAIR_HINT);
         }
         else if (bluetooth_audio_pair_state() == BT_PAIR_CONNECTING) {
             uint8_t rc = bluetooth_audio_retry_count();
             uint8_t rm = bluetooth_audio_retry_max();
             char st[28];
             if (rc > 0) {
-                snprintf(st, sizeof(st), "重试中 %u/%u", (unsigned)rc, (unsigned)rm);
+                snprintf(st, sizeof(st), UI_STR_BT_RETRY " %u/%u",
+                         (unsigned)rc, (unsigned)rm);
             } else {
-                snprintf(st, sizeof(st), "配对中 %s", bluetooth_audio_peer_name());
+                snprintf(st, sizeof(st), UI_STR_BT_PAIRING " %s",
+                         bluetooth_audio_peer_name());
             }
             st[27] = '\0';
             ui_theme_text_set(s_ui.bt_status, st);
-            ui_set_hint("连接中... B返回");
+            ui_set_hint(UI_STR_BT_LINK_HINT);
         }
         else if (bluetooth_audio_pair_state() == BT_PAIR_FAIL) {
-            ui_theme_text_set(s_ui.bt_status, "配对失败");
-            ui_set_hint("A重试 B返回");
+            ui_theme_text_set(s_ui.bt_status, UI_STR_BT_PAIRFAIL);
+            ui_set_hint(UI_STR_BT_FAIL_HINT);
         }
         else if (bluetooth_audio_is_scanning()) {
             char st[28];
-            snprintf(st, sizeof(st), "扫描中... %d", count);
+            snprintf(st, sizeof(st), UI_STR_BT_SCAN " %d", count);
             st[27] = '\0';
             ui_theme_text_set(s_ui.bt_status, st);
-            ui_set_hint("↑↓选 A开关/连接 Select扫描 B返回");
+            ui_set_hint(UI_STR_BT_ON_HINT);
         }
         else {
             if (count) {
                 char st[28];
-                snprintf(st, sizeof(st), "%d 个设备", count);
+                snprintf(st, sizeof(st), "%d " UI_STR_BT_DEVICES, count);
                 st[27] = '\0';
                 ui_theme_text_set(s_ui.bt_status, st);
             }
             else {
-                ui_theme_text_set(s_ui.bt_status, "无设备");
+                ui_theme_text_set(s_ui.bt_status, UI_STR_BT_NODATA);
             }
-            ui_set_hint(count ? "↑↓选 A开关/连接 Select扫描 B返回" : "Select扫描 B返回");
+            ui_set_hint(count ? UI_STR_BT_ON_HINT : UI_STR_BT_SCAN_HINT);
         }
 }
 
@@ -247,10 +252,10 @@ static void ui_bt_toggle_master(void)
     if (s_bt_on) {
         bluetooth_audio_enable();
         bluetooth_audio_scan_start();
-        set_action("蓝牙开");
+        set_action(UI_STR_BT_POWER_ON);
     } else {
         bluetooth_audio_disable();
-        set_action("蓝牙关");
+        set_action(UI_STR_BT_POWER_OFF);
         s_bt_sel = 0;   /* keep the highlight on the switch row */
     }
     if (player_state() == PLAYER_PLAYING) {
@@ -305,7 +310,7 @@ void ui_bt_select(void)
         return;
     }
     bluetooth_audio_scan_start();
-    set_action("扫描中");
+    set_action(UI_STR_BT_SCAN);
 }
 
 void ui_bt_reset_paint(void)
