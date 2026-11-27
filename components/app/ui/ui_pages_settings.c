@@ -580,7 +580,7 @@ void ui_settings_reset_paint(void)
 static const char *ui_set_vol_text(void)
 {
     static char buf[24];
-    snprintf(buf, sizeof(buf), "%u%%", (unsigned)hw_audio_get_volume());
+    ui_format_volume(buf, sizeof(buf), false);
     return buf;
 }
 

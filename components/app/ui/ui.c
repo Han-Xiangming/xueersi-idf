@@ -74,7 +74,7 @@ static char s_hint_normal[128];
  * The volume also moves without local input — an AVRCP remote setting the
  * absolute volume on the BT route, or a route switch swapping in the other
  * route's slot — so the refresh detects the change and acknowledges it with
- * the same "音量 XX%" toast the local entry points use. */
+ * the same volume toast the local entry points use. */
 static uint8_t s_vol_view = 0xFF;
 
 /* On-change refresh (optimization #4): ui_refresh() recomputes the current
@@ -562,6 +562,20 @@ void ui_volume_step(int dir)
     s_vol_view = hw_audio_get_volume();
 }
 
+/* Format the ACTIVE route's volume for display. Speaker: "60%" (a 1 % step is
+ * 0.4 dB there). BT: "-6dB" — its local trim is only 12 dB, so a fixed 1 dB
+ * step would jump the percent readout ~8 % while the audible change stays 1 dB;
+ * showing dB keeps the number and the perception in step. */
+void ui_format_volume(char *buf, size_t len, bool with_label)
+{
+    const char *label = with_label ? "音量 " : "";
+    if (hw_audio_get_route() == AUDIO_ROUTE_BT) {
+        snprintf(buf, len, "%s%.0fdB", label, hw_audio_get_volume_db());
+    } else {
+        snprintf(buf, len, "%s%u%%", label, (unsigned)hw_audio_get_volume());
+    }
+}
+
 /* One call for every volume entry point: step + debounced persist + toast.
  * Centralising this keeps the step size, the NVS dirty-mark and the on-screen
  * feedback identical on the player page, the settings row and the ebook panel. */
@@ -570,7 +584,7 @@ void ui_volume_change(int dir)
     ui_volume_step(dir);
     ui_settings_mark_dirty(SETTINGS_DIRTY_VOLUME);
     char buf[24];
-    snprintf(buf, sizeof(buf), "音量 %u%%", (unsigned)hw_audio_get_volume());
+    ui_format_volume(buf, sizeof(buf), true);
     set_action(buf);
 }
 
@@ -986,7 +1000,7 @@ void ui_refresh(void)
     if (vol != s_vol_view) {
         if (s_vol_view != 0xFF) {
             char buf[24];
-            snprintf(buf, sizeof(buf), "音量 %u%%", (unsigned)vol);
+            ui_format_volume(buf, sizeof(buf), true);
             set_action(buf);
             ui_settings_mark_dirty(SETTINGS_DIRTY_VOLUME);
         }

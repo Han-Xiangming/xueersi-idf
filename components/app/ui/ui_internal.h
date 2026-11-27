@@ -124,7 +124,7 @@ typedef struct {
     lv_obj_t *pl_panel;   /* floating playback control panel (MENU key) */
     lv_obj_t *pl_panel_name;
     lv_obj_t *pl_panel_state;
-    lv_obj_t *pl_panel_vol;     /* "音量 XX%" readout on the panel */
+    lv_obj_t *pl_panel_vol;     /* volume readout on the panel (% or dB per route) */
     lv_obj_t *pl_panel_btn[5];  /* 上一曲 / 播放暂停 / 下一曲 / 停止 / 循环 */
 
     lv_group_t *group;
@@ -172,8 +172,12 @@ bool ui_marquee_step(ui_marquee_t *mq, char *out, size_t out_size,
 void ui_volume_step(int dir);
 /* Unified volume change used by EVERY entry point (player ↑↓, settings ←→,
  * ebook panel ↑↓): step + debounced persist + toast. Keeps the step size, the
- * NVS dirty-mark and the "音量 XX%" feedback in one place. */
+ * NVS dirty-mark and the volume readout in one place. */
 void ui_volume_change(int dir);
+/* Format the ACTIVE route's volume for display: "60%" on the speaker route,
+ * "-6dB" on BT (where one percent is only 0.12 dB and a fixed 1 dB step jumps
+ * the percent readout ~8 %). with_label prepends "音量 ". */
+void ui_format_volume(char *buf, size_t len, bool with_label);
 /* Unified backlight change used by the settings row and the ebook reader ↑↓:
  * one gamma-level step + settings-copy sync + debounced persist + toast. */
 void ui_backlight_change(int dir);

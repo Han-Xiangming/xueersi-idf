@@ -401,8 +401,7 @@ void ui_player_refresh_panel(void)
     ui_theme_text_set(s_ui.pl_panel_state, s_panel_state_buf);
 
     static char s_panel_vol_buf[16];
-    snprintf(s_panel_vol_buf, sizeof(s_panel_vol_buf), "音量 %u%%",
-             (unsigned)hw_audio_get_volume());
+    ui_format_volume(s_panel_vol_buf, sizeof(s_panel_vol_buf), true);
     ui_theme_text_set(s_ui.pl_panel_vol, s_panel_vol_buf);
 
     for (int i = 0; i < PLAYER_PANEL_NBTN; i++) {

@@ -65,6 +65,11 @@ void hw_audio_set_route_change_cb(audio_route_change_cb_t cb);
  * knob silent. */
 void hw_audio_set_volume(uint8_t volume_pct);
 uint8_t hw_audio_get_volume(void);
+/* Current volume as attenuation in dB on the ACTIVE route (0 dB = full,
+ * negative = attenuated). Speaker spans 0..-40 dB, BT 0..-12 dB. Lets a UI
+ * show the perceptual value instead of a percent whose meaning changes with
+ * the route (on BT one percent is only 0.12 dB). */
+float hw_audio_get_volume_db(void);
 
 /* Step the ACTIVE route's volume by a fixed amount in dB (+ louder / - quieter),
  * resolved through the SAME perceptual taper as set_volume (linear dB over the
