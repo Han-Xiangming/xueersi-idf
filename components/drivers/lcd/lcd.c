@@ -53,46 +53,37 @@ static volatile bool s_lcd_first_flush_done;
 #define BL_LEDC_DUTY_RES      LEDC_TIMER_10_BIT   /* 0..1023 */
 #define BL_DUTY_MAX           ((1 << 10) - 1)
 
-/* Non-uniform (low-fine / high-coarse) brightness curve.
+/* Gamma-corrected brightness curve (standard LED dimming practice).
  *
- * Brightness perception is logarithmic (Weber-Fechner): a fixed PWM duty
- * step looks far smaller at high brightness than at low. A plain gamma curve
- * (duty = MIN + (MAX-MIN)*p^gamma) over-corrects and spends its *coarse*
- * steps at the dim end (where you actually want fine control for night
- * reading) and its *fine* steps at the bright end. To flip that — many small
- * steps when dim, fewer big steps when bright — lay the levels out in
- * log-duty space with a shaping exponent > 1:
+ * Human brightness perception is non-linear: PWM duty is perceived roughly
+ * as duty^0.33 (Stevens' law). To make equal input steps look equally
+ * different, duty follows a power curve instead of a linear ramp:
  *
- *     log_duty[i] = log(MIN_ON) + (log(MAX) - log(MIN_ON))
- *                                * ((i-1)/(STEPS-1)) ^ BL_LUT_SHAPE
- *     lut[i]      = round(exp(log_duty[i]))
+ *     duty[i] = MIN_ON + (MAX - MIN_ON) * (i / STEPS) ^ BL_LUT_GAMMA
  *
- * BL_LUT_SHAPE = 1 gives uniform *perceived* steps (duty exponential in the
- * level index). Raising it packs more levels into the dim region (finer low
- * end) and spreads fewer, larger steps across the bright region (coarser high
- * end). Index 0 stays fully off; index 1 is the dimmest visible floor
- * BL_LUT_MIN_ON. Tune BL_LUT_SHAPE / BL_LUT_MIN_ON against real hardware.
+ * GAMMA 2.2 is the sRGB / LED-dimming standard. It spreads many clearly
+ * visible steps across the dim end (where the eye is most sensitive) and
+ * compresses the bright end. MIN_ON is kept low so the low levels retain a
+ * usable dynamic range; raising it collapses the dim steps into a dead zone
+ * where the percentage changes but the brightness does not.
+ * Index 0 stays fully off. Tune BL_LUT_GAMMA / BL_LUT_MIN_ON on real HW.
  * BL_LUT_STEPS mirrors the public HW_LCD_BACKLIGHT_STEPS in lcd.h. */
 #define BL_LUT_STEPS          HW_LCD_BACKLIGHT_STEPS
-#define BL_LUT_MIN_ON         40      /* dimmest visible 10-bit duty (0..1023) */
-#define BL_LUT_SHAPE          1.8f    /* >1 = low-fine / high-coarse; 1 = even */
+#define BL_LUT_MIN_ON         4       /* dimmest visible 10-bit duty (0..1023) */
+#define BL_LUT_GAMMA          2.2f    /* sRGB / LED dimming standard */
 static uint16_t s_bl_lut[BL_LUT_STEPS + 1];
 
-/* Fill s_bl_lut[] with the low-fine / high-coarse curve above. Called once
- * from backlight_init() before any duty is applied. */
+/* Fill s_bl_lut[] with the gamma curve above. Called once from
+ * backlight_init() before any duty is applied. */
 static void backlight_lut_init(void)
 {
     s_bl_lut[0] = 0;   /* off */
-    const float log_min = logf((float)BL_LUT_MIN_ON);
-    const float log_max = logf((float)BL_DUTY_MAX);
-    const float span = log_max - log_min;
+    const uint16_t span = BL_DUTY_MAX - BL_LUT_MIN_ON;
     for (int i = 1; i <= BL_LUT_STEPS; i++) {
-        float n = (float)(i - 1) / (BL_LUT_STEPS - 1);   /* 0..1 level position */
-        float duty = expf(log_min + span * powf(n, BL_LUT_SHAPE));
+        float x = (float)i / (float)BL_LUT_STEPS;
+        float duty = (float)BL_LUT_MIN_ON + (float)span * powf(x, BL_LUT_GAMMA);
         int d = (int)(duty + 0.5f);
-        /* Guard against integer rounding collapsing two adjacent levels into
-         * a dead step (possible right above the dim floor); keep strictly
-         * increasing and clamped to the 10-bit range. */
+        /* Keep strictly increasing and clamped to the 10-bit range. */
         if (d <= (int)s_bl_lut[i - 1]) {
             d = (int)s_bl_lut[i - 1] + 1;
         }
