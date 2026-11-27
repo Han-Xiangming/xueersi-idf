@@ -562,18 +562,15 @@ void ui_volume_step(int dir)
     s_vol_view = hw_audio_get_volume();
 }
 
-/* Format the ACTIVE route's volume for display. Speaker: "60%" (a 1 % step is
- * 0.4 dB there). BT: "-6dB" — its local trim is only 12 dB, so a fixed 1 dB
- * step would jump the percent readout ~8 % while the audible change stays 1 dB;
- * showing dB keeps the number and the perception in step. */
+/* Format the ACTIVE route's volume as a discrete step counter: "24/40" on
+ * speaker, "6/12" on BT. One key press moves exactly one step on either route,
+ * so the readout and the perceived 1 dB change stay in step. */
 void ui_format_volume(char *buf, size_t len, bool with_label)
 {
     const char *label = with_label ? "音量 " : "";
-    if (hw_audio_get_route() == AUDIO_ROUTE_BT) {
-        snprintf(buf, len, "%s%.0fdB", label, hw_audio_get_volume_db());
-    } else {
-        snprintf(buf, len, "%s%u%%", label, (unsigned)hw_audio_get_volume());
-    }
+    snprintf(buf, len, "%s%u/%u", label,
+             (unsigned)hw_audio_get_volume_step(),
+             (unsigned)hw_audio_get_volume_steps());
 }
 
 /* One call for every volume entry point: step + debounced persist + toast.

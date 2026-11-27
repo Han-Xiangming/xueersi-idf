@@ -1354,10 +1354,15 @@ uint8_t hw_audio_get_volume(void)
     return s_volume;
 }
 
-float hw_audio_get_volume_db(void)
+uint8_t hw_audio_get_volume_steps(void)
+{
+    return (uint8_t)vol_active_max_db();
+}
+
+uint8_t hw_audio_get_volume_step(void)
 {
     const float max_db = vol_active_max_db();
-    return ((float)s_volume / 100.0f - 1.0f) * max_db;
+    return (uint8_t)((float)s_volume * max_db / 100.0f + 0.5f);
 }
 
 /* Fixed-dB volume step on the ACTIVE route. The percent↔gain map is dB-linear
