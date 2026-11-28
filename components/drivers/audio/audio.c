@@ -149,11 +149,15 @@ static bool              s_flush_fill;        /* hard switch: also overwrite the
                                                * DMA descriptor ring with silence
                                                * to kill previous-track PCM left
                                                * in descriptors ahead of the DMA. */
-static SemaphoreHandle_t s_flush_done = NULL; /* posted by the writer when a
-                                               * synchronous pipeline flush has
-                                               * actually dropped the ring + reset
-                                               * the DMA queue, so the caller can
-                                               * start the next track clean. */
+/* Flush completion handshake by generation counters instead of a binary
+ * semaphore. A semaphore token left by a timed-out wait is STALE: the next
+ * flush's Take returns immediately and the new track's first PCM is written
+ * while the writer is still feeding silence -> the song's head is cut. With
+ * generations the caller waits for `done >= req`; old completions can never
+ * satisfy a newer request. Both counters are volatile and updated inside
+ * s_ring_lock so neither task can cache a stale value (see s_ring_bytes). */
+static volatile uint32_t s_flush_req_gen;     /* latest requested flush gen    */
+static volatile uint32_t s_flush_done_gen;    /* gen the writer has finished   */
 /* One-shot seam diagnostics (see hw_audio_set_player_active + i2s_writer_task).
  * s_diag_arm: when set, the writer dumps its state the moment a seam flush
  * completes — proves whether s_player_active / s_parked / s_i2s_disabled are
@@ -1064,6 +1068,13 @@ static void i2s_writer_task(void *arg)
     static int64_t  s_underrun_log_us = 0;
     for (;;) {
         if (s_flush_req) {
+            /* Capture the generation this flush will satisfy. A newer request
+             * arriving mid-flush bumps s_flush_req_gen; we must NOT clear its
+             * flags below, or that request would be silently lost. */
+            uint32_t gen;
+            taskENTER_CRITICAL(&s_ring_lock);
+            gen = s_flush_req_gen;
+            taskEXIT_CRITICAL(&s_ring_lock);
             /* Hard switch: fade the queued previous-track PCM to zero on its
              * way to the DMA, so the cut into the mandatory silence gap is a
              * smooth ramp instead of a jump (anti-click, see FADE_OUT_MS).
@@ -1137,12 +1148,18 @@ static void i2s_writer_task(void *arg)
              * this build). Both are required: ESP-IDF documents disable() as
              * only stopping BCLK/WS, so a re-arm alone replays old PCM. See
              * i2s_seam_rearm() for details. */
-            s_flush_req = false;
-            s_flush_fill = false;
-            s_flush_fadeout = false;
             int64_t flush_done_us = esp_timer_get_time();
             int64_t last_dma_us;
             taskENTER_CRITICAL(&s_ring_lock);
+            /* Publish completion for THIS generation. Only clear the flags
+             * when no newer request arrived mid-flush: otherwise that newer
+             * request would be lost and its caller would wait to the bound. */
+            if (s_flush_req_gen == gen) {
+                s_flush_req = false;
+                s_flush_fill = false;
+                s_flush_fadeout = false;
+            }
+            s_flush_done_gen = gen;
             s_last_flush_done_us = flush_done_us;
             last_dma_us = s_last_real_dma_us;
             taskEXIT_CRITICAL(&s_ring_lock);
@@ -1156,9 +1173,6 @@ static void i2s_writer_task(void *arg)
                      (long long)(last_dma_us
                                  ? (flush_done_us - last_dma_us) / 1000
                                  : -1));
-            if (s_flush_done != NULL) {
-                xSemaphoreGive(s_flush_done);   /* unblock the waiting caller */
-            }
             if (s_diag_arm) {
                 ESP_LOGW(TAG,
                          "[SEAMDIAG] pre: active=%d parked=%d route=%d dis=%d "
@@ -1188,7 +1202,26 @@ static void i2s_writer_task(void *arg)
                 taskEXIT_CRITICAL(&s_ring_lock);
                 vRingbufferReturnItem(s_pcm_rb, pit);   /* dropped, not played */
             }
-            vTaskDelay(pdMS_TO_TICKS(I2S_DMA_DRAIN_MS));
+            /* Drain the DMA tail in SHORT steps so a resume or a new flush
+             * request can cut the wait short. This is essential at a quick
+             * stop->play: the flush wakes us from the blocking wait below,
+             * but by the time the flush completes `s_parked` may still be
+             * true (the player sets it false only after the synchronous
+             * flush returns). Re-entering this branch and spending the full
+             * I2S_DMA_DRAIN_MS + i2s_seam_rearm() again left the writer
+             * unable to pull PCM while the new track filled the ring ->
+             * "PCM ring full ... audible gap" on every fast restart. */
+            for (int waited = 0;
+                 waited < I2S_DMA_DRAIN_MS && s_parked && !s_flush_req;
+                 waited += 20) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
+            if (!s_parked || s_flush_req) {
+                /* Resume/flush arrived during the drain: skip the park re-arm
+                 * and the blocking wait. The flush path owns the seam now, or
+                 * playback is active and the normal loop must pull the ring. */
+                continue;
+            }
             /* Reset + prime the DMA descriptor ring at park. i2s_seam_rearm()
              * does a disable+enable (which re-initialises the descriptor queue on
              * the i2s_std driver) followed by a SHORT silence prime. The pending
@@ -1368,10 +1401,7 @@ void hw_audio_init(void)
         return;
     }
 
-    s_flush_done = xSemaphoreCreateBinary();
-    if (s_flush_done == NULL) {
-        ESP_LOGE(TAG, "[AUDIO] flush semaphore alloc failed");
-    }
+    s_flush_req_gen = s_flush_done_gen = 0;   /* generation handshake, no alloc */
 
     audio_set_hpf_coeff(s_rate);      /* default-rate HPF coefficient */
     audio_set_loudness_coeff(s_rate); /* default-rate loudness shelf coeff */
@@ -1698,6 +1728,46 @@ void hw_audio_set_sample_rate(uint32_t sample_rate_hz)
  * drains the old pass's tail is replaced by silence on its own, and the new
  * pass is written straight behind it. No stop/start, no chirp, no wedge.
  * Call from the task that owns PCM writes. */
+
+/* Request a synchronous flush and return the generation the caller must wait
+ * for. Follows ESP-ADF's audio_element_wait_for_stop() pattern: the request is
+ * not complete until the worker confirms it actually finished the abort work. */
+static uint32_t hw_audio_flush_begin(bool fadeout)
+{
+    uint32_t gen;
+    taskENTER_CRITICAL(&s_ring_lock);
+    gen = ++s_flush_req_gen;
+    s_flush_fill = true;
+    s_flush_fadeout = fadeout;
+    s_flush_req = true;
+    taskEXIT_CRITICAL(&s_ring_lock);
+    xTaskNotifyGive(s_i2s_task);   /* wake the writer if it is parked */
+    return gen;
+}
+
+/* Wait (bounded, WDT-fed) until the writer confirms `req_gen` is done. The
+ * bound covers the worst stop->play seam: park drain 350 ms + park re-arm
+ * ~286 ms + fade 20 ms + switch re-arm ~286 ms ~ 940 ms. A generation >= req
+ * also accepts a later flush that subsumed this one. */
+static void hw_audio_flush_wait(uint32_t req_gen)
+{
+    for (int waited = 0; waited < 1200; waited += 20) {
+        uint32_t done;
+        taskENTER_CRITICAL(&s_ring_lock);
+        done = s_flush_done_gen;
+        taskEXIT_CRITICAL(&s_ring_lock);
+        if ((int32_t)(done - req_gen) >= 0) {
+            return;
+        }
+#if defined(CONFIG_ESP_TASK_WDT_EN)
+        esp_task_wdt_reset();   /* decode task is WDT-monitored */
+#endif
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    ESP_LOGE(TAG, "[AUDIO] flush gen %u unconfirmed after 1200 ms (done=%u)",
+             (unsigned)req_gen, (unsigned)s_flush_done_gen);
+}
+
 void hw_audio_pipeline_flush(void)
 {
     if (s_route == AUDIO_ROUTE_BT) {
@@ -1718,26 +1788,16 @@ void hw_audio_pipeline_flush(void)
      * silence gap at every seam to guarantee it plays. (Shrinkable later once
      * the exact desync window is measured.)
      *
-     * Synchronous: block until the writer has actually dropped the ring and
-     * re-armed the DMA. A mere flag + notify is not enough — the caller
-     * (decode loop) then immediately opens a NEW track and writes its first
-     * PCM; without waiting, that first chunk could land in the ring and be
-     * discarded by the still-pending flush, cutting the new song's head.
-     * With the full 48 KB silence overwrite back in place the writer is busy
-     * ~280 ms at the seam, so this wait must match hw_audio_pipeline_switch()'s
-     * 400 ms: a shorter wait lets the decode loop start the new track while
-     * the writer is still feeding silence, overflowing the PCM ring and
-     * dropping the new song's first samples (commit 9db3895). Still bounded
-     * (400 ms) so a wedged writer can never deadlock the caller. */
+     * Synchronous: block until the writer CONFIRMS (by generation) that it
+     * dropped the ring and re-armed the DMA. A mere flag + notify is not
+     * enough — the decode loop would open the NEW track and write its first
+     * PCM while the writer is still feeding silence; that chunk is then
+     * discarded, cutting the new song's head (commit 9db3895). The wait is
+     * bounded (1200 ms, WDT-fed) so a wedged writer can never deadlock. */
     if (s_i2s_task == NULL) {
         return;   /* no writer to flush (init failed / not yet up) */
     }
-    s_flush_fill = true;   /* re-arm the out-link at the seam (see above) */
-    s_flush_req = true;
-    xTaskNotifyGive(s_i2s_task);   /* wake the writer if it is parked */
-    if (s_flush_done != NULL) {
-        xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(400));
-    }
+    hw_audio_flush_wait(hw_audio_flush_begin(false));  /* re-arm, no fade */
 }
 
 /* Hard track switch: like hw_audio_pipeline_flush() but the writer also
@@ -1754,17 +1814,11 @@ void hw_audio_pipeline_switch(void)
     if (s_i2s_task == NULL) {
         return;   /* no writer to flush (init failed / not yet up) */
     }
-    s_flush_fill = true;
-    s_flush_fadeout = true;   /* fade queued old PCM to zero before the seam */
-    s_flush_req = true;
-    xTaskNotifyGive(s_i2s_task);   /* wake the writer if it is parked */
-    if (s_flush_done != NULL) {
-        /* Fade (~20 ms of queued PCM) + full-ring silence fill (~272 ms) +
-         * disable/enable must all finish before the caller opens the next
-         * track, otherwise its first PCM lands in the ring mid-flush and is
-         * dropped. 400 ms covers all three. */
-        xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(400));
-    }
+    /* Fade (~20 ms) + full-ring silence fill (~272 ms) + disable/enable must
+     * all finish (confirmed by generation) before the caller opens the next
+     * track, otherwise its first PCM lands in the ring mid-flush and is
+     * dropped. The bounded, WDT-fed wait also covers a parked writer. */
+    hw_audio_flush_wait(hw_audio_flush_begin(true));  /* fade old PCM to zero */
 }
 
 /* Resample `pairs_in` stereo L/R pairs (decoder native rate) to the fixed I2S

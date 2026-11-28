@@ -258,6 +258,9 @@ static HMP3Decoder s_dec;
 static unsigned char s_readbuf[MP3_READ_CHUNK];
 static int s_bytes_left;
 static int s_consumed;
+/* LAME/Xing gapless priming to drop at the head of the next decoded frames
+ * (per-channel samples). See parse_gapless(). */
+static int s_gapless_skip;
 static int16_t s_pcm[MP3_PCM_MAX];
 EXT_RAM_BSS_ATTR static int16_t s_stereo[MP3_PCM_MAX];
 /* ID3v2 tag scratch: filled with ONE sequential fread at track open and
@@ -1068,6 +1071,89 @@ static void parse_id3v2(void)
     hw_audio_set_track_gain_db(gain);
 }
 
+/* LAME/Xing gapless priming (industry standard, same as FFmpeg's
+ * mp3dec.c: start_skip_samples = start_pad + MP3_DECODER_DELAY):
+ * an MP3 encodes 576 samples of encoder priming plus the decoder's 529-sample
+ * filter delay. Files carrying a LAME tag declare the encoder part in the
+ * 3-byte "encoder delays" field (top 12 bits); we add the decoder delay to
+ * get the exact number of leading PCM samples to drop before real audio.
+ * Without this the first ~25 ms is silence/junk — most audible on tracks
+ * whose first note starts immediately at full level. Files without a
+ * Xing/Info + LAME tag have no trustworthy value, so skip nothing. */
+#define LAME_DECODER_DELAY_SAMPLES  529
+#define LAME_MAX_START_PAD          4095
+
+static void parse_gapless(void)
+{
+    s_gapless_skip = 0;
+    long base = ftell(s_src.fp);
+    if (base < 0) {
+        return;
+    }
+    unsigned char h[4];
+    if (fread(h, 1, sizeof(h), s_src.fp) != sizeof(h) ||
+        h[0] != 0xFF || (h[1] & 0xE0) != 0xE0) {
+        fseek(s_src.fp, base, SEEK_SET);
+        return;
+    }
+    /* Side-info size after the 4-byte header: MPEG1 stereo 32/mono 17,
+     * MPEG2/2.5 stereo 17/mono 9 (FFmpeg's xing_offtbl). */
+    bool lsf = ((h[1] >> 3) & 3) != 3;
+    bool mono = ((h[3] >> 6) & 3) == 3;
+    long side = lsf ? (mono ? 9 : 17) : (mono ? 17 : 32);
+
+    unsigned char tag[4];
+    if (fseek(s_src.fp, base + 4 + side, SEEK_SET) != 0 ||
+        fread(tag, 1, sizeof(tag), s_src.fp) != sizeof(tag) ||
+        (memcmp(tag, "Xing", 4) && memcmp(tag, "Info", 4))) {
+        fseek(s_src.fp, base, SEEK_SET);
+        return;
+    }
+    unsigned char fl[4];
+    if (fread(fl, 1, sizeof(fl), s_src.fp) != sizeof(fl)) {
+        fseek(s_src.fp, base, SEEK_SET);
+        return;
+    }
+    uint32_t flags = ((uint32_t)fl[0] << 24) | ((uint32_t)fl[1] << 16) |
+                     ((uint32_t)fl[2] << 8) | (uint32_t)fl[3];
+    long off = base + 4 + side + 8;
+    if (flags & 0x01) off += 4;   /* frame count */
+    if (flags & 0x02) off += 4;   /* byte count */
+    if (flags & 0x04) off += 100; /* TOC */
+    if (flags & 0x08) off += 4;   /* VBR quality */
+
+    /* 9-byte encoder version ("LAME3.99r" here); the delay fields exist
+     * only when that starts with "LAME" (or "Lavf"/"Lavc"). */
+    unsigned char ver[9];
+    if (fseek(s_src.fp, off, SEEK_SET) != 0 ||
+        fread(ver, 1, sizeof(ver), s_src.fp) != sizeof(ver) ||
+        (memcmp(ver, "LAME", 4) && memcmp(ver, "Lavf", 4) &&
+         memcmp(ver, "Lavc", 4))) {
+        fseek(s_src.fp, base, SEEK_SET);
+        return;
+    }
+    /* revision(1) + lowpass(1) + peak(4) + radio gain(2) + audio gain(2)
+     * + encoding flags(1) + bitrate(1) = 12 bytes, then 3-byte delay. */
+    unsigned char d[3];
+    if (fseek(s_src.fp, off + 9 + 12, SEEK_SET) != 0 ||
+        fread(d, 1, sizeof(d), s_src.fp) != sizeof(d)) {
+        fseek(s_src.fp, base, SEEK_SET);
+        return;
+    }
+    uint32_t v = ((uint32_t)d[0] << 16) | ((uint32_t)d[1] << 8) | d[2];
+    int start_pad = (int)(v >> 12);
+    if (start_pad > LAME_MAX_START_PAD) {
+        ESP_LOGW(TAG, "implausible LAME start_pad %d, ignoring", start_pad);
+    }
+    else {
+        s_gapless_skip = start_pad + LAME_DECODER_DELAY_SAMPLES;
+        ESP_LOGI(TAG, "gapless: LAME start_pad=%d, skip=%d samples (%.1f ms)",
+                 start_pad, s_gapless_skip,
+                 (double)s_gapless_skip * 1000.0 / 44100.0);
+    }
+    fseek(s_src.fp, base, SEEK_SET);   /* decoder must see the 1st frame */
+}
+
 /* Forward declaration: open_track() must be able to release a previous pass. */
 static void close_track(void);
 
@@ -1105,6 +1191,7 @@ static bool open_track(void)
         return false;
     }
     parse_id3v2();   /* skip the tag past the decoder + pick up ReplayGain */
+    parse_gapless(); /* LAME priming samples to trim at the head */
     clearerr(s_src.fp);      /* drop any stale error/EOF flag from a prior file */
     s_bytes_left = 0;
     s_consumed = 0;
@@ -1176,6 +1263,7 @@ static bool rewind_track(void)
     s_dbg_frames = 0;
     clearerr(s_src.fp);      /* drop any stale error/EOF flag before replay */
     parse_id3v2();           /* re-skip the tag + pick up ReplayGain again */
+    parse_gapless();         /* re-read LAME priming for this pass */
     hw_audio_set_player_active(true); /* re-arm the pipeline */
     return true;
 }
@@ -1395,6 +1483,18 @@ static bool decode_frame(bool *rate_set)
                  (unsigned)s_dbg_frames, s_consumed, info.outputSamps);
     }
 
+    /* Trim LAME encoder priming at the head (s_gapless_skip is in
+     * per-channel samples). For stereo the decoded buffer holds interleaved
+     * L/R pairs, so drop `skip` PAIRS from the front; for mono drop `skip`
+     * samples before the L/R duplication. The remaining samples of the same
+     * frame are kept — dropping the whole frame would cut real audio. */
+    int skip = 0;
+    if (s_gapless_skip > 0 && info.nChans > 0 && info.outputSamps > 0) {
+        const int avail = info.outputSamps / info.nChans;
+        skip = (s_gapless_skip < avail) ? s_gapless_skip : avail;
+        s_gapless_skip -= skip;
+    }
+
     audio_write_result_t wr;
     if (info.nChans >= 2) {
         /* Stereo / multichannel: outputSamps is the total sample count, so the
@@ -1409,7 +1509,13 @@ static bool decode_frame(bool *rate_set)
                 frames = MP3_PCM_MAX / 2;
             }
         }
-        wr = hw_audio_write_pcm(s_pcm, frames);
+        const size_t drop = (size_t)skip;
+        if (drop >= frames) {
+            wr = AUDIO_WRITE_OK;   /* whole frame was priming */
+        }
+        else {
+            wr = hw_audio_write_pcm(s_pcm + drop * 2, frames - drop);
+        }
     }
     else if (info.nChans == 1) {
         /* Genuine mono output from the decoder: upmix to stereo by duplicating
@@ -1417,11 +1523,12 @@ static bool decode_frame(bool *rate_set)
          * mislabeled frame can never overflow s_stereo (MP3_PCM_MAX / 2 frames). */
         const int frames = (info.outputSamps < MP3_PCM_MAX / 2)
                                ? info.outputSamps : (MP3_PCM_MAX / 2);
-        for (int i = 0; i < frames; i++) {
-            s_stereo[2 * i] = s_pcm[i];
-            s_stereo[2 * i + 1] = s_pcm[i];
+        for (int i = skip; i < frames; i++) {
+            s_stereo[2 * (i - skip)] = s_pcm[i];
+            s_stereo[2 * (i - skip) + 1] = s_pcm[i];
         }
-        wr = hw_audio_write_pcm(s_stereo, (size_t)frames);
+        wr = (skip >= frames) ? AUDIO_WRITE_OK
+                              : hw_audio_write_pcm(s_stereo, (size_t)(frames - skip));
     }
     else {
         /* nChans == 0 (a malformed first frame some decoders report): there is
