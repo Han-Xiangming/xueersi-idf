@@ -1947,6 +1947,7 @@ void player_init(void)
     if (xTaskCreate(player_watch_task, "mp3_watch", 4 * 1024, NULL, 2,
                     &s_watch_task) != pdPASS) {
         ESP_LOGE(TAG, "[ERROR] player watchdog task create FAILED");
+        s_watch_task = NULL;
     }
 #if defined(CONFIG_ESP_TASK_WDT_EN)
     /* Last-resort backstop: subscribe the decode task to the TASK WDT so a
@@ -1990,6 +1991,11 @@ void player_init(void)
     player_scan_with_cache();
 }
 
+bool player_watchdog_started(void)
+{
+    return s_watch_task != NULL;
+}
+
 /* --- On-card playlist cache -------------------------------------------
  * An M3U8-style playlist file (PLAYER_CACHE_FILE):
  *     #EXTM3U
@@ -1999,15 +2005,20 @@ void player_init(void)
  *     #EXTINF:-1,<title>
  *     /sdcard/Album/b.mp3
  *     ...
+ *     ##EOF <count>
  * `#EXTM3U` is the standard M3U8 header; `#EXTINF` carries the display title
  * (we still derive the name from the path's basename at read time, so the
  * title column is informational only). `##SIG` is our own source signature —
  * a non-standard comment line that standard M3U players (VLC, etc.) ignore, so
- * the cache doubles as a PC-importable playlist. The list is already sorted at
- * write time, so loading is O(n) line reads and effectively instantaneous
- * versus the FATFS walk a real scan requires. A `##SIG` mismatch (or a missing
- * / non-M3U8 cache) makes playlist_cache_valid() false, so a card that changed
- * while powered off is transparently re-scanned on the next load. */
+ * the cache doubles as a PC-importable playlist. `##EOF` declares the entry
+ * count so a truncated file is detected instead of published as a short list.
+ * The list is already sorted at write time, so loading is O(n) line reads and
+ * effectively instantaneous versus the FATFS walk a real scan requires. A
+ * `##SIG` mismatch, bad `##EOF`, or missing / non-M3U8 cache makes
+ * playlist_cache_valid() false, so a card that changed while powered off is
+ * transparently re-scanned on the next load. Writes go to a temp file and are
+ * renamed into place only after a successful close, so power loss can leave
+ * a missing cache but never a half-written one. */
 
 /* Serialize the just-published snapshot to the cache file. Called from the
  * scan task after a real scan completes, so a re-entry reads instantly. The
@@ -2015,22 +2026,55 @@ void player_init(void)
  * next validation needs no extra state. */
 static void playlist_cache_write(const playlist_t *pl)
 {
-    FILE *f = fopen(PLAYER_CACHE_FILE, "w");
+    uint32_t sig = playlist_source_sig();
+    FILE *f = fopen(PLAYER_CACHE_TMP_FILE, "w");
     if (f == NULL) {
-        ESP_LOGW(TAG, "cache write failed (open %s)", PLAYER_CACHE_FILE);
+        ESP_LOGW(TAG, "cache write failed (open %s)", PLAYER_CACHE_TMP_FILE);
         return;
     }
-    uint32_t sig = playlist_source_sig();
-    fprintf(f, "#EXTM3U\n");
-    fprintf(f, "##SIG %08x %d\n", (unsigned int)sig, CACHE_SIG_DEPTH);
-    for (int i = 0; i < pl->count; i++) {
+
+    bool ok = true;
+    if (fprintf(f, "#EXTM3U\n") < 0) {
+        ok = false;
+    }
+    if (ok && fprintf(f, "##SIG %08x %d\n",
+                      (unsigned int)sig, CACHE_SIG_DEPTH) < 0) {
+        ok = false;
+    }
+    for (int i = 0; ok && i < pl->count; i++) {
         const playlist_entry_t *e = &pl->items[i];
         const char *b = strrchr(e->path, '/');
         const char *title = (b != NULL) ? b + 1 : e->path;
-        fprintf(f, "#EXTINF:-1,%s\n", title);
-        fprintf(f, "%s\n", e->path);
+        if (fprintf(f, "#EXTINF:-1,%s\n", title) < 0 ||
+            fprintf(f, "%s\n", e->path) < 0) {
+            ok = false;
+        }
     }
-    fclose(f);
+    if (ok && fprintf(f, "##EOF %d\n", pl->count) < 0) {
+        ok = false;
+    }
+    if (fflush(f) != 0) {
+        ok = false;
+    }
+    if (fclose(f) != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        ESP_LOGW(TAG, "cache write failed, dropping %s", PLAYER_CACHE_TMP_FILE);
+        unlink(PLAYER_CACHE_TMP_FILE);
+        return;
+    }
+
+    /* FatFs rename does not overwrite an existing target (FR_EXIST), so
+     * unlink first. Worst case is a missing cache -> full rescan, never a
+     * half-written file. */
+    unlink(PLAYER_CACHE_FILE);
+    if (rename(PLAYER_CACHE_TMP_FILE, PLAYER_CACHE_FILE) != 0) {
+        ESP_LOGW(TAG, "cache rename failed (%s -> %s), dropping tmp",
+                 PLAYER_CACHE_TMP_FILE, PLAYER_CACHE_FILE);
+        unlink(PLAYER_CACHE_TMP_FILE);
+        return;
+    }
     ESP_LOGI(TAG, "wrote %d entries (sig %08x) to cache %s",
              pl->count, (unsigned int)sig, PLAYER_CACHE_FILE);
 }
@@ -2066,6 +2110,7 @@ static int playlist_load_from_cache(playlist_t *work)
         return 0;
     }
     int n = 0;
+    int declared = -1;   /* ##EOF <count>; -1 means absent/malformed */
     bool corrupt = false;
     while (fgets(line, sizeof(line), f) != NULL) {
         size_t len = strlen(line);
@@ -2076,10 +2121,14 @@ static int playlist_load_from_cache(playlist_t *work)
             continue;
         }
         if (line[0] == '#') {   /* #EXTINF / any comment: not a path */
+            if (strncmp(line, "##EOF", 5) == 0 &&
+                sscanf(line, "##EOF %d", &declared) != 1) {
+                declared = -1;
+            }
             continue;
         }
         if (n >= PLAYER_SCAN_MAX) {
-            break;   /* cache larger than we keep: trust count, skip rest */
+            break;   /* cache larger than we keep: count check below fails */
         }
         if (len >= PLAYER_PATH_LEN) {
             corrupt = true;
@@ -2089,8 +2138,9 @@ static int playlist_load_from_cache(playlist_t *work)
         n++;
     }
     fclose(f);
-    if (corrupt) {
-        ESP_LOGW(TAG, "cache corrupt, dropping it");
+    if (corrupt || declared < 0 || declared != n) {
+        ESP_LOGW(TAG, "cache corrupt/truncated (declared=%d read=%d), dropping it",
+                 declared, n);
         unlink(PLAYER_CACHE_FILE);
         return 0;
     }

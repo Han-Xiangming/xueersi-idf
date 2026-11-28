@@ -16,6 +16,7 @@
 #include "esp_err.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -458,16 +459,12 @@ void hw_lcd_init(void)
     backlight_init();   /* default PWM at full brightness until UI overrides */
 }
 
-/* Partial-refresh draw buffers sized for LCD_DRAW_BUF_LINES lines. Prefer
- * external PSRAM (DMA-capable); fall back to the internal DMA pool if PSRAM
- * is not present. */
+/* Partial-refresh draw buffers sized for LCD_DRAW_BUF_LINES lines. ESP32 SPI
+ * DMA cannot reach PSRAM, so use ESP-IDF's official helper: it allocates
+ * DMA-capable internal memory and handles cache/alignment requirements. */
 static void *alloc_draw_buf(size_t sz)
 {
-    void *p = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
-    if (p == NULL) {
-        p = spi_bus_dma_memory_alloc(LCD_HOST, sz, 0);
-    }
-    return p;
+    return spi_bus_dma_memory_alloc(LCD_HOST, sz, 0);
 }
 
 lv_display_t *hw_lcd_create_display(void)
@@ -478,15 +475,21 @@ lv_display_t *hw_lcd_create_display(void)
     const lv_color_format_t color_format = LV_COLOR_FORMAT_RGB565_SWAPPED;
     const uint32_t stride = lv_draw_buf_width_to_stride(LCD_H_RES, color_format);
     const size_t draw_buffer_sz = stride * LCD_DRAW_BUF_LINES;
-    /* Partial rendering: the draw buffers cover only LCD_DRAW_BUF_LINES lines,
-     * so LVGL refreshes just the dirty area of the panel. Allocate from
-     * external PSRAM (DMA-capable) first; fall back to the internal DMA pool
-     * if PSRAM is unavailable. Using only spi_bus_dma_memory_alloc() draws
-     * from the very small internal DMA pool and allocations fail on boot. */
+    /* Partial rendering: buf1 covers LCD_DRAW_BUF_LINES lines so LVGL refreshes
+     * only dirty regions. buf2 is optional in LVGL; if the internal DMA pool is
+     * too fragmented for a second buffer, drop to single-buffer mode instead
+     * of asserting. */
     void *buf1 = alloc_draw_buf(draw_buffer_sz);
-    void *buf2 = alloc_draw_buf(draw_buffer_sz);
-    assert(buf1);
-    assert(buf2);
+    void *buf2 = (buf1 != NULL) ? alloc_draw_buf(draw_buffer_sz) : NULL;
+    if (buf1 == NULL) {
+        ESP_LOGE(TAG, "no DMA-capable LVGL draw buffer (%u bytes); restart",
+                 (unsigned)draw_buffer_sz);
+        esp_restart();
+        return NULL;
+    }
+    if (buf2 == NULL) {
+        ESP_LOGW(TAG, "second LVGL draw buffer unavailable; using single-buffer mode");
+    }
 
     lv_display_set_color_format(display, color_format);
     lv_display_set_dpi(display, LCD_DPI);
@@ -500,11 +503,11 @@ lv_display_t *hw_lcd_create_display(void)
     ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(s_lcd_io_handle, &callbacks, display));
 
     ESP_LOGI(TAG,
-             "LVGL display: %dx%d, dpi=%d, %d partial-refresh DMA buffers of %d lines, SPI=%d MHz",
+             "LVGL display: %dx%d, dpi=%d, %d partial-refresh DMA buffer(s) of %d lines, SPI=%d MHz",
              LCD_H_RES,
              LCD_V_RES,
              LCD_DPI,
-             LCD_DRAW_BUF_COUNT,
+             buf2 != NULL ? 2 : 1,
              LCD_DRAW_BUF_LINES,
              LCD_PIXEL_CLOCK_HZ / 1000000);
 

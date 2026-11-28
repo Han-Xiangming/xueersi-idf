@@ -302,11 +302,6 @@ void app_main(void)
     ESP_LOGW(TAG, "[BOOT] reset reason: %s (%d)",
              reset_reason_name(rr), (int)rr);
 
-    /* Arm the last-resort RTC watchdog before anything that can stall the
-     * CPU (see rtc_wdt_arm above). Fed every 2 s by the player watchdog
-     * task once it starts. */
-    rtc_wdt_arm();
-
     /* Bluedroid L2CAP floods "is_cong_cback_context" errors while the sink
      * is congested (known stack issue, espressif/esp-idf#7923, still present
      * in 5.5.4): every send attempt during the congestion callback logs one
@@ -342,6 +337,15 @@ void app_main(void)
     hw_sd_set_pre_unmount_cb(xiaomiao_sd_pre_unmount);
     hw_sd_try_mount();
     player_init();
+    /* Per ESP-IDF's watchdog guide, RTC_WDT must be explicitly fed or disabled
+     * once kept enabled. Arm it only after its single feeder (mp3_watch) exists;
+     * otherwise we would reboot every 30 s with no way to feed it. */
+    if (player_watchdog_started()) {
+        rtc_wdt_arm();
+    } else {
+        rtc_wdt_disable();
+        ESP_LOGE(TAG, "[BOOT] mp3_watch missing; RTC WDT left disabled");
+    }
     ebook_init();
 
     lv_init();

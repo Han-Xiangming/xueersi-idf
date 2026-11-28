@@ -22,16 +22,15 @@
 /* Partial-refresh draw buffers: 20 of 240 lines
  * so LVGL renders and flushes only dirty regions instead of the whole panel.
  * Two buffers let LVGL render the next chunk while the previous one is being
- * flushed over SPI.
+ * flushed over SPI; if the internal DMA pool cannot fit the second buffer,
+ * the driver drops to LVGL's single-buffer mode (buf2 = NULL).
  *
- * These buffers cannot live in PSRAM: ESP32's SPI DMA cannot reach it, and
- * heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA) never matches a
- * PSRAM heap (its caps carry MALLOC_CAP_SPIRAM|MALLOC_CAP_DEFAULT but no
- * MALLOC_CAP_DMA), so alloc_draw_buf() always lands on the internal DMA pool.
- * That pool is the same one the SD card and the BT controller need, and it is
- * small: 40 lines cost 2 x 320 x 40 x 2 = 51.2 KB of the ~300 KB of internal
- * DRAM, which is what starved MALLOC_CAP_DMA once A2DP came up. 20 lines
- * (2 x 12.8 KB) still keeps render/flush overlapped while handing back
+ * These buffers must live in DMA-capable internal RAM: ESP32 SPI DMA cannot
+ * reach PSRAM. lcd.c uses ESP-IDF's spi_bus_dma_memory_alloc(), which handles
+ * cache and alignment; no SPIRAM|DMA allocation is attempted. That pool is
+ * shared with SD and BT and is small: 40 lines cost 2 x 320 x 40 x 2 = 51.2 KB
+ * of the ~300 KB of internal DRAM, which starved MALLOC_CAP_DMA once A2DP came
+ * up. 20 lines (2 x 12.8 KB) keeps render/flush overlapped while handing back
  * 25.6 KB; a full 320x240 flush is ~20 ms over SPI at 60 MHz either way. */
 #define LCD_DRAW_BUF_LINES      20
 #define LCD_DRAW_BUF_COUNT      2

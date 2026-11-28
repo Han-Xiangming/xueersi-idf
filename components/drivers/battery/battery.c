@@ -256,7 +256,11 @@ static void battery_sample_int(bool forced)
     /* Load compensation: the pack sags under speaker load, so add an offset
      * that scales with the current volume (proxy for load current). Only
      * meaningful while playing; when idle the rested voltage is already
-     * correct. */
+     * correct. TI's gauge guidance rates plain voltage-lookup SOC as the least
+     * accurate method, suitable only for very light loads; with no current
+     * sense on this board, volume is the available IR-drop proxy and the
+     * display hold below is the pragmatic fallback. See
+     * https://e2echina.ti.com/blogs_/b/power_house/posts/52622 */
     const bool playing = hw_audio_is_playing();
     if (playing) {
         const float comp_mv = (float)s_load_comp_mv *
@@ -312,7 +316,11 @@ bool hw_battery_get_freeze_while_playing(void)
 static void battery_timer_cb(TimerHandle_t timer)
 {
     (void)timer;
-    hw_battery_sample();
+    /* Non-forced: keep the raw ADC/window fresh while allowing the display
+     * hold during playback. hw_battery_sample() is forced=true for UI calls;
+     * using it here would bypass the freeze guard and reintroduce load-sag
+     * drift in the gauge. */
+    battery_sample_int(false);
 }
 
 void hw_battery_init(void)

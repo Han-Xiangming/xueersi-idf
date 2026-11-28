@@ -35,15 +35,20 @@
  *     #EXTINF:-1,<title>
  *     /sdcard/Album/a.mp3
  *     ...
+ *     ##EOF <count>             (declared entry count; catches truncated files)
  * `#EXTM3U` is the standard M3U8 header; `#EXTINF` carries the display title
  * (the name is still derived from the path's basename at read time, so the
  * title column is informational only). `##SIG` is our own source signature —
  * a non-standard comment line standard M3U players (VLC, etc.) ignore. `path`
  * is the absolute path; the source is implicitly PL_SRC_FOLDER (the only one
  * implemented today). A file that cannot be parsed (bad header, sig mismatch,
- * corrupt line) invalidates the whole cache, so a broken file never freezes
- * the UI into a broken state — we just fall back to a real scan. */
+ * corrupt line, missing/mismatched `##EOF`) invalidates the whole cache, so a
+ * broken file never freezes the UI into a broken state — we just fall back to
+ * a real scan. Writes go to PLAYER_CACHE_TMP_FILE first and are renamed over
+ * the final cache only after a successful close: a power loss can leave a
+ * missing cache (full rescan) but never a half-written one. */
 #define PLAYER_CACHE_FILE "/sdcard/.xueersi_playlist.cache"
+#define PLAYER_CACHE_TMP_FILE "/sdcard/.xueersi_playlist.cache.tmp"
 
 /* Max length of a fully-qualified track path anywhere on the SD card.
  * A FATFS path is at most 80 bytes by spec, but long-file-name leaf names can
@@ -61,6 +66,11 @@ typedef enum {
 /* Create the player task, the background scan task and the stall watchdog
  * task. Call once at startup. */
 void player_init(void);
+
+/* True once the stall watchdog task exists. app_main uses this to decide
+ * whether the last-resort RTC watchdog can be armed: without its feeder,
+ * arming would just reboot the device every 30 s. */
+bool player_watchdog_started(void);
 
 /* --- Playback errors ---------------------------------------------------
  * The player reports WHY a track/playback failed instead of failing silent.

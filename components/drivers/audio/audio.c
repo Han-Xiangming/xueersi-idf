@@ -1592,10 +1592,12 @@ void hw_audio_set_sample_rate(uint32_t sample_rate_hz)
     s_resamp = speex_resampler_init(2, sample_rate_hz, s_rate,
                                     RESAMP_QUALITY, &err);
     if (err != 0 || s_resamp == NULL) {
-        ESP_LOGE(TAG, "speex resampler init failed (rate %u, err %d)",
-                 (unsigned)sample_rate_hz, err);
-        s_resamp = NULL;
-        s_resamp_active = false;   /* fallback: bypass (wrong pitch, no crash) */
+        /* Speex may return a partially built state with err != 0. Destroy it
+         * through resamp_free() instead of dropping the pointer on the floor,
+         * so repeated rate switches cannot leak resampler states. */
+        ESP_LOGE(TAG, "speex resampler init failed (rate %u, err %d: %s)",
+                 (unsigned)sample_rate_hz, err, speex_resampler_strerror(err));
+        resamp_free();             /* fallback: bypass (wrong pitch, no crash) */
         return;
     }
     speex_resampler_skip_zeros(s_resamp);   /* drop startup latency padding */
