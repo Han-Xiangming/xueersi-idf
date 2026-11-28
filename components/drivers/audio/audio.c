@@ -56,13 +56,39 @@ static const char *TAG = "hw_audio";
  * stereo) = 48 KB of buffering (~280 ms at 44.1 kHz). */
 #define I2S_DMA_DESC_NUM    12
 
-/* Seam re-arm silence prime. Flooding the whole 48 KB ring synchronously in
- * the writer task held it ~280 ms — past the 16 KB / ~93 ms PCM ring slack —
- * so the decoder's xRingbufferSend() timed out and dropped PCM ("PCM ring
- * full: N bytes dropped") at every track seam. disable+enable already
- * re-initialises the i2s_std descriptor queue, so 2 KB (~12 ms) suffices to
- * flush stale samples ahead of the DMA pointer. */
+/* Short silence prime AFTER re-enabling the channel. The full 48 KB descriptor
+ * overwrite happens BEFORE disable() inside i2s_seam_rearm(); this 2 KB prime
+ * (~12 ms) only keeps the freshly re-armed out-link fed while the first new
+ * PCM chunk is prepared. It is deliberately NOT a substitute for the full
+ * overwrite: ESP-IDF documents that disable() does not flush the TX descriptor
+ * queue, so a re-arm without the preceding full-ring silence replays the
+ * previous track's stale descriptors ("上一首残音"). */
 #define SEAM_SILENCE_PRIME_BYTES (2U * 1024U)
+
+/* Track-switch fade-out: 20 ms cosine ramp over the previous track's PCM still
+ * queued in the ring when a hard switch is requested. The seam still needs a
+ * full 48 KB silence overwrite (see i2s_seam_rearm), so without a ramp the cut
+ * to silence is a hard waveform jump = click. Industry practice is 10-50 ms
+ * with a cosine (gentler than linear near the top) envelope; 20 ms / 64-step
+ * Q15 table keeps it integer-only and cheap in the DMA writer task. */
+#define FADE_OUT_MS          20
+#define FADE_OUT_STEPS       64
+#define FADE_OUT_FRAMES      ((AUDIO_DEFAULT_RATE * FADE_OUT_MS) / 1000)
+static const int16_t s_fade_cos_q15[FADE_OUT_STEPS + 1] = {
+    32767, 32757, 32728, 32678, 32609, 32521, 32412, 32285,
+    32137, 31971, 31785, 31580, 31356, 31113, 30852, 30571,
+    30273, 29956, 29621, 29268, 28898, 28510, 28105, 27683,
+    27245, 26790, 26319, 25832, 25329, 24811, 24279, 23731,
+    23170, 22594, 22005, 21403, 20787, 20159, 19519, 18868,
+    18204, 17530, 16846, 16151, 15446, 14732, 14010, 13279,
+    12539, 11793, 11039, 10278,  9512,  8739,  7962,  7179,
+     6393,  5602,  4808,  4011,  3212,  2410,  1608,   804,
+        0
+};
+
+/* Set by hw_audio_pipeline_switch(): the writer fades the queued old-track PCM
+ * to zero before dropping the rest and re-arming. */
+static bool s_flush_fadeout;
 
 /* Time for the DMA to flush its in-flight descriptors (~48 KB at 44.1 kHz
  * stereo ≈ 280 ms) after the PCM ring has drained. The writer waits this out
@@ -967,22 +993,36 @@ static bool i2s_write_bounded(const void *data, size_t len)
     return false;
 }
 
-/* Seam re-arm: the TX out-link STOPS whenever the PCM ring drains (auto_clear
- * only zeroes sent descriptors, it does NOT loop the DMA). The old "flood
- * silence" re-arm is unreliable on this i2s_std build — i2s_channel_write() can
- * return OK yet the DMA never re-picks the out-link, leaving the next track
- * silent (the documented "second song dead" failure). A disable+enable
- * cleanly re-initialises the descriptor queue: this is the standard i2s_std
- * restart path, and the architecture comment's "enable() doesn't refill the
- * credit queue" caveat applied to the OLD ADF I2S driver, NOT the current
- * i2s_std one. Only a SHORT silence prime follows (see
- * SEAM_SILENCE_PRIME_BYTES): disable+enable resets the descriptor queue, so a
- * full-ring flood is unnecessary and — by stalling the writer past the PCM
- * ring's slack — caused the track-seam dropout. */
+/* Seam re-arm: overwrite the whole TX descriptor ring with silence WHILE the
+ * channel is still ENABLED, then disable+enable to restart the out-link, then
+ * a short silence prime. Order matters: ESP-IDF documents i2s_channel_disable()
+ * as only stopping BCLK/WS — it does NOT flush the TX descriptor queue. With
+ * the old order (disable+enable first, then a 2 KB prime) the re-enabled DMA
+ * replayed stale descriptors still holding the previous track's PCM — exactly
+ * the reported "上一首残音". Writing a full ring of silence up front makes
+ * every descriptor silent before the re-arm can replay them.
+ *
+ * The disable+enable itself stays: on this i2s_std build a drain-only seam
+ * left the next track silent ("second song dead"), and the ADF driver's
+ * "enable() doesn't refill the credit queue" caveat does not apply here.
+ * The full overwrite costs ~280 ms of writer time, so both synchronous flush
+ * callers wait long enough (400 ms) before the decode loop starts writing the
+ * new track — that is what keeps the PCM ring from overflowing at the seam. */
 static void i2s_seam_rearm(void)
 {
     if (s_i2s_chan == NULL || s_i2s_disabled) {
         return;
+    }
+    /* Silence EVERY descriptor before disable(): a re-arm only replays what is
+     * already in the ring, so any descriptor skipped here comes back as the
+     * previous track's tail. */
+    size_t overwritten = 0;
+    const size_t ring_bytes = I2S_DMA_DESC_NUM * 1024U * 4U;
+    while (overwritten < ring_bytes) {
+        if (!i2s_write_bounded(s_seam_silence, sizeof(s_seam_silence))) {
+            break;   /* stalled link: cannot guarantee a clean seam */
+        }
+        overwritten += sizeof(s_seam_silence);
     }
     esp_err_t rc = i2s_channel_disable(s_i2s_chan);
     if (rc != ESP_OK) {
@@ -1000,8 +1040,8 @@ static void i2s_seam_rearm(void)
         }
         filled += sizeof(s_seam_silence);
     }
-    ESP_LOGW(TAG, "[AUDIO] seam re-arm: channel reset + %u B silence prime",
-             (unsigned)filled);
+    ESP_LOGW(TAG, "[AUDIO] seam re-arm: overwrite %u B + reset + %u B prime",
+             (unsigned)overwritten, (unsigned)filled);
 }
 
 /* Create the I2S output with ESP-IDF's i2s_std — no ADF. Codec-less: the
@@ -1024,9 +1064,49 @@ static void i2s_writer_task(void *arg)
     static int64_t  s_underrun_log_us = 0;
     for (;;) {
         if (s_flush_req) {
-            /* Drop the queued PCM so the next track starts clean. The channel is
-             * deliberately NOT disabled/re-enabled here (see the note below): the
-             * DMA queue self-clears via auto_clear + the silence fill. */
+            /* Hard switch: fade the queued previous-track PCM to zero on its
+             * way to the DMA, so the cut into the mandatory silence gap is a
+             * smooth ramp instead of a jump (anti-click, see FADE_OUT_MS).
+             * Chunk to one DMA descriptor so i2s_write_bounded cannot time out;
+             * frames past the 20 ms window get gain 0 = digital silence. */
+            if (s_flush_fadeout) {
+                size_t fade_frames = 0;
+                while (fade_frames < FADE_OUT_FRAMES) {
+                    size_t f_len = 0;
+                    uint8_t *f_it = (uint8_t *)xRingbufferReceiveUpTo(
+                                        s_pcm_rb, &f_len, 0, PCM_WRITER_CHUNK_MAX);
+                    if (f_it == NULL) {
+                        break;
+                    }
+                    taskENTER_CRITICAL(&s_ring_lock);
+                    if (f_len <= s_ring_bytes) {
+                        s_ring_bytes -= f_len;
+                    } else {
+                        s_ring_bytes = 0;
+                    }
+                    taskEXIT_CRITICAL(&s_ring_lock);
+                    int16_t *p = (int16_t *)f_it;
+                    size_t n = f_len / 2;   /* int16 samples = 2 bytes each */
+                    size_t keep = (FADE_OUT_FRAMES - fade_frames) * 2;
+                    if (keep < n) {
+                        n = keep;   /* rest of this item is dropped below */
+                    }
+                    for (size_t k = 0; k < n; k++) {
+                        size_t fr = fade_frames + k / 2;   /* L/R share a frame */
+                        int32_t g = s_fade_cos_q15[(fr * FADE_OUT_STEPS) / FADE_OUT_FRAMES];
+                        p[k] = (int16_t)(((int32_t)p[k] * g) >> 15);
+                    }
+                    fade_frames += n / 2;
+                    i2s_write_bounded(f_it, n * 2);   /* write only the faded part */
+                    vRingbufferReturnItem(s_pcm_rb, f_it);
+                }
+                ESP_LOGW(TAG, "[AUDIO] seam fade-out: %u frames ramped to zero",
+                         (unsigned)fade_frames);
+            }
+            /* Drop anything the fade did not consume so the next track starts
+             * clean. The channel is deliberately NOT disabled/re-enabled here
+             * (see the note below); the DMA queue self-clears via auto_clear
+             * plus the silence fill. */
             uint8_t *it; size_t len;
             while ((it = (uint8_t *)xRingbufferReceive(s_pcm_rb, &len, 0)) != NULL) {
                 vRingbufferReturnItem(s_pcm_rb, it);
@@ -1051,16 +1131,15 @@ static void i2s_writer_task(void *arg)
                  * out-link so the next track's PCM is actually picked up. */
                 i2s_seam_rearm();
             }
-            /* i2s_seam_rearm() above DOES a disable()+enable() — this is now the
-             * intended seam re-arm, not the avoided path. On the i2s_std driver
-             * (used here) disable+enable correctly re-initialises the TX
-             * descriptor queue and restarts the DMA, whereas the old ADF
-             * driver's "enable() doesn't refill the credit queue" wedge no
-             * longer applies. The previous attempt (flood silence while
-             * ENABLED) left the second track dead on this build, so we now
-             * reset. See i2s_seam_rearm() for details. */
+            /* i2s_seam_rearm() first floods the ENABLED ring with silence (so
+             * no stale descriptor survives) and then does disable()+enable()
+             * to restart the out-link (a drain-only seam left track2 dead on
+             * this build). Both are required: ESP-IDF documents disable() as
+             * only stopping BCLK/WS, so a re-arm alone replays old PCM. See
+             * i2s_seam_rearm() for details. */
             s_flush_req = false;
             s_flush_fill = false;
+            s_flush_fadeout = false;
             int64_t flush_done_us = esp_timer_get_time();
             int64_t last_dma_us;
             taskENTER_CRITICAL(&s_ring_lock);
@@ -1643,9 +1722,13 @@ void hw_audio_pipeline_flush(void)
      * re-armed the DMA. A mere flag + notify is not enough — the caller
      * (decode loop) then immediately opens a NEW track and writes its first
      * PCM; without waiting, that first chunk could land in the ring and be
-     * discarded by the still-pending flush, cutting the new song's head. The
-     * wait is bounded (100 ms) so a wedged writer can never deadlock the
-     * caller. */
+     * discarded by the still-pending flush, cutting the new song's head.
+     * With the full 48 KB silence overwrite back in place the writer is busy
+     * ~280 ms at the seam, so this wait must match hw_audio_pipeline_switch()'s
+     * 400 ms: a shorter wait lets the decode loop start the new track while
+     * the writer is still feeding silence, overflowing the PCM ring and
+     * dropping the new song's first samples (commit 9db3895). Still bounded
+     * (400 ms) so a wedged writer can never deadlock the caller. */
     if (s_i2s_task == NULL) {
         return;   /* no writer to flush (init failed / not yet up) */
     }
@@ -1653,7 +1736,7 @@ void hw_audio_pipeline_flush(void)
     s_flush_req = true;
     xTaskNotifyGive(s_i2s_task);   /* wake the writer if it is parked */
     if (s_flush_done != NULL) {
-        xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(100));
+        xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(400));
     }
 }
 
@@ -1672,12 +1755,14 @@ void hw_audio_pipeline_switch(void)
         return;   /* no writer to flush (init failed / not yet up) */
     }
     s_flush_fill = true;
+    s_flush_fadeout = true;   /* fade queued old PCM to zero before the seam */
     s_flush_req = true;
     xTaskNotifyGive(s_i2s_task);   /* wake the writer if it is parked */
     if (s_flush_done != NULL) {
-        /* A full-ring silence fill takes ~272 ms of real playback time, so the
-         * wait must clear that (plus the disable/enable) or the caller can start
-         * the next track before the previous one's descriptors are overwritten. */
+        /* Fade (~20 ms of queued PCM) + full-ring silence fill (~272 ms) +
+         * disable/enable must all finish before the caller opens the next
+         * track, otherwise its first PCM lands in the ring mid-flush and is
+         * dropped. 400 ms covers all three. */
         xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(400));
     }
 }
