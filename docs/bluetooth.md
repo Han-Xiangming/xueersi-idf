@@ -5,10 +5,11 @@
 ## 1. 角色与架构
 
 ```text
-掌机（A2DP Source / AVRCP Target，设备名 "Xiaomao MP3"）
+掌机（A2DP Source / AVRCP TG + CT，设备名 "Xiaomao MP3"）
   │
-  ├─ A2DP：解码 PCM（路由自 audio.c）→ 内部重采样 → SBC（Bluedroid 编码，bitpool 上限 33）→ 蓝牙耳机/音箱
-  └─ AVRCP：耳机媒体键（播放/暂停/上/下曲）+ 绝对音量 → 本地回调
+  ├─ A2DP：解码 PCM（路由自 audio.c）→ 内部重采样 → SBC（Bluedroid 编码，bitpool 预设 33/45/53）→ 蓝牙耳机/音箱
+  ├─ AVRCP TG：耳机媒体键（播放/暂停/上/下曲）+ 绝对音量 → 本地回调
+  └─ AVRCP CT：本机 BT 音量 0..127 → SetAbsoluteVolume 推送 sink（双向镜像）
 
 PCM 环形缓冲 128KB（bluetooth_audio_init 分配，优先 PSRAM；~740ms @44.1kHz 立体声）
 ```
@@ -16,7 +17,7 @@ PCM 环形缓冲 128KB（bluetooth_audio_init 分配，优先 PSRAM；~740ms @44
 - 目标 ESP-IDF v6.1（正式版，IDF 路径 `D:\esp\v6.1\esp-idf`），`CONFIG_BT_ENABLED` + `CONFIG_BT_A2DP_ENABLE`。
 - 所有入口在蓝牙被裁剪时均为安全 no-op。
 - **懒启动**：`bluetooth_audio_init()` 只分配环形缓冲，不碰控制器；`bluetooth_audio_enable()`（进入蓝牙页时调用）才拉起控制器 + Bluedroid + A2DP Source，避免开机即广播 A2DP。
-- 只启用 BR/EDR（A2DP 不需要 BLE），启动时释放 BLE 内存；本机设为**可连接但不可发现**（源角色向外拨号）。
+- 只启用 BR/EDR（A2DP 不需要 BLE），启动时释放 BLE 内存；本机**默认不可连接也不可发现**，仅在用户拨号期间短暂开窗，拨号结果落地（连上/失败/掉线）立即关闭（见 §3）。
 
 ## 2. 生命周期
 
@@ -28,12 +29,12 @@ PCM 环形缓冲 128KB（bluetooth_audio_init 分配，优先 PSRAM；~740ms @44
 | `bluetooth_audio_set_enabled(bool)` / `bluetooth_audio_is_enabled()` | 开关/查询解码 PCM → 蓝牙路由；关闭时中止自动重试并断开当前连接 |
 | `bluetooth_audio_is_connected()` | A2DP 已连接 |
 
-- **拆栈安全性**：`bluetooth_audio_disable()` 在有连接/扫描/配对进行时把真实 teardown 延迟到 FreeRTOS Timer 任务（`bluetooth_audio_teardown`）：先 SUSPEND 媒体流 + 断开链路，再以 50ms 轮询（上限 1s）等链路/查询/配对全部静止，之后才 `esp_avrc_tg_deinit → esp_a2d_source_deinit → bluedroid → controller`（顺序固定：AVRC 必须先于 A2DP 拆）；另有 4s 安全兜底，确保断开事件丢失时也不会卡死在半禁用状态。拆栈期间 `s_tx_stopped` 冻结 PCM 喂送，防止向半释放的栈推 SBC 导致 BTC 任务崩溃。
+- **拆栈安全性**：`bluetooth_audio_disable()` 在有连接/扫描/配对进行时把真实 teardown 延迟到 FreeRTOS Timer 任务（`bluetooth_audio_teardown`）：先 SUSPEND 媒体流 + 断开链路，再以 50ms 轮询（上限 **3s**，`BT_TD_MAX_RECHECK=60`）等链路/查询/配对全部静止；链路卡住或 `esp_bluedroid_disable()` 非 OK 时不强拆，而是 `xTimerPendFunctionCall` 延迟 **500ms** 重新排队 teardown。正常路径才按 `esp_avrc_tg_deinit → esp_avrc_ct_deinit → esp_a2d_source_deinit → bluedroid → controller` 顺序拆（AVRC 必须先于 A2DP）；另有 4s 安全兜底，确保断开事件丢失时也不会卡死在半禁用状态。拆栈期间 `s_tx_stopped` 冻结 PCM 喂送，防止向半释放的栈推 SBC 导致 BTC 任务崩溃。
 
 ## 3. 设备发现与连接（驱动蓝牙 UI 页）
 
 ```text
-bluetooth_audio_scan_start()     清空列表 + GAP inquiry（发现音频 sink，12.8s）
+bluetooth_audio_scan_start()     清空列表 + GAP inquiry（发现周边设备，12.8s）
 bluetooth_audio_is_scanning()    扫描中
 bluetooth_audio_device_count()   已发现设备数（扫描期间增长，最多 8 台）
 bluetooth_audio_device_version() 列表变更计数（UI 只在递增时重格式化）
@@ -64,16 +65,18 @@ bluetooth_audio_set_sample_rate(hz)    A2DP/SBC 恒 44.1kHz，其它采样率内
   - 蓝牙页的蓝牙总开关只改 `s_enabled` / 拆栈，**不切路由**（连接（用户操作）才触发路由切换，见 `docs/audio.md` §1）。
 - 数据回调 `a2d_data_cb`：栈按 44.1kHz 拉取；欠载时补静音保证流不断；teardown 期间返回 0 让 Bluedroid 自行静音填充。
 
-## 5. AVRCP 远端控制（TG 角色）
+## 5. AVRCP 远端控制（TG + CT 双向）
 
-Bluedroid 自动 ACK passthrough / 绝对音量，本模块只翻译成回调（仅响应按键 PRESSED 状态，忽略 RELEASE）：
+Bluedroid 自动 ACK passthrough / 绝对音量，本模块负责过滤/翻译与镜像（媒体键仅响应 PRESSED，忽略 RELEASE）：
 
 ```c
-bluetooth_audio_set_avrc_cmd_cb(cb);      /* BT_AVRC_CMD_PLAY/PAUSE/STOP/NEXT/PREV */
-bluetooth_audio_set_avrc_volume_cb(cb);   /* 绝对音量 0..127，应用侧按满刻度写蓝牙音量槽位 */
+bluetooth_audio_set_avrc_cmd_cb(cb);        /* BT_AVRC_CMD_PLAY/PAUSE/STOP/NEXT/PREV */
+bluetooth_audio_set_avrc_volume_cb(cb);     /* 入站绝对音量 0..127 → 蓝牙音量槽位 */
+bluetooth_audio_set_avrc_sync_vol_cb(cb);   /* 本机音量快照 → 出站镜像 */
 ```
 
-- 音量映射：AVRCP 满刻度 0..127 → `hw_audio_set_avrc_volume()` 按满刻度查蓝牙路由 0.1dB 表（每步 ≈ 0.09dB，满量程 12dB），写蓝牙槽位并更新百分比视图；本地按键步进同为 1dB（见 `docs/audio.md` §2）。
+- **入站（TG）**：音量映射 0..127 → `hw_audio_set_avrc_volume()` 按满刻度查蓝牙路由 0.1dB 表（每步 ≈ 0.09dB，满量程 12dB），写蓝牙槽位并更新百分比视图；扬声器路由下只存槽位、不劫持输出也不回显。
+- **出站（CT）**：`bluetooth_audio_set_sink_volume(pct)` 把本机蓝牙音量按 `pct×127/100` 四舍五入后通过 `esp_avrc_ct_send_set_absolute_volume_cmd()` 推给 sink；CT 建链或 A2DP 连接时推当前快照，断链重置去重状态。sink 不支持绝对音量时只告警并以本机增益为准。`main.c` 注册 `*_set_avrc_sync_vol_cb()` + `hw_audio_set_bt_volume_change_cb()` 完成双向镜像，入站音量不再回传，避免环路。本地按键步进同为 1dB（见 `docs/audio.md` §2）。
 - TG 初始化后必须调用 `esp_avrc_tg_set_psth_cmd_filter()` 声明支持的媒体键（PLAY/PAUSE/STOP/FORWARD/BACKWARD/FAST_FORWARD/REWIND）。Bluedroid 默认对所有 passthrough 回复 `NOT IMPLEMENTED`，不设置过滤器时 `ESP_AVRC_TG_PASSTHROUGH_CMD_EVT` 根本不会到达应用回调，表现为遥控器按键完全无反应。
 - main.c 回调：PLAY 仅当**已暂停**时恢复；PAUSE 仅当**播放中**时暂停；STOP 停止；NEXT/PREV 投递到队列，由 LVGL 任务调用 `player_next()/player_prev()` 切歌（空闲时忽略），避免在 BT 任务里直接改播放器索引状态。
 

@@ -23,24 +23,18 @@
 
 ### 1.1 从源码构建
 
-需要 ESP-IDF v6.1（正式版，已验证）。
+需要 ESP-IDF v6.1（正式版，已验证）。本机开发请统一使用仓库根目录的 `dev.ps1`：它会定位/再生成本机 IDF activate 脚本并设置 `IDF_TOOLS_PATH`，避免手工 export 造成工具链路径不一致。
 
-```bash
-# 在 ESP-IDF 环境下
-idf.py set-target esp32
-idf.py build
-idf.py -p (PORT) flash monitor
+```powershell
+.\dev.ps1 build                          # 编译
+.\dev.ps1 build+flash                    # 编译并烧录（自动探测串口）
+.\dev.ps1 monitor                        # 串口监视（Ctrl+] 退出）
+.\dev.ps1 build+flash+monitor -p COM3    # 指定串口
+.\dev.ps1 menuconfig                     # 配置
+.\dev.ps1 size / clean / reconfigure     # 体积 / 清理 / 重新 cmake
 ```
 
-Windows 下可直接用仓库自带的 `dev.bat` / `dev.ps1`（自动激活本机 IDF 工具链）：
-
-```bat
-dev build      :: 编译
-dev flash      :: 编译并烧录（自动探测串口）
-dev monitor    :: 串口监视
-dev menuconfig :: 配置
-dev clean      :: 清理
-```
+`flash` 动作只烧录不编译，请用 `build+flash`。通用 ESP-IDF 环境（已正确 export 且与本机工具链一致）下也可直接 `idf.py build` / `idf.py -p (PORT) flash monitor`；`dev.bat` 仅作为旧入口保留。
 
 关键默认配置位于 `sdkconfig.defaults`：
 
@@ -60,10 +54,10 @@ dev clean      :: 清理
 ## 2. 功能总览
 
 - 固件用 LVGL 9.5 驱动 ST7789 显示屏，提供分页 UI：播放器 / 电子书 / 蓝牙 / 设置。蓝牙为独立顶级页，进入后才懒加载启动协议栈（见 5.2）。
-- 显示：ST7789（旋转 90° 后逻辑分辨率 320×240，实际面板为 240×320 原生），SPI2 最高 60 MHz；采用部分刷新 + 双 DMA 缓冲（每屏只重绘脏区）。由于屏幕 TE 引脚未接 MCU，无法做垂直同步，但双缓冲部分刷新已规避明显撕裂。
-- 背光由 GPIO14 的 LEDC PWM 驱动（5 kHz，10 位分辨率），可在设置页调节亮度（0..100%）。
+- 显示：ST7789（旋转 90° 后逻辑分辨率 320×240，实际面板为 240×320 原生），SPI2 最高 60 MHz；采用部分刷新 + 双 DMA 绘制缓冲（buf2 分配失败时降级单缓冲），按 4 行窗口批量提交 SPI 事务，每屏只重绘脏区。由于屏幕 TE 引脚未接 MCU，无法做垂直同步，但部分刷新已规避明显撕裂。
+- 背光由 GPIO14 的 LEDC PWM 驱动（5 kHz，10 位分辨率），可在设置页调节亮度（0..100%，gamma 2.2 曲线）。
 - 自动息屏：设置页可选空闲超时（永不 / 15 秒 / 30 秒 / 60 秒 / 2 分钟 / 5 分钟，默认 30 秒）；超时后关闭背光并让 ST7789 进入 DISPOFF 省电，任意按键即时唤醒恢复亮度。
-- 已接入功能：按键（6 键）、MicroSD（SDSPI）、I2S 音频（MAX98357 Class-D DAC）、MP3 播放（libhelix-mp3 解码 + ReplayGain 2.0 响度归一 + 曲库缓存）、蓝牙 A2DP 音频输出（SOURCE 角色）、TXT 电子书阅读、单节锂电电量检测。
+- 已接入功能：按键（9 键）、MicroSD（SDSPI，热插拔探活）、I2S 音频（MAX98357 Class-D DAC）、MP3 播放（libhelix-mp3 解码 + LAME/Xing gapless + ReplayGain 2.0 响度归一 + 曲库缓存）、蓝牙 A2DP 音频输出（SOURCE 角色，AVRCP TG+CT 双向音量）、TXT 电子书阅读、单节锂电电量检测。
 - 蓝牙在用户打开蓝牙页时才懒加载启动（开机不广播），关掉蓝牙开关时彻底断电。蓝牙输出为显式路由切换，不会因蓝牙连接上来而静默抢占本地扬声器。
 - 启动器（Launcher）为 3×2 图标网格，当前填充 4 个磁贴：第一排 音乐 / 电子书 / 蓝牙，第二排 设置。方向键在网格内移动选中（左右按行主序回绕、上下两排循环切换），选中态以右上角 accent 圆点光标标示并随选择平滑滑动；A 键进入所选页面。
 
@@ -80,9 +74,10 @@ ESP32-WROVER-B (主控)
   │   ├─ BCLK = GPIO32
   │   ├─ LRC  = GPIO15
   │   └─ DIN  = GPIO21        (无 MCLK，MAX98357 自带 PLL)
-  ├─ 6 个按键 (GPIO2/13/27/35/34/12)
-  ├─ 电池电压采样 (GPIO39, ADC1_CH3, 电阻分压 1/2)
-  └─ 蓝牙 (Bluedroid, A2DP SOURCE + AVRCP TARGET)
+  ├─ 9 个按键 (UP/DOWN/LEFT/RIGHT/A/B=GPIO2/13/27/35/34/12,
+  │           SELECT/START/MENU=GPIO25/26/33)
+  ├─ 电池电压采样 (GPIO39, ADC1_CH3, 100k/100k 分压 1/2)
+  └─ 蓝牙 (Bluedroid, A2DP SOURCE + AVRCP TG+CT)
 ```
 
 代码分层：
@@ -147,8 +142,11 @@ TFT 与 MicroSD 共用 SPI2，通过不同 CS 分时使用。SD 挂载在 `/sdca
 | 右  | GPIO35     |
 | A   | GPIO34     |
 | B   | GPIO12     |
+| SELECT | GPIO25  |
+| START  | GPIO26  |
+| MENU   | GPIO33  |
 
-按键为低电平有效，带 25 ms 消抖，经 LVGL keypad 输入设备接入 UI。
+按键为低电平有效，带 10 ms 消抖，经 LVGL keypad 输入设备接入 UI：SELECT 在播放器切循环模式 / 阅读页呼出跳转 / 蓝牙页重扫；START 当前只用于唤醒（无页面功能）；MENU 在电子书页呼出悬浮播控面板、在播放器页返回主菜单。
 
 注意：
 
@@ -182,9 +180,10 @@ MAX98357 由 BCLK 内部派生主时钟，因此 **不需要 MCLK**。
 ### 5.1 播放器（MP3）
 
 - 解码库：`esp-libhelix-mp3`（libhelix C API），运行在独立 FreeRTOS 任务中，不阻塞 UI。
-- 音源：`/sdcard` 递归扫描（最多 256 首，`PLAYER_SCAN_MAX`；超出时 UI 提示「仅显示前 N 首」），支持「全部音乐（`/sdcard/Music`）/ 指定文件夹」源选择；首次扫描结果写入 `/sdcard/.xueersi_playlist.cache` 缓存（M3U8 文本格式，可被 VLC 等直接导入），下次进入播放器秒开，无需重新遍历 FATFS。缓存以**源签名**（两层目录内文件的名字 + 文件大小的 FNV-1a 哈希）做失效判定：关机后往卡里加 / 删 / 改歌，下次进入会自动重扫并更新缓存，无需手动「刷新播放列表」。
+- 音源：`/sdcard` 递归扫描（最多 256 首，`PLAYER_SCAN_MAX`；超出时 UI 提示「仅前 N 首(更多)」），支持「全部音乐（`/sdcard/Music`）/ 指定文件夹」源选择；首次扫描结果写入 `/sdcard/.xueersi_playlist.cache` 缓存（M3U8 文本格式，可被 VLC 等直接导入），下次进入播放器秒开，无需重新遍历 FATFS。缓存带 `##SIG` 源签名（两层目录内文件的名字 + 文件大小的 FNV-1a 哈希）与 `##EOF <count>` 尾部计数：关机后往卡里加 / 删 / 改歌，或缓存尾部计数与实际条目不符，都会自动重扫并更新缓存；写入先落临时文件再 rename 就位，避免掉电留下半写缓存。无需手动「刷新播放列表」。
 - 支持播放 / 暂停切换 / 停止；播放时上下键调节音量，A 播放/继续，B 停止。
 - 循环模式：列表循环（默认）/ 单曲循环，播放页按 Select 键切换，右上角状态栏显示当前模式。
+- LAME/Xing gapless：解析首帧 side-info 后的 Xing/Info + LAME 标签，取 encoder delay 高 12 位加解码器 529 样本延迟，在首帧内按每声道样本数裁掉预采样/脏样本；无标签曲目跳过。换曲与单曲重播都会重新解析。
 - ReplayGain 2.0：自动读取歌曲 ID3 标签中的 `REPLAYGAIN_TRACK_GAIN`（loudgain / rsgain 写入），在进入主音量前以约 5 ms 平滑曲线应用分轨响度增益，未打标歌曲按 0 dB 处理。
 - 输出路由：`AUDIO_ROUTE_SPEAKER`（本地 MAX98357）与 `AUDIO_ROUTE_BT`（蓝牙 sink）二选一；蓝牙 sink 连接成功时自动接管输出（连接即接管），断链后交还扬声器。
 - 故障兜底：无同步字 / 解码错误过多 / **解码成功但零进度（连续 16 帧既没消耗字节也没产出样本）的畸形帧**判定为损坏并自动跳到下一首（单曲循环下也跳过坏文件，避免死循环）——零进度护栏专门防 libhelix 在特定帧上原地自旋卡死（CPU 跑满、把停顿看门狗也饿死、且无任何日志的「静默冻结」）。连续失败过多则停止并提示。解码心跳被停顿看门狗监视，且解码任务已订阅 ESP 任务看门狗（5s 卡死即带 backtrace 重启）作为最后兜底（见 5.6）。
@@ -193,14 +192,14 @@ MAX98357 由 BCLK 内部派生主时钟，因此 **不需要 MCLK**。
 
 - 设备作为 **A2DP SOURCE**：把解码出的 PCM 通过 SBC 编码后推流给配对的蓝牙音箱/耳机，SBC 编码由 Bluedroid 完成。
 - 懒加载启动：进入「蓝牙」页才拉起蓝牙控制器/协议栈；关闭开关时彻底断电。
-- 扫描：GAP 通用查询（约 12.8 s，`BT_INQ_LEN=10`），只收录带 RENDERING 类的设备，按地址去重，名称取自 inquiry 的 BDNAME/EIR，列表最多 8 个（`BT_MAX_DEVICES`）。
-- 配对：支持 SSP 数字比对（配对时显示 6 位配对码）。
-- 远程控制：作为 AVRCP TARGET，接受远端耳机的播放/暂停/停止/上下曲媒体键，以及远端绝对音量（0..127）映射回本地主音量。AVRCP 上下曲通过队列投递到 LVGL 任务执行，与按键切歌共用 `player_next()/player_prev()`，列表光标会自动跟随正在播放的曲目；空闲时忽略上下曲。
+- 扫描：GAP 通用查询（约 12.8 s，`BT_INQ_LEN=10`），仅保留 COD 有效的设备（不再要求 RENDERING 服务位，手机等也能列出），按地址去重，名称取自 inquiry 的 BDNAME/EIR，列表最多 8 个（`BT_MAX_DEVICES`）。
+- 配对：纯 Just Works 零交互（声明 `NoInputNoOutput`）；常态显示「配对中 <名>」，仅当非合规对端强制数值比较时才显示 6 位配对码。
+- 远程控制：作为 AVRCP TG，接受远端耳机的播放/暂停/停止/上下曲媒体键，以及远端绝对音量（0..127）映射回本地蓝牙音量槽位；同时作为 AVRCP CONTROLLER 把本机蓝牙音量以 0..127 推送给 sink，实现双向镜像（入站音量不回显，避免环路）。AVRCP 上下曲通过队列投递到 LVGL 任务执行，与按键切歌共用 `player_next()/player_prev()`，列表光标会自动跟随正在播放的曲目；空闲时忽略上下曲。
 - 连接成功时自动把输出路由切到蓝牙（连接即接管）；断链时音频层把路由交还扬声器。
 
 ### 5.3 电子书（TXT）
 
-- 读取 SD 卡 `/sdcard/eBook` 下的 `.txt` 文件（UTF-8 纯文本，递归扫描最多 512 本；超出时 UI 提示「仅前 N 本」）。
+- 读取 SD 卡 `/sdcard/eBook` 下的 `.txt` 文件（UTF-8 纯文本，递归扫描最多 512 本；超出时 UI 提示「[来源] N 本+ (超出上限)」）。
 - 用 16px 中文点阵字体按固定 8 行/页确定性排版，前后翻页与后台页数统计始终一致；支持续读位置保存与百分比跳转（详见 `docs/ebook.md`）。
 
 ### 5.4 设置
@@ -220,11 +219,12 @@ MAX98357 由 BCLK 内部派生主时钟，因此 **不需要 MCLK**。
         清除阅读进度（丢弃 TXT 续读位置）
 ```
 
-蓝牙总开关不在设置页（已提升到 Launcher 顶层入口），设置页只保留上述 10 项。
+蓝牙入口已提升到 Launcher 顶层，蓝牙总开关由蓝牙页自身管理并持久化；设置页只保留上述 10 项。
 
 ### 5.5 电池
 
-- 电压经 ADC 采样 + 开路电压查表换算为百分比。
+- GPIO39（ADC1_CH3）经板载 100kΩ/100kΩ 分压（固件按 ÷2 还原）采集锂电池电压，满电基准 4.10V（带载离充电器）、空电 3.30V。
+- oneshot ADC + 12bit + 16 次突发均值 + 中值滤波 + 非对称 EMA；播放中按负载做电压补偿，避免误报低电量。
 
 ### 5.6 稳定性与故障兜底
 
@@ -241,7 +241,7 @@ MAX98357 由 BCLK 内部派生主时钟，因此 **不需要 MCLK**。
 | -------------------------------- | ---------------------------------------- |
 | `main/main.c`                     | 启动装配 + LVGL 主循环                        |
 | `components/board/board_config.h` | 板级硬件引脚、显示几何、分压系数                      |
-| `components/drivers/buttons/`     | 6 键输入 + 消抖，LVGL keypad 读取回调             |
+| `components/drivers/buttons/`     | 9 键输入 + 10ms 消抖，LVGL keypad 读取回调          |
 | `components/drivers/lcd/`         | ST7789 驱动 + LVGL 显示绑定 + 背光 PWM          |
 | `components/drivers/audio/`       | I2S → MAX98357，路由/音量/采样率/ PCM 写入         |
 | `components/drivers/bluetooth_audio/`    | 蓝牙 A2DP SOURCE + AVRCP + 扫描/配对/连接管理      |
@@ -273,3 +273,6 @@ MAX98357 由 BCLK 内部派生主时钟，因此 **不需要 MCLK**。
 - `docs/ui.md` —— UI 页面与交互
 - `docs/player.md` —— MP3 播放器
 - `docs/ebook.md` —— 电子书阅读器
+- `docs/audio.md` —— I2S/DSP/音量与输出链路
+- `docs/bluetooth.md` —— A2DP/AVRCP 蓝牙音频
+- `docs/hardware.md` —— 板级配置与驱动时序

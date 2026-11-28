@@ -14,8 +14,8 @@ MP3 解码（helix） ──> hw_audio_write_pcm() → 按路由分发
 - 输出 DAC：MAX98357 单声道 Class-D，I2S 标准模式（16-bit stereo slot），引脚 BCLK=32 / LRC=15 / DIN=21，无 MCLK。MAX98357 的 `SD_MODE` 可选左/右/(L+R)/2；固件在喇叭路径统一做 `(L+R)/2` 下混并把同一 mono 样本写进两个 slot，因此不依赖板上 `SD_MODE` 接法，左右声道交替的音源也不会听成静音。蓝牙路径保留完整立体声。
 - 蓝牙输出：A2DP Source，SBC 编码由 Bluedroid 完成（见 `docs/bluetooth.md`）。
 - **路由互斥**：蓝牙连接时只走蓝牙，I2S 不喂数据（喇叭静音），解码任务由 BT 环形缓冲的阻塞发送单一时钟驱动，避免双时钟漂移丢音。
-- **环形缓冲 + 独立 DMA writer 任务（无 ADF 中间层）**：MP3 解码任务在 DSP 后把 PCM 推入一个 16KB 的 FreeRTOS 字节环形缓冲（`xRingbufferSend()`，满则阻塞——天然背压；~93ms @44.1kHz，叠加 DMA 的 ~279ms 共 ~372ms 生产者停摆裕量，可吸收一次 SD 读重试退避）；一个专用 writer 任务（`i2s_wr`，优先级 6）独立地从 ring 取出 PCM 喂 `i2s_channel_write()`。I2S DMA（12×1024 帧，`auto_clear`）即抖动缓冲，writer 任务按硬件时钟定速取走 ring 中的数据——解码快则 ring 背压堵住解码，解码慢则 writer 发数字静音填空，解码与 DMA 不会互相跑飞。
-- **通道驻车（由 writer 任务控制，有意为之的代价）**：`i2s_std` 频道在 `hw_audio_init()` 时 `i2s_channel_enable()` 一次后**常驻运行**；只有两种情形会由 **DMA writer 任务**在下一轮循环里 `i2s_channel_disable()` 关掉通道（停 BCLK/LRC、MAX98357 掉电）：(1) **切到蓝牙路由**（喇叭静音、省电）；(2) **整段停止** `hw_audio_park()`（B 键退解码循环 / 看门狗停摆）。speaker 路由下、播放未真正结束（暂停 / 曲间 / 仅 `player_active=false`）时频道**保持启用**，writer 任务以 `auto_clear` 数字静音填充环形缓冲——代价是 BCLK 持续、MAX98357 不进掉电（几 mA），换取绝不触发会卡死 ESP32 DMA 的 out-link stop/start。**停止先排净余音**：`hw_audio_set_player_active(false)` 不立即关通道，而是让解码任务下一帧写返回 `AUDIO_WRITE_ABANDONED` 即时静音；整圈 DMA 环形缓冲（12×1024 帧）靠 `auto_clear` 把已传输描述符清零、在「下次播放之前」自然排净成静音，`hw_audio_park()` 再 `i2s_channel_disable()` 冻结的是静音而非上一首尾音（见 §4）。所有 I2S 通道操作都收敛到这一个 writer 任务内部，天然串行，无需互斥锁；跨任务停止安全（IDF 驱动在 `i2s_channel_disable` 中置 READY 并等待在途写循环退出）。
+- **环形缓冲 + 独立 DMA writer 任务（无 ADF 中间层）**：MP3 解码任务在 DSP 后把 PCM 推入一个 32KB 的 FreeRTOS 字节环形缓冲（`xRingbufferSend()`，100ms 有界超时，满则阻塞——天然背压；~186ms @44.1kHz，叠加 DMA 的 ~279ms 共 ~465ms 生产者停摆裕量，可吸收一次 SD 读重试退避）；一个专用 writer 任务（`i2s_wr`，优先级 8，绑 Core 1，高于同核 `lvgl` 的 7）独立地从 ring 取出 PCM 喂 `i2s_channel_write()`。I2S DMA（12×1024 帧，`auto_clear`）即抖动缓冲，writer 任务按硬件时钟定速取走 ring 中的数据——解码快则 ring 背压堵住解码，解码慢则 writer 发数字静音填空，解码与 DMA 不会互相跑飞。
+- **通道驻车与无缝切换（由 writer 任务控制）**：`i2s_std` 频道在 `hw_audio_init()` 时启用一次并常驻；speaker 路由下暂停/曲间（`player_active=false`）不关闭，只以静音填充。只有切到蓝牙路由或整段停止（`hw_audio_park()`）才由 writer 关掉通道（停 BCLK/LRC、MAX98357 掉电）。切歌/重播的接缝不再只靠 `auto_clear` 自然排净：`i2s_seam_rearm()` 先用 2KB 静音块循环**写满整圈 48KB DMA 描述符环**（约 280ms），再 `disable()+enable()` 重置 out-link，最后补 2KB 静音 prime；硬切换前还有 64 阶 Q15 余弦表的 20ms 淡出，避免直接丢弃旧 PCM 产生 click；park 排空改为 20ms 分步循环。所有 I2S 通道操作都收敛到唯一 writer 任务内部，天然串行，无需互斥锁；跨任务停止安全。
 
 ## 2. 音量模型
 
@@ -61,15 +61,16 @@ MP3 解码（helix） ──> hw_audio_write_pcm() → 按路由分发
 ## 4. 解码/输出解耦（防爆音与欠载）
 
 ```text
-环形缓冲：hw_audio_write_pcm() 就地 DSP → xRingbufferSend() 送 PCM ring（100ms 有界超时，背压阻塞）
-  DMA writer 任务 → i2s_channel_write() 喂 I2S DMA（12×1024 帧 ≈ 279ms @44.1kHz，auto_clear 欠载自动静音）
+环形缓冲：hw_audio_write_pcm() 就地 DSP → xRingbufferSend() 送 32KB PCM ring（100ms 有界超时，背压阻塞）
+  DMA writer 任务（i2s_wr，优先级 8 / Core 1）→ i2s_channel_write() 喂 I2S DMA（12×1024 帧 ≈ 279ms @44.1kHz，auto_clear 欠载自动静音）
   解码任务被 ring 背压钉在硬件时钟附近（ring 满则阻塞解码；ring 空则 writer 发静音，绝无超前）
 ```
 
-- 停止/暂停：`hw_audio_set_player_active(false)` 声明播放器不再写数据，解码任务下一帧写返回 `AUDIO_WRITE_ABANDONED` 即时静音；但通道**不立即禁用**——靠 `auto_clear` 把整圈 DMA 环形缓冲在「下次播放之前」排净成静音（否则上一首尾音会在下一首重新使能通道时被回放，即「余音」）。整段停止（B 键 / 看门狗）由 `hw_audio_park()` 在排净后才 `i2s_channel_disable()`。
-- **采样率处理（软件重采样，不重建通道）**：I2S 通道在初始化时以**单一固定速率**（`AUDIO_DEFAULT_RATE`，当前 44100 Hz）创建并启用一次，之后整段会话**绝不**因采样率变化而 disable/rebuild。解码任务每曲首帧调用 `hw_audio_set_sample_rate()` 仅声明解码器的原生码率；若该码率与固定 I2S 速率不同，`hw_audio_write_pcm()` 在写 DMA 前用 **SpeexDSP 定点重采样器**（cubic-interpolated sinc，`RESAMP_QUALITY=1`，每曲重建以重置接缝历史，同速率曲库直接旁路，零开销）把 PCM 重采样到固定速率。这样曲目接缝处的换速只是一次重采样，不触碰 I2S 通道——彻底消除了"运行通道 disable→enable"这一会卡死 ESP32 DMA 的 out-link stop/start（即"首曲有声、之后整片无声、仅 I2S 受影响"的失败模式：随机/单曲循环选到不同码率文件时原本会在接缝触发通道重建）。正常情况下变调问题不存在：重采样保证音高正确，且 DSP 链系数始终按固定 I2S 速率计算。已知降级：若 SpeexDSP 重采样器初始化失败（内存不足或非法码率），当前实现会旁路重采样并以原码率写入固定 I2S 速率，此时该曲会**变调**并打印 `speex resampler init failed` 错误日志——这是明确的兜底取舍（宁可变调也不静默无声），不是正常路径。i2s_std 频道在初始化时一次性启用并常驻运行,不再有通道重建/自愈逻辑;独立的 DMA writer 任务喂 DMA,若 DMA 真卡死只能 terminate+reinit(当前未实现自愈,须避免该路径)。
+- 停止/暂停：`hw_audio_set_player_active(false)` 声明播放器不再写数据，解码任务下一帧写返回 `AUDIO_WRITE_ABANDONED` 即时静音；通道**不立即禁用**，writer 先以 20ms 分步排空 ring，再经 `i2s_seam_rearm()` 全环静默重写 + disable/enable 重置 out-link。`hw_audio_park()` 最终冻结的是静音而非上一首尾音；整段停止（B 键 / 看门狗）才走到 park。
+- **flush 代际确认**：切歌/重播的 flush 由 `s_flush_req_gen` / `s_flush_done_gen` 代际计数确认，调用方等 `done >= req`；`hw_audio_flush_wait()` 上限 **1200ms**、每 20ms 轮询并 `esp_task_wdt_reset()` 喂狗，覆盖 park 排空 ~350ms + park re-arm ~286ms + fade 20ms + switch re-arm ~286ms（约 940ms）。writer 仅在无更新请求时清标志，避免超时残留 token 吞掉新曲头部；park 排空遇 `!s_parked || s_flush_req` 提前退出，修复快速 stop→play 卡在排空的问题。
+- **采样率处理（软件重采样，不重建通道）**：I2S 通道在初始化时以**单一固定速率**（`AUDIO_DEFAULT_RATE`，当前 44100 Hz）创建并启用一次，之后整段会话**绝不因采样率变化**而 disable/rebuild（接缝 re-arm 是独立路径，见上）。解码任务每曲首帧调用 `hw_audio_set_sample_rate()` 仅声明解码器的原生码率；若该码率与固定 I2S 速率不同，`hw_audio_write_pcm()` 在写 DMA 前用 **SpeexDSP 定点重采样器**（cubic-interpolated sinc，`RESAMP_QUALITY=1`，每曲重建以重置接缝历史，同速率曲库直接旁路，零开销）把 PCM 重采样到固定速率。这样曲目接缝处的换速只是一次重采样，不触碰 I2S 通道——彻底消除了"运行通道 disable→enable"这一会卡死 ESP32 DMA 的 out-link stop/start（即"首曲有声、之后整片无声、仅 I2S 受影响"的失败模式：随机/单曲循环选到不同码率文件时原本会在接缝触发通道重建）。正常情况下变调问题不存在：重采样保证音高正确，且 DSP 链系数始终按固定 I2S 速率计算。已知降级：若 SpeexDSP 重采样器初始化失败（内存不足或非法码率），当前实现会旁路重采样并以原码率写入固定 I2S 速率，此时该曲会**变调**并打印 `speex resampler init failed` 错误日志——这是明确的兜底取舍（宁可变调也不静默无声），不是正常路径。i2s_std 通道在初始化时启用并常驻，采样率变化不重建；接缝的 disable/enable 只由 writer 内的 `i2s_seam_rearm()` 执行，无自愈逻辑，DMA 真卡死只能 terminate+reinit（当前未实现，须避免该路径）。
 - **播放时钟对齐（取舍说明）**：MP3 解码速率精确而 I2S BCLK（APLL 派生）仅 ppm 级精度，旧架构用 ring+feed+插样主动抵消漂移；新架构（ringbuf + 独立 writer 任务）下该漂移由 DMA 吸收，最坏表现为长时间播放中偶发一次约几十 ms 的欠载静音（`auto_clear` 兜底、自恢复），远轻于旧架构概率性整首无声。
-- **通道生命周期**：频道在 `hw_audio_init()` 时启用一次并常驻（init 后 writer 任务即开始以静音驱动 BCLK，无起始 auto-clear 空白）；禁用仅发生在**切到蓝牙路由**或**整段停止 `hw_audio_park()`**——暂停与曲间不禁用，仅以静音填充环形缓冲。全部 I2S 通道操作（enable/disable/写 ring）都收敛到唯一的 DMA writer 任务内部，天然串行，无需互斥锁；跨任务停止安全（IDF 驱动在 `i2s_channel_disable` 中置 READY 并等待在途写循环退出）。
+- **通道生命周期**：通道在 `hw_audio_init()` 时启用并常驻；暂停与曲间不禁用，只以静音填充。蓝牙路由切换与整段 `hw_audio_park()` 才由 writer 关通道；切歌/重播则由 `i2s_seam_rearm()` 做「全环静默重写 → disable/enable → 2KB 静音 prime」的 re-arm（约 280ms），这不是采样率重建。全部 I2S 通道操作（enable/disable/写 ring）都收敛到唯一的 DMA writer 任务内部，天然串行，无需互斥锁；跨任务停止安全。
 - 蓝牙路由时 I2S 通道保持驻车（见 §1），蓝牙侧由 A2DP 流控自行定钟。
 
 ## 5. 接口摘要
@@ -78,11 +79,18 @@ MP3 解码（helix） ──> hw_audio_write_pcm() → 按路由分发
 components/drivers/audio/audio.c
   hw_audio_init()                        I2S 初始化 + 音量表 + DSP 系数 + 启动 DMA writer 任务（通道常驻）
   hw_audio_set/get_volume(pct)           当前生效路由的音量 0..100
+  hw_audio_get_volume_steps()/step()     当前路由档位总数 / 当前档位（喇叭 40 / BT 12，UI 显示 N/40）
   hw_audio_set/get_speaker_volume(pct)   喇叭路由音量槽位（NVS 恢复用）
   hw_audio_set/get_bt_volume(pct)        蓝牙路由音量槽位
+  hw_audio_set_bt_volume_change_cb(cb)   本机 BT 音量变化 → AVRCP CT 推送 sink（不入站回声）
   hw_audio_set_avrc_volume(v)            AVRCP 绝对音量 0..127（写蓝牙槽位）
+  hw_audio_set_master_gain_db()/get()    全局前置增益 -12..+12 dB（两路由共用）
   hw_audio_set_track_gain_db(dB)         每曲 ReplayGain（两路由通用）
-  hw_audio_set_sample_rate(hz)           声明解码器原生码率（内部按固定 I2S 速率重采样，绝不重建通道）
+  hw_audio_set_route()/set_route_change_cb()  显式路由切换与切换完成回调
+  hw_audio_set_sample_rate(hz)           声明解码器原生码率（内部按固定 I2S 速率重采样，采样率变化不重建通道）
   hw_audio_set_player_active(bool)       MP3 播放器声明 I2S 总线归属（释放后不关通道，靠静音填充；真正停止由 hw_audio_park()）
-  hw_audio_write_pcm(frames,n)           就地 DSP 后推入 PCM 环形缓冲（或送 BT 路由），由 writer 任务喂 DMA
+  hw_audio_pipeline_flush()/switch()     接缝 flush / 硬切歌（静默重写 + re-arm，切歌额外 20ms 淡出）
+  hw_audio_pending() / drain_blocking()  查询 PCM 环余量 / 等待 DMA 尾音排净
+  hw_audio_is_playing()                  解码任务持有总线且 I2S 真正在出声（电池补偿用）
+  hw_audio_write_pcm(frames,n)           就地 DSP 后推入 32KB PCM 环形缓冲（或送 BT 路由），由 writer 任务喂 DMA
 ```

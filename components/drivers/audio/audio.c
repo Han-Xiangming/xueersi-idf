@@ -1066,6 +1066,13 @@ static void i2s_writer_task(void *arg)
      * slow-but-adequate 4 KB read on 48 kHz tracks. */
     static uint32_t s_underruns = 0;
     static int64_t  s_underrun_log_us = 0;
+    /* Rearm-at-pause is a one-shot per pause episode. Every wake-up used to
+     * redo it (~300 ms of prio-8 silence writes + a disable/enable on the
+     * out-link), and a notification that arrives WHILE the rearm runs makes
+     * ulTaskNotifyTake() return immediately -> two rearms back to back on every
+     * A2DP route switch ("seam re-arm" logged twice, 300 ms apart). Reset when
+     * the writer is streaming again, so the next park/BT pause rearms once. */
+    bool pause_rearmed = false;
     for (;;) {
         if (s_flush_req) {
             /* Capture the generation this flush will satisfy. A newer request
@@ -1216,13 +1223,22 @@ static void i2s_writer_task(void *arg)
                  waited += 20) {
                 vTaskDelay(pdMS_TO_TICKS(20));
             }
-            if (!s_parked || s_flush_req) {
-                /* Resume/flush arrived during the drain: skip the park re-arm
-                 * and the blocking wait. The flush path owns the seam now, or
+            /* Re-check BOTH pause reasons, never s_parked alone. On the
+             * Bluetooth route s_parked stays FALSE (the player is still active,
+             * BT merely owns the output), so testing !s_parked by itself turned
+             * this branch into a hot `continue`: the writer never blocked, kept
+             * core 1 busy at prio 8, starved IDLE1 and aborted on the 5 s task
+             * WDT every time an A2DP link came up. */
+            bool still_paused = (s_route == AUDIO_ROUTE_BT) || s_parked;
+            if (s_flush_req || !still_paused) {
+                /* Resume/flush arrived during the drain: skip the re-arm and
+                 * the blocking wait. The flush path owns the seam now, or
                  * playback is active and the normal loop must pull the ring. */
                 continue;
             }
-            /* Reset + prime the DMA descriptor ring at park. i2s_seam_rearm()
+            /* Reset + prime the DMA descriptor ring at park / on the Bluetooth
+             * route (once per pause episode — the notify wake-up re-enters this
+             * branch at most once per track start). i2s_seam_rearm()
              * does a disable+enable (which re-initialises the descriptor queue on
              * the i2s_std driver) followed by a SHORT silence prime. The pending
              * PCM was already dropped and I2S_DMA_DRAIN_MS waited out the DMA
@@ -1231,10 +1247,14 @@ static void i2s_writer_task(void *arg)
              * below, so the DMA idles and BCLK stops — the amp powers down. (The
              * old comment warning that disable() "wedges the out-link" referred
              * to the ADF I2S driver, not i2s_std.) */
-            i2s_seam_rearm();
+            if (!pause_rearmed) {
+                i2s_seam_rearm();
+                pause_rearmed = true;
+            }
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  /* wait for resume / flush */
             continue;
         }
+        pause_rearmed = false;   /* streaming again: next pause rearms once */
         /* Pull PCM from the ring; on underrun, emit silence to keep BCLK alive. */
         uint8_t *item = (uint8_t *)xRingbufferReceiveUpTo(
                             s_pcm_rb, &written, pdMS_TO_TICKS(20),
