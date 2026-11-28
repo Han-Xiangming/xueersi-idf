@@ -1910,6 +1910,21 @@ audio_write_result_t hw_audio_write_pcm(int16_t *stereo_frames, size_t frames)
     }
     s_vol_gain_sm = g;
 
+    /* MAX98357 is a mono amp: SD_MODE can select left, right, or (L/2 + R/2).
+     * Channel-alternating material therefore sounds silent whenever the
+     * selected side is the quiet one. Fold both channels into the same mono
+     * sample and feed it to both I2S slots, so the speaker always carries
+     * both source channels regardless of SD_MODE wiring. This is the mono mix
+     * listed in the MAX98357A datasheet and FFmpeg's standard
+     * `pan=mono|c0=0.5*c0+0.5*c1` downmix. L/R are already bounded by
+     * LOUD_LIMIT_CEIL, so the sum-then-shift cannot overflow. The BT path
+     * above is untouched and remains full stereo. */
+    for (size_t i = 0; i < dsp_frames; i++) {
+        int32_t m = ((int32_t)dsp_buf[2 * i] + (int32_t)dsp_buf[2 * i + 1]) >> 1;
+        dsp_buf[2 * i] = (int16_t)m;
+        dsp_buf[2 * i + 1] = (int16_t)m;
+    }
+
     size_t bytes = dsp_frames * 4;
 
     /* Underrun diagnostics now live in the writer task: it is the only place

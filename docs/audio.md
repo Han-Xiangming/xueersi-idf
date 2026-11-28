@@ -7,11 +7,11 @@
 ```text
 MP3 解码（helix） ──> hw_audio_write_pcm() → 按路由分发
  ├─ 蓝牙已连接 + 开启 → 音量（~5ms 平滑，全频段）→ bluetooth_audio_write_pcm() → BT 环形缓冲(128KB) → A2DP
- └─ 喇叭 → 800Hz 保护高通 → 音量（平滑）→ 响度低音架 → ReplayGain/主增益 → 双频段 DRC（400Hz 分频，各段软拐点压缩）→ 硬顶棚 → xRingbufferSend() 送 PCM 环形缓冲
+ └─ 喇叭 → 800Hz 保护高通 → 音量（平滑）→ 响度低音架 → ReplayGain/主增益 → 双频段 DRC（400Hz 分频，各段软拐点压缩）→ 硬顶棚 → (L+R)/2 单声道下混 → 复制到 L/R 两个 slot → xRingbufferSend() 送 PCM 环形缓冲
                                        → DMA writer 任务 → i2s_channel_write() → I2S(MAX98357)
 ```
 
-- 输出 DAC：MAX98357 单声道 Class-D，I2S 标准模式（16-bit 立体声，只写 DOUT 声道），引脚 BCLK=32 / LRC=15 / DIN=21，无 MCLK。
+- 输出 DAC：MAX98357 单声道 Class-D，I2S 标准模式（16-bit stereo slot），引脚 BCLK=32 / LRC=15 / DIN=21，无 MCLK。MAX98357 的 `SD_MODE` 可选左/右/(L+R)/2；固件在喇叭路径统一做 `(L+R)/2` 下混并把同一 mono 样本写进两个 slot，因此不依赖板上 `SD_MODE` 接法，左右声道交替的音源也不会听成静音。蓝牙路径保留完整立体声。
 - 蓝牙输出：A2DP Source，SBC 编码由 Bluedroid 完成（见 `docs/bluetooth.md`）。
 - **路由互斥**：蓝牙连接时只走蓝牙，I2S 不喂数据（喇叭静音），解码任务由 BT 环形缓冲的阻塞发送单一时钟驱动，避免双时钟漂移丢音。
 - **环形缓冲 + 独立 DMA writer 任务（无 ADF 中间层）**：MP3 解码任务在 DSP 后把 PCM 推入一个 16KB 的 FreeRTOS 字节环形缓冲（`xRingbufferSend()`，满则阻塞——天然背压；~93ms @44.1kHz，叠加 DMA 的 ~279ms 共 ~372ms 生产者停摆裕量，可吸收一次 SD 读重试退避）；一个专用 writer 任务（`i2s_wr`，优先级 6）独立地从 ring 取出 PCM 喂 `i2s_channel_write()`。I2S DMA（12×1024 帧，`auto_clear`）即抖动缓冲，writer 任务按硬件时钟定速取走 ring 中的数据——解码快则 ring 背压堵住解码，解码慢则 writer 发数字静音填空，解码与 DMA 不会互相跑飞。
